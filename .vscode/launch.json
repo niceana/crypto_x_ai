@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python：调试当前文件",
+            "type": "debugpy",
+            "request": "launch",
+            "purpose": ["debug-in-terminal"],
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "pythonArgs": ["-X", "utf8"],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
+            },
+            "windows": {
+                "env": {
+                    "PYTHONPATH": "${workspaceFolder};${env:PYTHONPATH}"
+                }
+            }
+        }
+    ]
+}
