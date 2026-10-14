@@ -2,22 +2,26 @@
 
 import json
 import logging
+import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
 class ParsedResponse:
-    """单次最终解析结果；不包含响应原文或持久化重试计划。"""
+    """单次最终解析结果；生成时间为北京时间文本，不包含响应原文或重试计划。"""
 
     success: bool
     http_status: Optional[int]
     ai_response_content: str = ""
     reasoning_content: str = ""
     usage: Any = None
-    response_created: Any = None
+    response_created: str = ""
     error_message: str = ""
 
 
@@ -34,6 +38,20 @@ def request_failure(error_message: str) -> ParsedResponse:
 
 def _reject_constant(value):
     raise ValueError("响应包含非标准 JSON 数值")
+
+
+def _format_response_created(value) -> str:
+    """将数值 Unix 秒转为北京时间文本；缺失留空，格式或范围错误抛 ValueError。"""
+    if value is None:
+        return ""
+    if type(value) not in (int, float):
+        raise ValueError("created 必须为 Unix 秒时间戳数值")
+    try:
+        # 按秒取整，再从固定 UTC 起点计算，避免本机时区和系统时间戳范围影响。
+        created = (_UNIX_EPOCH + timedelta(seconds=math.floor(value))).astimezone(_BEIJING_TIMEZONE)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("created 超出可转换的日期范围") from exc
+    return created.replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
 
 
 def _error_message(body, non_success):
@@ -60,7 +78,7 @@ def parse_response(http_status: int, raw_response: str) -> ParsedResponse:
     content = ""
     reasoning = ""
     usage = None
-    created = None
+    created = ""
     reason = ""
     non_success = not 200 <= http_status < 300
     try:
@@ -76,7 +94,7 @@ def parse_response(http_status: int, raw_response: str) -> ParsedResponse:
         logger.debug("响应结构无效：HTTP状态=%d，JSON根值不是对象", http_status)
         message = "HTTP {}".format(http_status) if non_success else "响应 JSON 根值不是对象"
         return ParsedResponse(False, http_status, error_message=_reason(message))
-    usage, created = body.get("usage"), body.get("created")
+    usage, raw_created = body.get("usage"), body.get("created")
     error = body.get("error")
     explicit_error = error is not None and error != ""
     # HTTP 失败与明确 error 优先，不能被 body 中的正常 choices 掩盖。
@@ -126,9 +144,9 @@ def parse_response(http_status: int, raw_response: str) -> ParsedResponse:
                             reason = "AI 正文为空"
     # 失败也可保留安全提取的最终字段，但不可编码的值必须清空。
     for name, value in (("ai_response_content", content), ("reasoning_content", reasoning),
-                        ("usage", usage), ("response_created", created)):
+                        ("usage", usage)):
         try:
-            if name in ("usage", "response_created"):
+            if name == "usage":
                 json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
             else:
                 value.encode("utf-8")
@@ -139,11 +157,19 @@ def parse_response(http_status: int, raw_response: str) -> ParsedResponse:
                 content = ""
             elif name == "reasoning_content":
                 reasoning = ""
-            elif name == "usage":
-                usage = None
             else:
-                created = None
+                usage = None
             if not reason:
                 reason = "{} 无法编码：{}".format(name, str(exc))
+    try:
+        created = _format_response_created(raw_created)
+    except ValueError as exc:
+        logger.debug("响应生成时间转换失败：HTTP状态=%d，异常类型=%s",
+                     http_status, type(exc).__name__)
+        # 时间不合法时整条 AI 结果无效，保存空值以覆盖同一任务的旧结果。
+        content = reasoning = ""
+        usage = None
+        if not reason:
+            reason = "response_created 无法转换：{}".format(str(exc))
     logger.debug("响应解析完成：HTTP状态=%d，结果=%s", http_status, "失败" if reason else "成功")
     return ParsedResponse(not bool(reason), http_status, content, reasoning, usage, created, _reason(reason))

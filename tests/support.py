@@ -62,7 +62,10 @@ class FakeCli:
     def apply(self, patch_frame):
         self.frame.loc[patch_frame.index, patch_frame.columns] = patch_frame.to_numpy()
 
-    def update_by_index(self, path, patch_frame):
+    def update_by_column(self, path, patch_frame):
+        # 按用户确认的 xdata 要求拒绝无序或重复索引，避免模拟客户端掩盖错误。
+        if not patch_frame.index.is_unique or not patch_frame.index.is_monotonic_increasing:
+            raise ValueError("更新行必须按 (date, id) 严格递增，不能包含重复键")
         self.threads.append(threading.get_ident())
         self.updates.append(patch_frame.copy(deep=True))
         self.update_paths.append(path)

@@ -64,6 +64,32 @@ class RunnerTests(Fixture, unittest.TestCase):
                 self.assertFalse(cli.updates)
                 self.assertFalse(self.clients)
 
+    def test_old_results_do_not_block_pending_requests_and_successes_are_skipped(self):
+        frame = tasks(pd.date_range("2021-01-01", periods=4))
+        frame["status"] = ["0", "9", "-1", "1"]
+        for column in ("ai_response_content", "reasoning_content", "usage_json",
+                       "response_created", "error_message"):
+            frame.loc[frame.index[:3], column] = [None, 7, pd.NA]
+        frame.loc[frame.index[:3], "usage_json"] = ["invalid JSON", float("nan"), pd.NA]
+        frame.at[frame.index[3], "config_hash"] = config_hash(self.config())
+        frame.at[frame.index[3], "ai_response_content"] = "saved answer"
+        original_success = frame.iloc[3].copy()
+        cli = FakeCli(frame)
+        requested_texts = []
+
+        def handler(request):
+            requested_texts.append(request_text(request))
+            return success("new answer", usage={"total_tokens": 3}, created=100)
+
+        summary = self.worker(cli, handler)
+        self.assertEqual(summary.already_succeeded, 1)
+        self.assertEqual(summary.new_succeeded, 3)
+        self.assertEqual(summary.http_attempts_started, 3)
+        self.assertCountEqual(requested_texts, ["post 0", "post 1", "post 2"])
+        self.assertTrue(all(isinstance(value, str) for value in cli.frame.to_numpy().flat))
+        pd.testing.assert_series_equal(cli.frame.iloc[3], original_success)
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], frame[["text", "user_name"]])
+
     def test_startup_failure_logs_reason_before_any_task_access(self):
         cli = FakeCli(tasks(["2021-01-01"]))
         with self.assertRaises(ValueError):
@@ -181,6 +207,44 @@ class RunnerTests(Fixture, unittest.TestCase):
         self.assertNotIn(main_thread, network_threads)
         self.assertEqual(len(self.clients), 1)
         self.assertEqual(summary.total, summary.already_succeeded + summary.new_succeeded + summary.new_failed + summary.pending + summary.processing)
+
+    def test_reverse_concurrent_completions_save_sorted_batches_with_aligned_answers(self):
+        self.document["run"].update({
+            "concurrency": 4, "batch_size": 2, "result_buffer_size": 2,
+            "flush_interval_seconds": 100,
+        })
+        frame = tasks(pd.DatetimeIndex(["2021-01-01 00:00:00.123456789"] * 4, tz="Asia/Shanghai"))
+        frame.index = pd.MultiIndex.from_arrays([
+            frame.index.get_level_values("date"), ["2", "10", "3", "1"],
+        ], names=["date", "id"])
+        cli = FakeCli(frame)
+        completed = []
+        events = {}
+
+        async def handler(request):
+            text = request_text(request)
+            position = int(text.split()[-1])
+            # 在网络事件循环内建立事件，强制后提交的请求先完成。
+            events.setdefault(position, asyncio.Event())
+            if position < 3:
+                events.setdefault(position + 1, asyncio.Event())
+                await asyncio.wait_for(events[position + 1].wait(), timeout=2)
+                await asyncio.sleep(0)
+            completed.append(position)
+            events[position].set()
+            return success("answer " + text, usage={"total_tokens": position}, created=100 + position)
+
+        summary = self.worker(cli, handler)
+        self.assertEqual(completed, [3, 2, 1, 0])
+        final_updates = [update for update in cli.updates if "ai_response_content" in update.columns]
+        self.assertEqual([list(update.index.get_level_values("id")) for update in final_updates],
+                         [["1", "3"], ["10", "2"]])
+        for position, key in enumerate(frame.index):
+            self.assertEqual(cli.frame.at[key, "ai_response_content"], "answer " + frame.at[key, "text"])
+            self.assertEqual(json.loads(cli.frame.at[key, "usage_json"]), {"total_tokens": position})
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], frame[["text", "user_name"]])
+        pd.testing.assert_index_equal(cli.frame.index, frame.index)
+        self.assertEqual((summary.new_succeeded, summary.new_failed, summary.http_attempts_started), (4, 0, 4))
 
     def test_full_year_reads_and_saves_each_month_before_next(self):
         month_starts = pd.date_range("2021-01-01", "2022-01-01", freq="MS")
@@ -373,8 +437,30 @@ class RunnerTests(Fixture, unittest.TestCase):
         summary = self.worker(cli, handler)
         self.assertEqual(summary.http_attempts_started, 3)
         self.assertEqual(json.loads(cli.frame.iloc[0]["usage_json"]), {"total_tokens": 5})
-        self.assertEqual(cli.frame.iloc[0]["response_created"], "3")
+        self.assertEqual(cli.frame.iloc[0]["response_created"], "1970-01-01 08:00:03")
         self.assertEqual(len([frame for frame in cli.updates if len(frame.columns) == 6]), 1)
+
+    def test_invalid_created_fails_only_one_post_without_retry(self):
+        cli = FakeCli(tasks(["2021-01-01", "2021-01-02"]))
+        requested_texts = []
+
+        def handler(request):
+            text = request_text(request)
+            requested_texts.append(text)
+            created = "invalid" if text == "post 0" else 1791947560
+            return success("new answer", usage={"total_tokens": 7}, created=created)
+
+        summary = self.worker(cli, handler)
+        self.assertEqual(summary.new_failed, 1)
+        self.assertEqual(summary.new_succeeded, 1)
+        self.assertEqual(summary.http_attempts_started, 2)
+        self.assertCountEqual(requested_texts, ["post 0", "post 1"])
+        failed = cli.frame.iloc[0]
+        self.assertEqual(failed["status"], "-1")
+        for column in ("ai_response_content", "reasoning_content", "usage_json", "response_created"):
+            self.assertEqual(failed[column], "")
+        self.assertTrue(failed["error_message"].startswith("response_created 无法转换："))
+        self.assertEqual(cli.frame.iloc[1]["response_created"], "2026-10-14 11:12:40")
 
     def test_network_budget_failure_is_single_post_and_restarts_from_zero(self):
         self.document["run"]["concurrency"] = 1

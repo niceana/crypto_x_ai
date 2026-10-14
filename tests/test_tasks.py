@@ -1,5 +1,7 @@
 import json
 import unittest
+from dataclasses import replace
+from datetime import datetime
 from unittest.mock import call, patch
 
 import pandas as pd
@@ -80,33 +82,218 @@ class TaskTests(Fixture, unittest.TestCase):
             initialize_tasks(source, fail)
         self.assertEqual(len(calls), 1)
 
+    def test_pending_float_results_do_not_block_startup(self):
+        frame = tasks(pd.date_range("2021-01-01", periods=3))
+        frame[RESULT_COLUMNS[1:]] = float("nan")
+        cli = FakeCli(frame)
+        store = TaskStore(self.config(), cli, self.task_path)
+        store.recover()
+        self.assertEqual(store.already_succeeded, 0)
+        self.assertEqual(list(store.candidates), list(frame.index))
+        pd.testing.assert_frame_equal(store.df, frame)
+        self.assertFalse(cli.updates)
+
+    def test_old_result_tolerance_keeps_input_and_success_checks(self):
+        config = self.config()
+        digest = config_hash(config)
+        cases = [("0", name, None, name + " 的所有单元格必须为字符串")
+                 for name in ("text", "user_name", "config_hash", "status")]
+        cases += [
+            ("1", "ai_response_content", None, "ai_response_content 的所有单元格必须为字符串"),
+            ("1", "reasoning_content", pd.NA, "reasoning_content 的所有单元格必须为字符串"),
+            ("1", "ai_response_content", "  ", "成功任务的摘要、正文或错误列不一致"),
+            ("1", "config_hash", "", "成功任务的摘要、正文或错误列不一致"),
+            ("1", "error_message", "HTTP 429", "成功任务的摘要、正文或错误列不一致"),
+            ("1", "usage_json", "invalid JSON", "usage_json 必须为标准 JSON"),
+        ]
+        for status, column, value, reason in cases:
+            with self.subTest(status=status, column=column, value=value):
+                frame = tasks(["2021-01-01"])
+                frame["status"] = status
+                frame["config_hash"] = digest
+                if status == "1":
+                    frame["ai_response_content"] = "saved answer"
+                else:
+                    frame[RESULT_COLUMNS[1:]] = float("nan")
+                frame.at[frame.index[0], column] = value
+                cli = FakeCli(frame)
+                with self.assertRaisesRegex(TaskValidationError, reason):
+                    TaskStore(config, cli, self.task_path)
+                self.assertFalse(cli.updates)
+
     def test_reset_claim_and_final_patch_columns(self):
         frame = tasks(pd.date_range("2021-01-01", periods=3))
         frame["status"] = ["9", "-1", "0"]
         frame["ai_response_content"] = "old"
         frame["error_message"] = "old error"
-        original_user_names = frame["user_name"].copy()
+        original_inputs = frame[["text", "user_name"]].copy()
         cli = FakeCli(frame)
         store = TaskStore(self.config(), cli, self.task_path)
         with patch("ai_batch.tasks.config_hash", side_effect=AssertionError("early identity")):
             store.recover()
         self.assertEqual(list(cli.updates[0].columns), ["status"])
-        self.assertTrue(cli.frame["ai_response_content"].eq("old").all())
+        pd.testing.assert_frame_equal(cli.frame.drop(columns="status"), frame.drop(columns="status"))
         keys = store.select(3)
         inputs = store.claim(keys)
         self.assertEqual(inputs[0], (keys[0], "post 0"))
         self.assertEqual(list(cli.updates[-1].columns), ["status", "config_hash"])
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], original_inputs)
+        pd.testing.assert_frame_equal(cli.frame[RESULT_COLUMNS[1:]], frame[RESULT_COLUMNS[1:]])
         result = parse_response(200, success("new", usage={"total_tokens": 7}, created=100).text)
         store.save_results([(keys[0], result), (keys[1], request_failure("network unavailable"))])
         self.assertEqual(list(cli.updates[-1].columns), RESULT_COLUMNS)
         self.assertEqual(cli.frame.at[keys[0], "error_message"], "")
         self.assertEqual(json.loads(cli.frame.at[keys[0], "usage_json"]), {"total_tokens": 7})
-        self.assertEqual(cli.frame.at[keys[0], "response_created"], "100")
+        self.assertEqual(cli.frame.at[keys[0], "response_created"], "1970-01-01 08:01:40")
         self.assertEqual(cli.frame.at[keys[1], "ai_response_content"], "")
         self.assertEqual(store.new_succeeded, 1)
         self.assertEqual(store.new_failed, 1)
         self.assertEqual(store.active_keys, {keys[2]})
-        pd.testing.assert_series_equal(cli.frame["user_name"], original_user_names)
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], original_inputs)
+        self.assertTrue(cli.frame["config_hash"].eq(config_hash(store.config)).all())
+
+    def test_all_update_stages_sort_whole_rows_and_preserve_original_keys(self):
+        timestamp = "2021-01-01 00:00:00.123456789"
+        frame = tasks(pd.DatetimeIndex([
+            "2021-01-02 00:00:00.123456789", timestamp, timestamp, timestamp,
+        ], tz="Asia/Shanghai"))
+        frame.index = pd.MultiIndex.from_arrays([
+            frame.index.get_level_values("date"), ["3", "2", "10", "1"],
+        ], names=["date", "id"])
+        frame["status"] = ["9", "-1", "9", "0"]
+        cli = FakeCli(frame)
+        store = TaskStore(self.config(), cli, self.task_path)
+        store.recover()
+        keys = store.select(4)
+        self.assertEqual(keys, list(frame.index))
+        self.assertEqual(store.claim(keys), [(key, frame.at[key, "text"]) for key in keys])
+        responses = {
+            key: parse_response(200, success(
+                "answer " + frame.at[key, "text"], usage={"total_tokens": i}, created=100 + i,
+            ).text)
+            for i, key in enumerate(keys)
+        }
+        store.save_results([(key, responses[key]) for key in reversed(keys)])
+        self.assertEqual([list(update.columns) for update in cli.updates],
+                         [["status"], ["status", "config_hash"], RESULT_COLUMNS])
+        pd.testing.assert_index_equal(cli.updates[0].index,
+                                      frame.loc[frame["status"].isin(["9", "-1"])].sort_index().index)
+        for update in cli.updates[1:]:
+            pd.testing.assert_index_equal(update.index, frame.sort_index().index)
+        self.assertEqual(list(cli.updates[-1].index.get_level_values("id")), ["1", "10", "2", "3"])
+        for i, key in enumerate(keys):
+            self.assertEqual(cli.frame.at[key, "ai_response_content"], "answer " + frame.at[key, "text"])
+            self.assertEqual(json.loads(cli.frame.at[key, "usage_json"]), {"total_tokens": i})
+            self.assertEqual(cli.frame.at[key, "response_created"], responses[key].response_created)
+        pd.testing.assert_index_equal(store.df.index, frame.index)
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], frame[["text", "user_name"]])
+        self.assertEqual(store.new_succeeded, 4)
+        self.assertFalse(store.active_keys)
+
+    def test_duplicate_result_keys_fail_before_client_update(self):
+        cli = FakeCli(tasks(["2021-01-01"]))
+        store = TaskStore(self.config(), cli, self.task_path)
+        store.recover()
+        key = store.select(1)[0]
+        store.claim([key])
+        before = cli.frame.copy(deep=True)
+        update_count = len(cli.updates)
+        first = parse_response(200, success("first answer").text)
+        second = parse_response(200, success("second answer").text)
+        with self.assertRaisesRegex(TaskValidationError, "同一更新批次的.*不允许重复"):
+            store.save_results([(key, first), (key, second)])
+        self.assertEqual(len(cli.updates), update_count)
+        self.assertIsNone(store.pending_patch)
+        self.assertEqual(store.new_succeeded, 0)
+        self.assertEqual(store.active_keys, {key})
+        pd.testing.assert_frame_equal(cli.frame, before)
+
+    def test_unordered_results_remain_aligned_and_sorted_after_partial_save(self):
+        frame = tasks(["2021-01-01"] * 4)
+        cli = FakeCli(frame)
+        store = TaskStore(self.config(), cli, self.task_path)
+        store.recover()
+        keys = store.select(4)
+        store.claim(keys)
+        final_calls = []
+
+        def update(patch_frame):
+            final_calls.append(patch_frame.copy(deep=True))
+            if len(final_calls) == 1:
+                # 只写入排序后的第二行，重试还须保留其他三行的顺序和答复。
+                cli.apply(patch_frame.iloc[[1]])
+                raise RuntimeError("partial update")
+            cli.apply(patch_frame)
+
+        cli.update_hook = update
+        store.save_results([
+            (keys[i], parse_response(200, success("answer " + frame.at[keys[i], "text"]).text))
+            for i in [2, 0, 3, 1]
+        ])
+        self.assertEqual([list(update.index) for update in final_calls],
+                         [keys, [keys[0], keys[2], keys[3]]])
+        for key in keys:
+            self.assertEqual(cli.frame.at[key, "ai_response_content"], "answer " + frame.at[key, "text"])
+        self.assertEqual(store.new_succeeded, 4)
+        self.assertFalse(store.active_keys)
+        self.assertIsNone(store.pending_patch)
+
+    def test_invalid_created_clears_old_results_and_leaves_completed_history_unchanged(self):
+        config = self.config()
+        frame = tasks(pd.date_range("2021-01-01", periods=2))
+        frame["config_hash"] = config_hash(config)
+        frame["status"] = ["-1", "1"]
+        frame["ai_response_content"] = "old answer"
+        frame["reasoning_content"] = "old reasoning"
+        frame["usage_json"] = '{"total_tokens": 99}'
+        frame["response_created"] = "1791947560"
+        frame["error_message"] = ["old error", ""]
+        historical_success = frame.iloc[[1]].copy(deep=True)
+        cli = FakeCli(frame)
+        store = TaskStore(config, cli, self.task_path)
+        store.recover()
+        keys = store.select(2)
+        self.assertEqual(keys, [frame.index[0]])
+        store.claim(keys)
+        result = parse_response(200, success("new answer", usage={"total_tokens": 7}, created="invalid").text)
+        store.save_results([(keys[0], result)])
+        saved = cli.frame.loc[keys[0]]
+        self.assertEqual(saved["status"], "-1")
+        for column in ("ai_response_content", "reasoning_content", "usage_json", "response_created"):
+            self.assertEqual(saved[column], "")
+        self.assertTrue(saved["error_message"].startswith("response_created 无法转换："))
+        self.assertEqual(store.new_failed, 1)
+        pd.testing.assert_frame_equal(cli.frame.iloc[[1]], historical_success)
+        pd.testing.assert_frame_equal(cli.frame[["config_hash", "text", "user_name"]],
+                                      frame[["config_hash", "text", "user_name"]])
+
+    def test_final_type_error_names_field_and_type_before_any_batch_write(self):
+        cases = [
+            ("response_created", 1791947560),
+            ("response_created", None),
+            ("response_created", datetime(2026, 10, 14, 11, 12, 40)),
+            ("ai_response_content", None),
+            ("reasoning_content", {}),
+            ("error_message", None),
+        ]
+        for column, value in cases:
+            with self.subTest(column=column, actual_type=type(value).__name__):
+                cli = FakeCli(tasks(pd.date_range("2021-01-01", periods=2)))
+                store = TaskStore(self.config(), cli, self.task_path)
+                store.recover()
+                keys = store.select(2)
+                store.claim(keys)
+                before = cli.frame.copy(deep=True)
+                update_count = len(cli.updates)
+                valid = parse_response(200, success(created=1791947560).text)
+                invalid = replace(request_failure("network unavailable"), **{column: value})
+                with self.assertRaises(TaskValidationError) as captured:
+                    store.save_results([(keys[0], valid), (keys[1], invalid)])
+                self.assertEqual(str(captured.exception),
+                                 "最终更新字段必须为字符串：字段={}，实际类型={}".format(
+                                     column, type(value).__name__))
+                self.assertEqual(len(cli.updates), update_count)
+                pd.testing.assert_frame_equal(cli.frame, before)
 
     def test_partial_save_only_rewrites_unconfirmed_keys(self):
         cli = FakeCli(tasks(["2021-01-01", "2021-01-02"]))
@@ -132,6 +319,38 @@ class TaskTests(Fixture, unittest.TestCase):
         self.assertEqual(store.new_succeeded, 2)
         self.assertIsNone(store.pending_patch)
         self.assertFalse(store.active_keys)
+
+    def test_partial_save_with_empty_old_results_only_rewrites_unconfirmed_keys(self):
+        frame = tasks(pd.date_range("2021-01-01", periods=4))
+        for column in RESULT_COLUMNS[1:]:
+            frame[column] = [None, float("nan"), pd.NA, None]
+        untouched = frame.iloc[3:].copy()
+        cli = FakeCli(frame)
+        store = TaskStore(self.config(), cli, self.task_path)
+        store.recover()
+        keys = store.select(3)
+        store.claim(keys)
+        final_calls = []
+
+        def update(patch_frame):
+            final_calls.append(patch_frame.copy(deep=True))
+            if len(final_calls) == 1:
+                cli.apply(patch_frame.iloc[:1])
+                # 未写入的行仍有 NaN/pd.NA，应继续重试，不拒绝本月读回。
+                raise RuntimeError("partial update")
+            cli.apply(patch_frame)
+
+        cli.update_hook = update
+        result = parse_response(200, success("new answer", usage={"total_tokens": 7}).text)
+        store.save_results([(key, result) for key in keys])
+        self.assertEqual([len(patch_frame) for patch_frame in final_calls], [3, 2])
+        self.assertEqual(list(final_calls[1].index), keys[1:])
+        self.assertEqual(store.new_succeeded, 3)
+        self.assertIsNone(store.pending_patch)
+        self.assertTrue(cli.frame.loc[keys, "status"].eq("1").all())
+        self.assertTrue(cli.frame.loc[keys, "config_hash"].eq(config_hash(store.config)).all())
+        pd.testing.assert_frame_equal(cli.frame[["text", "user_name"]], frame[["text", "user_name"]])
+        pd.testing.assert_frame_equal(cli.frame.iloc[3:], untouched)
 
     def test_thrown_update_is_confirmed_by_readback_including_new_hash(self):
         self.document["run"]["storage_max_attempts"] = 1

@@ -90,26 +90,31 @@ def _validate_range(df, start_time, end_time):
 
 
 def _validate_tasks(df):
-    """在恢复或认领前拒绝不完整的任务表与不一致的成功记录。"""
+    """校验任务输入和成功结果，未成功记录的旧结果不阻止重跑。"""
     _validate_index(df)
     if set(df.columns) != set(TASK_COLUMNS):
         raise TaskValidationError("任务表必须恰好包含约定的九个普通列")
-    _validate_strings(df, TASK_COLUMNS)
+    _validate_strings(df, ["config_hash", "text", "user_name", "status"])
     if not df["status"].isin(["0", "9", "1", "-1"]).all():
         raise TaskValidationError("任务状态只能为 0/9/1/-1")
     if any(value and re.fullmatch(r"[0-9a-f]{64}", value) is None for value in df["config_hash"]):
         raise TaskValidationError("config_hash 必须为空或 64 位小写十六进制摘要")
-    for value in df["usage_json"]:
+    succeeded = df["status"].eq("1")
+    if not succeeded.any():
+        return
+    # 成功记录会直接跳过，必须有有效旧结果；其他记录只使用原帖子输入。
+    succeeded_results = df.loc[succeeded, RESULT_COLUMNS[1:]]
+    _validate_strings(succeeded_results, RESULT_COLUMNS[1:])
+    for value in succeeded_results["usage_json"]:
         if value:
             try:
                 parsed = json.loads(value, parse_constant=_reject_constant)
                 json.dumps(parsed, allow_nan=False)
             except (ValueError, TypeError) as exc:
                 raise TaskValidationError("usage_json 必须为标准 JSON") from exc
-    succeeded = df["status"].eq("1")
-    if ((succeeded & df["config_hash"].eq("")).any()
-            or (succeeded & df["ai_response_content"].str.strip().eq("")).any()
-            or (succeeded & df["error_message"].ne("")).any()):
+    if (df.loc[succeeded, "config_hash"].eq("").any()
+            or succeeded_results["ai_response_content"].str.strip().eq("").any()
+            or succeeded_results["error_message"].ne("").any()):
         raise TaskValidationError("成功任务的摘要、正文或错误列不一致")
 
 
@@ -189,10 +194,17 @@ class TaskStore:
                     self.new_failed += status == "-1"
 
     def _write(self, patch, stage):
-        """保存指定列；异常后核对本段，只重写尚未确认的键。"""
+        """按唯一递增的原索引保存指定列；异常后只重写尚未确认的键。"""
         stage_name = {"reset": "恢复状态", "claim": "认领任务", "final": "保存终态"}[stage]
         if self.pending_patch is not None:
             raise BatchPersistenceError(stage, self.pending_patch, "存在尚未确认的更新")
+        if not patch.index.is_unique:
+            raise TaskValidationError("同一更新批次的 (date, id) 不允许重复")
+        # 并发结果按完成顺序到达；整行一起排序，保持原键与答复对应。
+        # 后续部分确认只删除已确认行，剩余重试行仍严格递增。
+        patch = patch.sort_index()
+        if not patch.index.is_monotonic_increasing:
+            raise TaskValidationError("更新行必须按 (date, id) 严格递增")
         # 保留副本以应对部分落库或中断，客户端不能改动待确认快照。
         self.pending_patch = patch.copy(deep=True)
         for attempt in range(self.config.run.storage_max_attempts):
@@ -200,9 +212,10 @@ class TaskStore:
                          stage_name, len(self.pending_patch), list(self.pending_patch.columns),
                          attempt + 1, self.config.run.storage_max_attempts)
             try:
-                self.cli.update_by_index(self.task_path, self.pending_patch.copy(deep=True))
+                # 按列更新，保留本次未提交的帖子输入、摘要及历史结果。
+                self.cli.update_by_column(self.task_path, self.pending_patch.copy(deep=True))
             except Exception as exc:
-                logger.warning("cli.update_by_index 异常，开始同范围读回核对：阶段=%s，尝试=%d/%d，异常类型=%s",
+                logger.warning("cli.update_by_column 异常，开始同范围读回核对：阶段=%s，尝试=%d/%d，异常类型=%s",
                                stage_name, attempt + 1, self.config.run.storage_max_attempts,
                                type(exc).__name__)
                 try:
@@ -212,7 +225,9 @@ class TaskStore:
                         raise TaskValidationError("读回时日期索引类型、时区或精度发生变化")
                     _validate_range(observed, self.start_time, self.end_time)
                     required = ["text", "user_name", "config_hash"] + list(self.pending_patch.columns)
-                    _validate_strings(observed, set(required))
+                    if any(name not in observed.columns for name in required):
+                        raise TaskValidationError("任务缺少必要列")
+                    _validate_strings(observed, ["text", "user_name", "config_hash"])
                     confirmed = []
                     for key in self.pending_patch.index:
                         if key not in observed.index:
@@ -223,7 +238,10 @@ class TaskStore:
                                 continue
                             if observed.at[key, name] != self.df.at[key, name]:
                                 raise TaskValidationError("读回时帖子输入或未提交摘要发生变化")
-                        if all(observed.at[key, name] == self.pending_patch.at[key, name]
+                        # 未写入的结果可能仍是 NaN/pd.NA，不能据此拒绝整月读回。
+                        # 只有字符串且与提交值相等才确认，其余记录保留重试。
+                        if all(isinstance(observed.at[key, name], str)
+                               and observed.at[key, name] == self.pending_patch.at[key, name]
                                for name in self.pending_patch.columns):
                             confirmed.append(key)
                     if confirmed:
@@ -294,13 +312,14 @@ class TaskStore:
         for key, result in results:
             # 只保存最终一次响应的用量和生成时间，不累计中间重试。
             usage = "" if result.usage is None else json.dumps(result.usage, ensure_ascii=False, allow_nan=False)
-            created = result.response_created
-            created = "" if created is None else created if isinstance(created, str) else json.dumps(created, ensure_ascii=False, allow_nan=False)
+            # 生成时间已由响应解析转为北京时间文本，缺失或转换失败时为空。
             row = ["1" if result.success else "-1", result.ai_response_content,
-                   result.reasoning_content, usage, created, "" if result.success else result.error_message]
-            for value in row:
+                   result.reasoning_content, usage, result.response_created, "" if result.success else result.error_message]
+            for column, value in zip(RESULT_COLUMNS, row):
                 if not isinstance(value, str):
-                    raise TaskValidationError("最终更新字段必须为字符串")
+                    # 只报告字段和类型，定位输入来源时不暴露帖子或 AI 回答。
+                    raise TaskValidationError("最终更新字段必须为字符串：字段={}，实际类型={}".format(
+                        column, type(value).__name__))
                 value.encode("utf-8")
             rows.append(row)
         patch = pd.DataFrame(rows, index=self._index([key for key, _ in results]), columns=RESULT_COLUMNS, dtype=object)

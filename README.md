@@ -12,6 +12,8 @@ python -X utf8 -m pip install -r requirements.txt
 
 运行还需要原有环境提供的 `xdata` 包及其连接、认证配置，使 `from xdata.client import get_client` 可用。该包的安装来源和版本尚未核实，请沿用原有安装方式。
 
+处理任务时，客户端须提供 `read` 和 `update_by_column(path, df)`；后者按原索引只更新提交列，保留其他字段。原实现误用 `update_by_index` 已导致任务输入和配置标识缺失，已有受影响数据的恢复方法见 [关键规则第 7 节](docs/KEY_RULES.md#7-保存时只改哪些内容)。
+
 | 文件 | 需要填写的内容 |
 | --- | --- |
 | `job_config.yaml` | 源帖子路径 `source_path`、任务表路径 `task_path`、AI 配置路径 `ai_config_path`、处理起止日期和日志设置。 |
@@ -83,6 +85,6 @@ VS Code 中打开项目根目录，选择已安装依赖和 `xdata` 的解释器
 python -X utf8 -B -m unittest discover -s tests -v
 ```
 
-工作区已有 `.python38` 验证环境时，可将 `python` 换成 `.python38/python.exe`。现有记录为 Python 3.8.10 下 86 项模拟测试通过；真实客户端、AI 接口和大规模容量仍需接入验证，具体限制见 [关键规则](docs/KEY_RULES.md)。
+工作区已有 `.python38` 验证环境时，可将 `python` 换成 `.python38/python.exe`。现有记录为 Python 3.8.10 下 102 项模拟测试通过，包含并发乱序答复的对应关系、每批索引严格递增和部分写入重试；真实客户端、AI 接口和大规模容量仍需接入验证，具体限制见 [关键规则](docs/KEY_RULES.md)。
 
 部署时携带 `main.py`、完整的 `ai_batch` 和 `integration`、两份 YAML 配置、`requirements.txt`，以及按需配置的 `.env`；在新机器安装 Python、公共依赖和原有 `xdata` 环境。

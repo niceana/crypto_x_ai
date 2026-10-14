@@ -96,8 +96,91 @@ class ResponseTests(unittest.TestCase):
         self.assertTrue(parsed.success)
         self.assertEqual(parsed.ai_response_content, "  汉字\n ")
         self.assertEqual(parsed.usage, {"total_tokens": 8})
-        self.assertEqual(parsed.response_created, 1700000000)
+        self.assertEqual(parsed.response_created, "2023-11-15 06:13:20")
         self.assertEqual(parsed.error_message, "")
+
+    def test_created_formats_unix_seconds_as_beijing_text(self):
+        cases = [
+            (1791947560, "2026-10-14 11:12:40"),
+            (1791947560.875, "2026-10-14 11:12:40"),
+            (0, "1970-01-01 08:00:00"),
+            (-1, "1970-01-01 07:59:59"),
+            (-0.5, "1970-01-01 07:59:59"),
+            (-62135596800, "0001-01-01 08:00:00"),
+            (253402271999, "9999-12-31 23:59:59"),
+        ]
+        for value, expected in cases:
+            with self.subTest(created=value):
+                body = self.body()
+                body["created"] = value
+                parsed = self.parse(body)
+                self.assertTrue(parsed.success, parsed.error_message)
+                self.assertEqual(parsed.response_created, expected)
+
+    def test_missing_or_null_created_does_not_fail_valid_answer(self):
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                body = self.body()
+                if missing:
+                    body.pop("created")
+                else:
+                    body["created"] = None
+                parsed = self.parse(body)
+                self.assertTrue(parsed.success)
+                self.assertEqual(parsed.response_created, "")
+                self.assertEqual(parsed.ai_response_content, "  汉字\n ")
+                self.assertEqual(parsed.usage, {"total_tokens": 8})
+
+    def test_invalid_created_fails_and_clears_all_ai_results(self):
+        for value in (True, False, "1791947560", "", "2026-10-14 11:12:40", [], {},
+                      1791947560000, 253402272000, -62135596801, 1e100, -1e100, 10 ** 100):
+            with self.subTest(created=value):
+                body = self.body()
+                body["created"] = value
+                body["choices"][0]["message"]["reasoning_content"] = "本次推理"
+                parsed = self.parse(body)
+                self.assertFalse(parsed.success)
+                self.assertEqual(parsed.http_status, 200)
+                self.assertEqual(parsed.ai_response_content, "")
+                self.assertEqual(parsed.reasoning_content, "")
+                self.assertIsNone(parsed.usage)
+                self.assertEqual(parsed.response_created, "")
+                self.assertTrue(parsed.error_message.startswith("response_created 无法转换："))
+
+    def test_invalid_created_preserves_prior_error_reason(self):
+        cases = [(503, "http"), (200, "api"), (200, "length"), (200, "encoding")]
+        for status, kind in cases:
+            with self.subTest(status=status, kind=kind):
+                body = self.body()
+                body["created"] = "invalid"
+                if kind in ("http", "api"):
+                    body["error"] = {"message": "具体错误"}
+                    expected = "HTTP 503：具体错误" if kind == "http" else "具体错误"
+                elif kind == "length":
+                    body["choices"][0]["finish_reason"] = "length"
+                    expected = "回答被截断"
+                else:
+                    body["choices"][0]["message"]["content"] = "\ud800"
+                    expected = "ai_response_content 无法编码："
+                parsed = self.parse(body, status)
+                self.assertFalse(parsed.success)
+                self.assertTrue(parsed.error_message.startswith(expected))
+                self.assertEqual(parsed.ai_response_content, "")
+                self.assertEqual(parsed.reasoning_content, "")
+                self.assertIsNone(parsed.usage)
+                self.assertEqual(parsed.response_created, "")
+
+    def test_other_failures_keep_current_available_results(self):
+        body = self.body()
+        body["choices"][0]["finish_reason"] = "length"
+        body["choices"][0]["message"]["reasoning_content"] = "本次推理"
+        parsed = self.parse(body)
+        self.assertFalse(parsed.success)
+        self.assertEqual(parsed.error_message, "回答被截断")
+        self.assertEqual(parsed.ai_response_content, "  汉字\n ")
+        self.assertEqual(parsed.reasoning_content, "本次推理")
+        self.assertEqual(parsed.usage, {"total_tokens": 8})
+        self.assertEqual(parsed.response_created, "2023-11-15 06:13:20")
 
     def test_http_errors_preserve_status_and_only_message(self):
         for status in (400, 429, 500, 501, 505, 599):

@@ -12,6 +12,8 @@ api:
   trust_env: false
   payload:
     model: glm-5.3-flash
+    temperature: 0
+    provider_options: max
     messages:
       - role: system
         content: "{{prompts.system}}"
