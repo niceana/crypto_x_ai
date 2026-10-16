@@ -1,1 +1,1 @@
-"""Regression tests for the confirmed module contracts."""
+"""项目模拟测试，不访问真实 AI 或数据系统。"""

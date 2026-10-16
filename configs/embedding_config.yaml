@@ -1,0 +1,16 @@
+# round2事件去重归组使用的 Embedding 检索配置；向量保存在事件去重分析表。
+# 基础地址，例如 https://服务地址/v1；程序在后面追加 /embeddings。
+base_url: ""
+api_key: "${EMBEDDING_API_KEY}"
+model: "bge-m3"
+# 服务端更换权重或编码方式时手动更改，避免混用已有缓存。
+model_version: "bge-m3-v1"
+batch_size: 8
+timeout_seconds: 120
+max_attempts: 3
+backoff_base_seconds: 1
+backoff_max_seconds: 30
+trust_env: false
+# 试运行起点，尚未经过真实样本标定；调高会增加直接判新的数量。
+# 仅组内最高余弦分数 >= 此值的组进入 round2事件去重归组 AI，全部低于则自动 new。
+similarity_threshold: 0.50

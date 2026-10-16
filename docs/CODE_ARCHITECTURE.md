@@ -1,123 +1,92 @@
-# 第二轮、第三轮代码架构草案
+# 代码结构与接口
 
-更新日期：2026-10-14。本文是供确认的结构方案，尚未按此移动或实现代码。已确认的行为以 [三轮计划](../第一轮+第二轮+第三轮计划) 为准；现有实现见 [项目总览](../project_overview.md)。
+2026-10-16 按用户确认方案将公共目录收拢为 9 个功能模块。项目独立运行，代码目录直接位于根目录，不增加顶层包、src 布局或安装步骤。目标与数据流见 [项目总览](../project_overview.md)，实际规则见 [round1事件提取规则](rules/KEY_RULES.md) 和 [事件规则](rules/EVENT_RULES.md)。
 
-## 1. 总体选择
-
-保留现有第一轮入口、配置和任务表。把第一轮中可以共用的网络请求与按列保存能力抽出来；第二轮和第三轮共用这些能力，各自组织业务输入、校验业务回答和调度任务。
-
-第一轮按单帖独立并发，第二轮有同代币的时间依赖，第三轮按有效披露独立并发。三个流程分别实现调度，避免把不同处理顺序藏在一套复杂的通用任务框架中。
-
-第二轮、第三轮共用已确认的统一结果表，不新增输入表、候选表或状态表。普通列仍为 14 个，加上 date、record_id 两个索引项共 16 项。
-
-## 2. 建议目录
+## 1. 目录及依赖方向
 
 ```text
 项目根目录/
-├─ main.py                         现有第一轮启动入口
-├─ job_config.yaml                 现有第一轮任务配置
-├─ ai_config.yaml                  现有第一轮 AI 配置
-├─ event_config.yaml               新增：数据路径、范围、映射和两份 AI 配置路径
-├─ round2_ai_config.yaml            新增：第二轮提示词、接口和运行参数
-├─ round3_ai_config.yaml            新增：第三轮提示词、接口和运行参数
-├─ ai_batch/
-│  ├─ config.py                    共用：AI 配置、认证、模板与请求体构造
-│  ├─ response.py                  共用：HTTP 响应和 choices 外层解析
-│  ├─ network.py                   新增：从 runner 抽出的网络执行与统一请求预算
-│  ├─ persistence.py               新增：从 tasks 抽出的按列写入、排序与保存重试核心
-│  ├─ tasks.py                     第一轮任务表和业务状态
-│  ├─ runner.py                    第一轮逐月调度，调用共用网络能力
-│  └─ __init__.py                  保留现有公开入口
-├─ event_pipeline/
-│  ├─ config.py                    读取和校验扩展任务配置
-│  ├─ records.py                   第一轮检查、代币映射、展开与确定性 ID
-│  ├─ store.py                     统一结果表读取、认领、结果保存和续跑恢复
-│  ├─ history.py                   截至指定时点的历史索引与事件组时间线
-│  ├─ retrieval.py                 记录召回、融合排序、归组与 Top 10 选择
-│  ├─ relation.py                  第二轮输入、输出校验、关联处理与调度
-│  ├─ impact.py                    第三轮输入、输出校验与并发调度
-│  └─ __init__.py                  发布初始化、第二轮和第三轮调用入口
-├─ integration/
-│  ├─ initialize_tasks.py          保留：现有第一轮任务初始化
-│  ├─ initialize_event_records.py  新增：初始化统一结果表
-│  ├─ run_round2.py                新增：读取配置、创建客户端、启动第二轮
-│  ├─ run_round3.py                新增：读取配置、创建客户端、启动第三轮
-│  └─ __init__.py
-├─ docs/
-│  ├─ CODE_ARCHITECTURE.md         本架构草案
-│  ├─ KEY_RULES.md                 现有第一轮运行规则
-│  └─ data/TABLE_DESIGN.md         现有第一轮任务表
-└─ tests/                          保留已有测试，按职责新增验证
+├─ main.py                       round1事件提取及自动导入启动入口
+├─ configs/                      两份任务配置、三份 AI 配置、Embedding 配置及 .env.example
+├─ common/                       9 个功能模块，另有 __init__.py
+│  ├─ config.py                  配置加载、对象、模板检查和摘要
+│  ├─ ai_protocol.py             大模型请求体构造、响应解析及答复类型
+│  ├─ validation.py              表字段、结构检查和三轮输出校验
+│  ├─ event_context.py           原帖正文、业务输入、候选及组内时间线
+│  ├─ time_rules.py              事件时间解析和范围选择
+│  ├─ store.py                   TableStore、PostTaskStore、EventRecordStore 及汇总
+│  ├─ network.py                 作业、限速、重试、完成消息和线程关闭
+│  ├─ execution.py               round1事件提取与round3事件影响分析共用分段并发执行
+│  └─ persistence.py             排序、按列更新和存储重试
+├─ initialization/
+│  ├─ post_tasks.py              round1事件提取任务初始化及 InitializationSummary
+│  └─ event_records.py           事件展开、自动导入和独立续建
+├─ round1/runner.py              round1事件提取执行和成功帖回调
+├─ round2/                       round2事件去重归组：调度、候选校验及向量检索
+├─ round3/runner.py              round3事件影响分析前提检查、历史准备和执行
+├─ entrypoints/                  五种独立任务入口及 runtime.py
+├─ tests/                        common、initialization、各轮及 entrypoints
+└─ docs/                         规则、字段、研究计划及历史方案
 ```
 
-暂不移动现有第一轮配置到新目录，减少对启动方式、部署和现有路径的影响。第一轮与扩展阶段的配置用途清楚，认证继续通过环境变量或 .env 提供。
+common 包含基础能力及共用业务约定，只依赖本目录、标准库和已有第三方库，不导入初始化、轮次或入口。各轮依赖 common，不互相导入；初始化依赖公共数据约定和保存能力，不依赖轮次运行器。入口协调客户端、配置及业务函数。
 
-## 3. 哪些直接复用，哪些调整
+## 2. 配置、业务输入与请求构造
 
-| 能力 | 处理方式 | 原因 |
-| --- | --- | --- |
-| AI 配置与认证 | 复用 ai_batch/config.py。 | 第二轮、第三轮的提示词、模型和运行参数不同，配置结构相同。 |
-| 提示词和请求体构造 | 复用现有 render_payload。 | 把结构化业务输入序列化为 JSON 文本，填入现有 task.text 变量即可。 |
-| HTTP 响应外层解析 | 复用 ai_batch/response.py。 | choices、正文、推理、usage 和接口错误与事件业务无关。 |
-| 并发请求、限速、网络重试与停止 | 从 runner.py 移入 network.py 后共用。 | 避免三轮各自维护 HTTPX、网络线程和请求预算。 |
-| 业务回答校验及重试 | 共用网络层增加可选的业务校验函数，具体规则由 relation/impact 提供。 | 当前第一轮只校验外层响应；新两轮还需检查回答中的 JSON、枚举和匹配 ID。 |
-| 按列保存核心 | 从 tasks.py 抽出与表结构无关的提交、排序、读回核对和存储重试。 | 第一轮与统一结果表都需要同一套可靠写入机制。 |
-| 任务表规则 | 第一轮 TaskStore 保留，新增 ResultStore。 | 两张表的索引、列、状态字段和不可修改输入不同。 |
-| 调度 | 第一轮保留；第二轮和第三轮在各自模块实现。 | 第二轮必须等待同代币前一条关联保存，第三轮可独立并发。 |
+common.config 按配置类别提供加载入口：load_job_config 读取round1事件提取任务 YAML 并检查调用方指定的必填字段；load_event_config 读取事件任务配置；load_ai_config 读取 AI 配置、加载同目录可选 .env，并检查模板及参数。向量配置另由下文的 load_embedding_config 加载。各入口原有的日志、路径冲突等检查继续留在调用方，顺序不变。初始化不加载 AI 配置；第二轮全部完成或无待处理任务时直接返回，第三轮只在需要分析 new/update 时加载 AI 配置。第一轮仍在读取任务表前加载并校验其 AI 配置，即使范围内任务全部成功也需要配置可加载。
 
-共用保存模块只处理写入机制。表结构校验、业务合法性和阶段可更新列由各自的 store 负责，不让保存模块识别事件关系或第三轮评分。
+配置仍位于 configs，相对 AI 配置按任务配置所在目录解析，绝对路径继续支持；环境变量优先于 .env。ai_config_hash 仍只基于原始提示词及 api.payload，URL、认证、并发和重试参数不参与摘要。
 
-## 4. 共用网络层的接口边界
+common.event_context 的 build_current_record_input 供第二、三轮组织固定 event 和定位字段；第二轮不读取原帖。load_source_texts 仅供第三轮，build_impact_input 在认领后补入原帖正文及必要历史；build_relation_input 在检索后序列化当前事件及候选。round1事件提取仍直接使用原帖正文。
 
-业务模块提交一个请求任务，包含原记录键、已构造的输入文本和可选业务输出校验函数。网络层负责构造 payload、限速、发请求、解析外层响应，并在需要时调用业务校验函数。
+common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮一次读取全事件表，窗口筛选和按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
-网络层只接受校验函数，不直接导入第二轮或第三轮业务模块。校验函数使用本任务固定的上下文，例如当前资产、时间边界及本次候选 ID；不读写数据库，不查询已经变化的历史索引。
+common.ai_protocol.render_payload 接收已准备的文本，完成一次模板替换和请求体编码检查，不读取数据库、不重新查询历史。TaskRenderError 也由 common.ai_protocol 定义。配置加载不依赖 ai_protocol；ai_protocol 使用 AIConfig 和同一模板变量语法。
 
-网络故障、可重试 5xx 和新两轮业务校验失败在同一个请求循环中计数，共用 max_attempts。只对已识别的输出错误重试，不把程序自身的异常一概当作 AI 回答错误。
+## 3. 表结构与三轮输出校验
 
-最终完成消息包含原记录键、外层解析结果、业务解析结果及实际请求次数。第一轮不传入新的业务校验函数，保持已确认的外层校验与失败规则；新两轮取业务解析结果写入统一结果表。
+common.validation 的 POST_RESULT_COLUMNS 和 TASK_COLUMNS 定义round1帖子事件提取表，RESULT_COLUMNS 和 RELATION_COLUMNS 定义事件去重分析表及关联业务列。IMPACT_FIELDS 只定义第三轮正文内的五个字段，不再对应数据库独立列。事件去重分析表为 14 个普通列，第二、三轮分别使用 round2_ai_response、round3_ai_response 保存原始回答和调用信息。共用 validate_index 后仍保留各自的索引、日期和字段检查，不合并不同输入的约束。
 
-现有模板支持 task.text。第二轮填写当前披露和候选历史的 JSON，第三轮填写当前有效信息及必要历史的 JSON。无需为每个业务字段新增模板变量；输入文本仅在任务处理期间存在于内存。
+common.validation 集中 parse_strict_json 和三轮独立校验：
 
-## 5. 第二轮真实处理顺序
+- validate_extraction_output 检查 events/event/tickers，供round1事件提取请求及事件导入共用；空事件和空代币数组在格式层面合法。导入另对空 tickers 查账号映射，无映射时停止本次全部导入，尚未写入事件表；缺少 tickers 字段则不通过格式校验。
+- validate_relation_output 检查三字段、关系枚举及本次候选 ID，候选快照由调用方传入。
+- validate_impact_output 保留五字段非空字符串检查，round3事件影响分析仍支持注入 validator；具体评分枚举没有新增。
 
-1. 读取配置和数据，检查本范围第一轮所有任务已完成、结果合法；确认统一结果表已经完整导入。
-2. 恢复本阶段遗留状态，并检查所需前史已完成关联。有缺口时停止提示，不扩大日期范围。
-3. 从已确认关联的记录恢复历史索引；第二轮未完成的行不能进入事件组历史，第三轮是否完成不影响检索资格。
-4. 按代币建立时间顺序，选择当前可处理的一条或同一时刻的一批记录，保存 round2_status=9。
-5. history 提供当前时点之前的可检索记录；retrieval 召回、排序并选择最多十个不同事件组；history 构造这些组的起点与进展。
-6. relation 构造输入并提供输出校验函数，交给共用网络层；程序自动判新则直接生成本阶段结果。
-7. 正常 uncertain 转为 new；其他结果按已确认规则分配 event_id，统一保存关联字段、状态和错误字段。
-8. 保存确认后更新历史索引，再推进该代币下一条；相同发布时间使用同一份此前历史，完成该批后才加入索引。不同代币之间可以并发。
-9. 普通任务最终失败时，暂停该代币后续记录，其他代币继续；停止型接口错误仍停止整体运行。
+OutputValidationError 由网络层计入同一任务的原请求预算。HTTP 外层响应及生成时间解析继续位于 common.ai_protocol，不与正文校验混合。common.time_rules 只解析业务时间用于校验、排序和范围选择，保存仍用原索引。
 
-relation.py 包含第二轮自己的输入与输出处理，以及这一阶段的协调流程。网络执行、数据库写入、检索评分和历史组织分别调用对应模块，不在此重复实现。
+## 4. Store 与保存
 
-## 6. 第三轮真实处理顺序
+三个 Store 集中在 common.store，各自职责保留。TableStore 负责工作快照、原索引定位、阶段恢复、认领、字符串更新检查、提交和统计，不解释 new/update/repeat。PostTaskStore 负责round1事件提取任务选择及答复转换；EventRecordStore 负责事件去重分析表的round2事件去重归组与round3事件影响分析保存及跨阶段约定，不拆成重复的两个 Store。
 
-1. 读取配置，检查本范围第二轮全部任务已完成且关联结果合法。
-2. 恢复本阶段遗留状态；选出第二轮已完成、第三轮待处理的 new/update。repeat 已按规则将第三轮标为完成，不调用 AI。
-3. 保存 round3_status=9。对 update，history 提供匹配组截至本次披露之前的必要状态，impact 构造以本次新增事实为核心的输入。
-4. 交给共用网络层并发请求，由 impact 的校验函数检查五个经济影响字段。
-5. 成功时共同保存经济影响字段、round3_status=1 和空错误；失败时共同保存 round3_status=-1 和错误原因。
-6. 单条普通失败不影响其他记录，也不修改第二轮结果或状态。
+TableStore.update_stage_columns 更新当前阶段指定列，数据库调用返回后由 _apply_saved_patch 同步内存；count_completed 返回完成数量。SegmentCoordinator.should_flush 只判断是否满足保存条件，实际保存仍由 flush 执行。名称直接区分数据更新、内存同步、计数及布尔判断，处理顺序不变。
 
-第三轮不再执行 Top 10 检索，也不重新进行事件关联。
+业务转换生成本次更新列后，由 common.persistence.write_columns 按原索引整行排序，再以同一批次调用 update_by_column。EventRecordStore 将最后一次响应和实际请求次数交给保存层，不再丢弃 usage、响应时间或原始 uncertain。第三轮正文已在网络入口校验，保存时不重复校验或拆列。回答 JSON 不含推理文本，结构见 [表约定](data/EVENT_RESULT_TABLE.md#两轮-ai-回答的保存口径)。
 
-## 7. 数据、线程和依赖
+write_columns 的可选 prepare_write 回调只用于两轮回答保存，在每次提交前补当前北京时间 created，解决存储重试等待后仍记录首次时间的问题；其余写入不使用回调。每次提交前保留实际提交值的副本，防止客户端修改入参；正常返回后同步该副本。write_with_retry 不重新调用 AI，重试保持原逻辑批次，仅 created 随提交时间更新。内存同步失败停止并保留答复，不重新进入数据库写入预算。新表 write 和新索引 update_by_index 继续共用同一存储重试函数。
 
-integration 只负责读取配置、设置日志、创建 xdata 客户端和调用业务入口。客户端的读写留在调用线程，所有结果更新由本阶段协调程序提交；并发 AI 网络请求继续放在独立网络线程。
+全表阶段摘要由 common.store.read_stage_hashes 调用 `cli.read(task_path, start_time='', end_time='', columns=[hash_column])` 取得，从返回的 DataFrame 中取摘要列原值。只有本次确实需认领时检查，跨月复用核对后的摘要；读取失败或返回缺列时停止，不回退整表读取。普通列原值使用，不增加读取质检或自动修复。
 
-同一结果表沿用单个处理程序协调写入的约定，不引入多进程抢任务机制。第二轮、第三轮分别启动和续跑，程序内部支持并发请求。
+## 5. 执行和业务差异
 
-event_pipeline 的 config 仅负责路径、范围、映射和日志等任务设置；两份 AI 配置分别交给现有 AI 配置模块读取。业务模块依赖共用网络与保存模块，共用模块不反向依赖业务模块。
+common.network.NetworkWorker 只处理 RequestJob，在网络线程内完成该作业的请求尝试并返回 CompletionMessage。任务键只用于关联答复，业务校验回调使用同一请求预算。数据操作仍在调用线程。
 
-history 和 retrieval 分开，是因为第二轮需要检索候选，第三轮只需要回查已匹配组的历史；检索评分后续还需要独立测量召回质量。当前不新增向量数据库，也不为尚未确定的评分和提示词生成假结果。
+round1事件提取与round3事件影响分析使用 common.execution.run_segments 和 SegmentCoordinator，共用分段加载、网络名额、结果缓冲、批量保存和停止收尾。各轮提供任务选择、输入、校验及汇总。
 
-## 8. 改动范围与验证
+round2事件去重归组保留独立调度：同币按发布时间推进，同一时点共享此前历史，当前时点全部保存后才加入历史；普通最终失败暂停该币，其他币继续。
 
-新增两个共用模块、event_pipeline、三个扩展入口和三份配置。修改第一轮 runner/tasks，使其委托共用能力；保留现有公开入口、第一轮表结构、日期规则及已确认行为。
+两种初始化保留不同流程。post_tasks 对完整源帖一次建表，不重试、不读 AI 配置；event_records 负责事件展开、映射和去重，并保留自动导入及独立 auto/create/resume 的不同检查。主入口自动导入不重读round1事件提取，只在存在读取时已成功帖时读一次已有事件去重分析表去重。
 
-抽取网络和保存代码会影响现有测试引用的内部路径，需同步调整模拟调用位置。先运行第一轮既有回归验证，再检查新阶段的前置检查、映射、稳定 ID、历史时间边界、同代币推进、统一重试预算、阶段独立恢复及按列保存。
+## 6. 入口、测试与后续接入
 
-真实 xdata 的新增行、索引和写入一致性仍需小样接入验证。评分标准、历史裁剪预算与提示词后置细化，检索模块的质量不能仅靠流程测试宣称通过。
+根目录 main.py 保留可调用的 main，并转调 entrypoints.run_round1.execute_round1。根入口和模块入口共用round1事件提取退出处理，保留调用脚本的日志来源、标准异常栈及退出码 0、1、130。其他入口为 entrypoints.initialize_tasks、entrypoints.import_events、entrypoints.run_round2 和 entrypoints.run_round3。
+
+entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客户端接入及退出处理。round1事件提取初始化保留具体错误提示，round1事件提取处理保留原异常处理流程。日志来源随迁移后的模块名称更新，正文、提示词和认证仍不主动写入日志。
+
+测试与源码职责对应，事件配置、三轮输出和公共 Store 测试统一归入 tests/common；各轮执行、初始化和入口测试仍独立。基础夹具位于 tests/support.py，事件模拟表及 EventFixture 位于 tests/event_support.py。
+
+本次公共模块归并完整保留当前 255 项测试及原断言，包含已确认的表内向量与阈值规则。迁移后 54 个源码及测试模块对照实际工作区语法树，处理代码和数据字面值一致，9 份配置文件指纹保持原样；验证结果见 [公共模块收拢记录](history/COMMON_MODULE_CONSOLIDATION.md)。此前符号变化见 [命名统一记录](history/NAMING_CONSISTENCY.md)，目录迁移背景保留在 [合并记录](history/COMMON_DIRECTORY_MERGE.md)。
+
+按列摘要 CLI 已按用户确认的调用方式接入；真实 Embedding 服务配置、提示词和经济评分枚举仍待接入，检索召回质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
+
+上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当前事件去重分析表为 14 个普通列，完整 267 项模拟测试通过。向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。

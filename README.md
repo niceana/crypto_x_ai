@@ -1,90 +1,140 @@
-# AI 帖子批量处理
+# AI 帖子三轮处理项目
 
-本工具先把现有帖子建立为任务，再调用 AI 处理指定日期范围的任务，保存每帖最新结果。项目结构见 [项目总览](project_overview.md)，重要处理行为见 [关键规则](docs/KEY_RULES.md)，字段见 [任务表](docs/data/TABLE_DESIGN.md)。
+本项目从帖子提取事件，建立按代币划分的披露记录，关联历史事件，再分析经济影响。项目独立运行，不需要打包或安装本项目；三个轮次分别启动，round1事件提取正常结束后自动导入成功帖。
 
-## 准备环境
+三个轮次统一称为 **round1事件提取**、**round2事件去重归组**、**round3事件影响分析**。两张表按用途区分：
 
-使用 Python 3.8，并安装项目锁定的公共依赖：
+| 表名 | 数据粒度与用途 | 对应配置 |
+| --- | --- | --- |
+| round1帖子事件提取表 | 一帖一行，保存原帖输入、提取结果及状态 | `job_config.yaml` 的 `task_path`；独立导入来源为 `event_config.yaml` 的 `first_round_task_path` |
+| 事件去重分析表 | 一条事件 × 一个代币一行，共用保存归组结果、向量及影响分析结果 | `event_config.yaml` 的 `result_path` |
+
+本次统一显示名称，现有配置键、路径值和真实数据表路径保留。配置中的旧称呼占位文本也保持原值，填写时以上表为准。“去重归组”通过 new/update/repeat 和事件组表达披露关系，仍保留每条记录。完整职责见 [项目总览](project_overview.md#统一主题与表名)。
+
+事件去重分析表当前为 14 个普通列，第二、三轮 AI 回答分别保存在 round2_ai_response、round3_ai_response 两个 JSON 字符串列，第三轮五个影响字段保留在原始正文内。回答列还保存最后一次响应 usage、接口生成时间、实际请求次数，以及提交数据库前的北京时间 created，不保存推理文本。字段、失败和存储重试口径见 [表结构](docs/data/EVENT_RESULT_TABLE.md#两轮-ai-回答的保存口径)。
+
+## 环境与配置
+
+使用现有 Python 环境安装 `requirements.txt` 中的依赖，并确保运行环境可导入已有数据客户端 `xdata`。仓库中的 `.python38` 用于当前本地验证；正式运行使用已有可访问数据系统的解释器。
 
 ```powershell
-python -X utf8 -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-运行还需要原有环境提供的 `xdata` 包及其连接、认证配置，使 `from xdata.client import get_client` 可用。该包的安装来源和版本尚未核实，请沿用原有安装方式。
-
-处理任务时，客户端须提供 `read` 和 `update_by_column(path, df)`；后者按原索引只更新提交列，保留其他字段。原实现误用 `update_by_index` 已导致任务输入和配置标识缺失，已有受影响数据的恢复方法见 [关键规则第 7 节](docs/KEY_RULES.md#7-保存时只改哪些内容)。
-
-| 文件 | 需要填写的内容 |
+| 文件 | 用途 |
 | --- | --- |
-| `job_config.yaml` | 源帖子路径 `source_path`、任务表路径 `task_path`、AI 配置路径 `ai_config_path`、处理起止日期和日志设置。 |
-| `ai_config.yaml` | 提示词、真实 AI 接口 URL、请求参数及运行参数。 |
-| 环境变量或 `.env` | AI 认证信息；默认认证配置读取 `AI_API_KEY`。可参考 `.env.example`。 |
+| `configs/job_config.yaml` | 源帖子路径、round1帖子事件提取表、日期范围、round1事件提取 AI 配置和日志 |
+| `configs/event_config.yaml` | round1帖子事件提取表的来源路径、事件去重分析表的目标路径、日期范围、代币映射、检索和 round2/round3 AI 配置路径 |
+| `configs/round1_ai_config.yaml` | round1事件提取提示词、AI 接口、请求及运行参数 |
+| `configs/round2_ai_config.yaml` | round2事件去重归组提示词、接口、请求及运行参数 |
+| `configs/round3_ai_config.yaml` | round3事件影响分析提示词、接口、请求及运行参数 |
+| `configs/embedding_config.yaml` | round2事件去重归组使用的 bge-m3 地址、模型、每批条数、重试及相似度阈值 |
+| 进程环境或 `configs/.env` | AI_API_KEY、EMBEDDING_API_KEY，参考 `configs/.env.example` |
 
-`.env` 放在 AI 配置文件所在目录，同名进程环境变量优先。公司接口请求体使用 `messages`，模型及其他参数由 `api.payload` 提供。默认空 URL、缺失或为空的认证变量会使批量处理启动失败。
+入口按脚本位置读取项目的 `configs`，不依赖当前工作目录。两份任务配置中的相对 AI 配置路径按配置所在目录解析，例如round1事件提取填写 `ai_config_path: "round1_ai_config.yaml"`；绝对路径继续支持。数据系统路径原样传给客户端。
 
-## 第一次建立任务表
+`.env` 继续与 AI 配置放在同一目录，进程环境优先。因此使用本地文件时放在 `configs/.env`；不要只移动 YAML 而留下原根目录 `.env`。自定义绝对 AI 配置路径时，仍查找该文件同目录的 `.env`。
 
-在 `job_config.yaml` 中填写实际 `source_path` 和尚未创建的新 `task_path`，两个路径必须不同。从项目根目录执行：
-
-```powershell
-python -X utf8 -m integration.initialize_tasks
-```
-
-初始化完整读取现有帖子，校验后注册目标，再一次写入完整任务表。它不使用处理起止日期，也不读取 AI 配置或调用 AI。源数据要求见 [关键规则](docs/KEY_RULES.md)。
-
-成功建立任务表后运行 `main.py`。初始化失败时先核查目标是否已注册、是否已有部分数据；使用尚未注册的新目标，或按真实客户端规则处理原目标后再重跑。仅清空数据不代表重复注册一定安全。
-
-## 批量处理已有任务
-
-设置好任务表路径、AI 配置及认证信息，从项目根目录执行：
-
-```powershell
-python -X utf8 main.py
-```
-
-起止日期使用带引号的 `YYYY-MM-DD` 字符串，包含起止日期全天。例如处理 2021 年全年：
+起止日期使用带引号的 `YYYY-MM-DD`，必须同时设置或同时不设置，包含起止日全天。有日期范围时，round1事件提取与round3事件影响分析按自然月分段；两端为空时保留原全表方式。
 
 ```yaml
 start_time: "2021-01-01"
 end_time: "2021-12-31"
 ```
 
-两端必须同时设置或同时不设置，起点不能晚于终点；起止同日表示处理当天。有日期范围时按自然月依次处理；没有两端日期时读取全表一次。
+## 初始化和日常运行
 
-入口配置固定从项目根目录读取；相对的 `ai_config_path` 按项目根目录解析，数据路径原样交给客户端。已有应用也可自行管理客户端，直接调用：
+从项目根目录执行。第一次建立round1帖子事件提取表前，在 `configs/job_config.yaml` 填写源 `source_path` 和尚未创建的 `task_path`，两者必须不同：
+
+```powershell
+python -X utf8 -m entrypoints.initialize_tasks
+```
+
+round1事件提取初始化完整读取源帖，校验后注册目标并一次写入，不使用处理日期、不读取 AI 配置、不调用 AI。注册成功但写入失败可能留下空目标；须按真实客户端规则处理原目标或使用尚未注册的新目标，再重新初始化。仅清空数据不代表可安全重复注册。
+
+配置好round1事件提取 AI，以及事件配置的 `result_path` 和所需账号映射后，日常依次执行：
+
+```powershell
+python -X utf8 main.py
+python -X utf8 -m entrypoints.run_round2
+python -X utf8 -m entrypoints.run_round3
+```
+
+`main.py` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 job_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
+
+当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型和 system 提示词也为空。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围；第二、三轮当前日期为空，表示全表处理。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
+
+round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时round1事件提取结果保留，重新运行同范围可跳过成功帖 AI 并补导。没有成功帖时不创建事件去重分析表。
+
+历史数据独立导入使用：
+
+```powershell
+python -X utf8 -m entrypoints.import_events
+```
+
+独立导入使用 `configs/event_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功；initialize_mode 支持 auto/create/resume，只控制该独立入口。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
+
+`configs/event_config.yaml` 已包含用户提供的 50 组账号代币映射，保留原名单大小写及迁移备注。原名单 `screen_name` 对应原帖 `user_name`，`ticker` 转为代币列表。空 tickers 使用账号映射，例如：
+
+```yaml
+user_name_to_tickers:
+  ethereum: ["ETH"]
+  project_account: ["ETH", "LEND"]
+```
+
+`tickers: []` 在第一轮属于合法输出，导入时才按原帖 `user_name` 精确查映射；没有映射会报错并停止本次整批导入，其他成功帖的事件本次也不会新增。第一轮已保存结果及成功状态保留，不为无代币事件创建失败行；补齐映射后重跑同一范围的 main.py 可补导。若整个 tickers 字段缺少、为 null 或类型不合法，则第一轮输出校验失败并按请求预算重试。`events: []` 表示没有事件，不查映射。具体例子见 [事件展开规则](docs/rules/EVENT_RULES.md#2-检查round1事件提取并展开记录)。
+
+round2事件去重归组默认使用 `embedding_config_path: "embedding_config.yaml"` 指向的 bge-m3 纯向量检索。填写该文件的 base_url，例如 `https://服务地址/v1`，程序追加 `/embeddings`；把密钥填入 `configs/.env` 的 EMBEDDING_API_KEY 或进程环境。默认每批 8 条，只编码 event；生成后保存到事件去重分析表的 embedding 列，JSON 包含 model、model_version、config_hash 和 vector，重启复用。config_hash 只标识服务、模型、版本和编码规则，不含 event；同名模型更换权重时要修改 model_version，人工修改 event 时须清空该行向量并确定下游重算范围。第二轮只使用 event 和候选历史，不再读取原帖；第三轮保留正文输入。初始化已包含该列，不使用 SQLite。
+
+用户确认模型已输出归一化向量；程序保留返回数值，直接用内积计算余弦相似度，不再归一化或转成 float32。仍校验格式、维度、有限数值、非零向量及单位范数，范数允许绝对误差 1e-5；新响应不满足约定时使用该批剩余请求预算重试，耗尽后停止。
+
+检索仍限定同币前 180 天，按事件组最高余弦分数筛选，只将分数大于等于 similarity_threshold 的 Top 10 组交round2事件去重归组；无历史或所有组都低于阈值时直接 new，继续round3事件影响分析。默认阈值 0.50 是待真实样本标定的试运行起点，可在 Embedding 配置调整：
+
+```yaml
+similarity_threshold: 0.50
+```
+
+调高阈值会增加直接判新，调低会增加round2事件去重归组调用；更改只影响待处理记录，不自动重算已完成关联。Embedding 或向量保存失败停止本轮；存储重试不重复请求向量。自定义检索可用 retriever 的 `模块:函数` 覆盖，应用也可直接注入函数。完整格式与失败规则见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
+
+round2事件去重归组与round3事件影响分析正式提示词和真实接口仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。
+
+## 代码目录与应用内调用
+
+`common` 统一放公共能力和共用业务约定；`initialization` 放两种初始化；`round1`、`round2`、`round3` 放各轮执行流程；`entrypoints` 负责配置和客户端接入。目录直接位于根目录，不套顶层包。
+
+公共目录共 9 个功能模块：`config.py` 加载各类配置；`ai_protocol.py` 构造三轮大模型请求体并解析接口响应；`validation.py` 集中表字段、结构检查及三轮输出校验；`event_context.py` 组织业务输入和事件历史。其余为独立的时间规则、网络、分段执行、Store 和存储重试。三个 Store 的职责保留，具体依赖见 [代码结构](docs/CODE_ARCHITECTURE.md)，文件对应关系见 [公共模块收拢记录](docs/history/COMMON_MODULE_CONSOLIDATION.md)。
+
+`common/time_rules.py` 继续独立保留，负责解析完整发布时间、按包含首尾日的范围判断和选择数据；原始索引及其时区不转换。它供校验、Store、事件上下文及导入共用，不随本次文字调整移动或修改。
+
+已有应用可自行管理客户端，直接调用：
 
 ```python
-from ai_batch import run_worker
+from round1.runner import run_extraction
 
-summary = run_worker(
-    cli,
-    settings["task_path"],
-    settings["ai_config_path"],
-    start_time=settings.get("start_time"),
-    end_time=settings.get("end_time"),
+summary = run_extraction(
+    cli, task_path, config_path,
+    start_time="2021-01-01", end_time="2021-12-31",
 )
 ```
 
-该入口会阻塞调用线程。应用内初始化使用 `integration.initialize_tasks.initialize_existing_posts(cli, settings)`；仅导入初始化接入模块不会创建客户端。
+该函数同步处理round1事件提取，返回 ExtractionSummary；仅主入口负责自动导入。可选 `on_successful_posts(new_posts, previous_posts)` 在分段保存完成后交出成功帖副本。初始化接入为 `entrypoints.initialize_tasks.initialize_existing_posts(cli, settings)`；直接业务函数的完整路径见 [项目总览](project_overview.md)。模块迁移见 [公共目录合并记录](docs/history/COMMON_DIRECTORY_MERGE.md)，类和函数名称对应见 [命名统一记录](docs/history/NAMING_CONSISTENCY.md)。
 
-## 日志与调试
+## 日志、停止和调试
 
-两个独立入口通过 `job_config.yaml` 的 `logging` 设置日志，默认显示 INFO；应用内调用包接口时由应用配置日志。INFO 显示月份、进度及完成统计，WARNING 显示重试和单帖失败，ERROR 显示整体停止及保存故障，DEBUG 可查看逐帖和保存细节。
+入口使用任务配置的 logging，级别和各入口既有默认格式保留；日志模块名称随目录更新。INFO 显示进度和统计，WARNING 显示重试和单条失败，ERROR 显示整体停止和保存故障。常规项目日志不主动输出正文、提示词、认证或完整响应；外部异常说明仍按原文显示。
 
-批量处理异常使用标准日志显示类型、消息、调用栈和异常链；初始化入口显示异常类型和具体原因。常规日志不主动打印正文、提示词、认证信息或完整响应，外部异常消息仍按原文显示。“worker 收尾结束”只表示清理流程结束，不代表任务全部成功或结果全部保存。
+各轮专用日志使用完整主题名称，建表、读取及导入日志明确表名。公共网络与分段执行日志使用通用任务描述；内部阶段标识 `round1/round2/round3`、异常文本和错误字段继续沿用原值。
 
-正常退出码为 0，普通异常为 1，用户中断为 130。停止整个程序是当前的停止方式；已保存状态和重启行为见 [关键规则](docs/KEY_RULES.md)。
+退出码继续为成功 0、普通异常 1、用户中断 130。round1事件提取初始化保留具体错误和目标核查提示；其他入口保留标准异常栈。停止程序后重启各自入口继续处理，恢复、保存和历史时间边界见 [round1事件提取规则](docs/rules/KEY_RULES.md) 与 [事件规则](docs/rules/EVENT_RULES.md)。
 
-VS Code 中打开项目根目录，选择已安装依赖和 `xdata` 的解释器，打开 `integration/initialize_tasks.py`，使用右上角的 **Python Debugger: Debug Python File**。现有 `.vscode/launch.json` 为这个按钮提供项目导入路径和 UTF-8 设置；终端初始化使用上面的模块命令。
+VS Code 打开项目根目录并选用已安装依赖和 xdata 的解释器。打开 `entrypoints/initialize_tasks.py` 等入口，使用 **Python Debugger: Debug Python File**；现有 `.vscode/launch.json` 为当前文件提供根目录导入路径和 UTF-8 设置，无需安装项目。
 
-## 本地验证与部署
+## 验证和文档
 
-可运行模拟测试：
+模拟测试按公共能力、初始化、轮次和入口分组，公共模拟客户端在 tests/support.py 与 tests/event_support.py。2026-10-16 按列摘要接口接入后，完整 267 项测试通过；包含三轮摘要列查询、跨月复用与读取失败停止，以及 23 项表内向量与阈值测试中的模型输出原值保存及复用、第二轮不读原文、共用网络重试及 1024 维相似度。测试不访问真实 AI 或数据库：
 
 ```powershell
-python -X utf8 -B -m unittest discover -s tests -v
+python -X utf8 -B -m unittest discover -s tests -t . -q
 ```
 
-工作区已有 `.python38` 验证环境时，可将 `python` 换成 `.python38/python.exe`。现有记录为 Python 3.8.10 下 102 项模拟测试通过，包含并发乱序答复的对应关系、每批索引严格递增和部分写入重试；真实客户端、AI 接口和大规模容量仍需接入验证，具体限制见 [关键规则](docs/KEY_RULES.md)。
-
-部署时携带 `main.py`、完整的 `ai_batch` 和 `integration`、两份 YAML 配置、`requirements.txt`，以及按需配置的 `.env`；在新机器安装 Python、公共依赖和原有 `xdata` 环境。
+当前本地验证可使用 `.\.python38\python.exe` 替代 python。真实接口和规模验证事项见 [待办](docs/IMPLEMENTATION_ISSUES.md)，模块职责和总体数据流见 [项目总览](project_overview.md)，数据结构见 [round1帖子事件提取表](docs/data/TABLE_DESIGN.md) 和 [事件去重分析表](docs/data/EVENT_RESULT_TABLE.md)。历史改造记录保留在 docs/history，研究计划位于 docs/plans。

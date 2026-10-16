@@ -1,99 +1,124 @@
-# AI 帖子批量处理工具
+# AI 帖子三轮处理项目
 
-## 目标与范围
+## 统一主题与表名
 
-批量处理已有帖子，为每帖保存最新 AI 回答、推理、用量及失败原因，并支持退出后重新启动继续处理。
+| 主题 | 处理内容 | 使用的表 |
+| --- | --- | --- |
+| round1事件提取 | 从每条帖子提取事件事实和代币 | round1帖子事件提取表，一帖一行 |
+| round2事件去重归组 | 判断 new/update/repeat，将同一事件的披露归组 | 事件去重分析表，一条事件 × 一个代币一行 |
+| round3事件影响分析 | 分析 new/update 的经济影响；repeat 沿用既有跳过规则 | 与 round2 共用事件去重分析表 |
 
-工具提供两个入口：一次性建立现有帖子的任务表，以及处理已有任务表。原始帖子采集、以后新增帖子的任务创建由现有数据流程负责。
+“去重归组”保留每条披露记录，通过关联类型和事件组表达重复或新增信息，不删除重复披露行。本文档及运行日志采用上述名称；配置键、代码符号、表字段和实际数据系统路径保持不变。两张表的配置对应关系见 [运行说明](README.md)。历史改造记录保留当时称呼，现行命名以本节为准。
 
-一个任务表由一个批量处理程序写入。任务和结果保存在现有数据系统，提示词及接口参数由配置文件提供。
+本次仅统一文档、日志和配置说明，同步调整日志测试；`common/time_rules.py` 继续独立保留。时间解析、日期边界、筛选排序、状态恢复、请求预算、保存与停止规则均不调整。整理与验证范围见 [主题和表名统一记录](docs/history/TERMINOLOGY_STANDARDIZATION.md)。
+
+2026-10-16 已将公共代码收拢为 9 个功能模块，按请求与响应、校验、事件上下文合并，并完成导入、测试及文档复查。处理规则、数据字段和配置保持不变，详见 [公共模块收拢记录](docs/history/COMMON_MODULE_CONSOLIDATION.md)。
+
+2026-10-16 已按用户追加要求将向量存入事件去重分析表新增的 embedding 列，取消 SQLite。新增列初始化为空字符串，生成后保存含模型、版本、配置标识及向量的 JSON；config_hash 不含 event，相同向量配置的各行一致。第二轮只使用固定 event 和候选历史，不读原帖，第三轮保留正文输入；Embedding 复用公共网络异常分类、随机退避和 Retry-After 解析。只提交组分数达到阈值的最多 10 组，不补足，全部低于时直接 new。默认阈值 0.50 是用户授权 AI 建议的试运行值，尚未按实际样本标定。实现及例子见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。用户确认事件去重分析表尚未创建，本次不增加旧表迁移。
+
+2026-10-16 已按命名检查清单统一代码符号及测试类，并完成导入、测试和文档复查；目录、表字段、配置键和处理规则保持不变。对应关系与验证结果见 [命名统一记录](docs/history/NAMING_CONSISTENCY.md)。
+
+2026-10-16 用户确定round2事件去重归组采用已部署的 `bge-m3` 兼容接口，只编码 event 做纯向量检索，不使用关键词或排名融合。向量持久保存、阈值放行及重启行为以本次表内向量方案为准。
+
+用户进一步确认服务已经输出归一化向量：程序仅校验单位范数，按模型返回值保存并计算内积，不再次归一化或转成 float32；内存计算使用 float64，配置摘要中的编码规则标识同步更新。详见 [表内向量方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
+
+2026-10-16 按已确认方案将公共代码统一放入 common，集中表结构、三轮输出校验及 Store，分别组织配置加载、业务输入与请求构造。处理规则保持不变，详见 [公共目录合并记录](docs/history/COMMON_DIRECTORY_MERGE.md)。
+
+本项目独立运行，目标是从帖子提取事件事实，按代币生成披露记录，关联已有事件组，再分析有效新增信息的经济影响。原始帖子采集和后续新增round1事件提取任务由现有数据流程负责。
+
+2026-10-16 用户确认两轮 AI 回答分别存入 round2_ai_response、round3_ai_response 两列 JSON，第三轮不再拆成五个影响列。事件去重分析表为 14 个普通列；两轮回答内保存原始正文、最后一次响应 usage、接口响应时间、实际请求次数及提交数据库前的北京时间 created，不保存推理文本。存储重试仅刷新 created，不重新调用 AI。第三轮五字段校验、归组与状态规则保留，详见 [回答保存口径](docs/data/EVENT_RESULT_TABLE.md#两轮-ai-回答的保存口径)。
+
+2026-10-15 用户确认目录直接按职责划分，不套顶层包，不增加安装或发布流程。本次只调整文件归属、导入、配置定位、测试和文档；处理规则保持不变。迁移记录见 [目录整理方案](docs/history/DIRECTORY_REORGANIZATION_PLAN.md)。
 
 ## 模块职责与依赖
 
-| 模块 | 文件 | 负责什么 | 主要依赖 |
-| --- | --- | --- | --- |
-| 配置与请求构造 | `ai_batch/config.py` | 读取 AI 配置，填写提示词和请求内容，计算处理配置的标识。 | PyYAML、python-dotenv。 |
-| 响应解析 | `ai_batch/response.py` | 判断响应是否有效，提取回答、推理、用量及失败原因，将生成时间的 Unix 秒转为北京时间文本。 | 标准库。 |
-| 任务与保存 | `ai_batch/tasks.py` | 建立初始任务表，读取任务并按状态校验旧结果，保存状态和最终结果。 | 配置模块、响应模块、pandas、调用方提供的客户端。 |
-| 批量运行 | `ai_batch/runner.py` | 组织逐月处理，协调 AI 请求、结果收取和任务保存。 | 上述模块、HTTPX。 |
-| 初始化接入与启动 | `integration/initialize_tasks.py` | 提供源帖子、目标注册与完整写入，并支持独立初始化启动。 | 任务模块、PyYAML、xdata。 |
-| 处理启动 | `main.py` | 读取任务配置，创建客户端，启动批量处理。 | 批量运行模块、PyYAML、xdata。 |
+| 目录或文件 | 职责 | 主要依赖 |
+| --- | --- | --- |
+| `common/config.py` | 分别加载任务、事件、AI 及 Embedding 配置，维护配置对象、模板检查和摘要 | PyYAML、python-dotenv、标准库 |
+| `common/ai_protocol.py` | 三轮大模型请求体构造、接口响应解析及答复类型 | 配置对象、标准库 |
+| `common/validation.py` | 两张表字段及结构、严格 JSON 解析、三轮各自的输出校验 | 时间规则、公共异常、pandas |
+| `common/event_context.py` | 原帖正文和业务输入、180 天记录候选及组内起点和 update 时间线 | 数据约定、时间规则、pandas |
+| `common/time_rules.py` | 完整发布时间解析、包含首尾日的范围判断和选择，原索引及时区不变 | pandas、标准库 |
+| `common/store.py` | TableStore 共用保存；PostTaskStore 管理 round1帖子事件提取表，EventRecordStore 管理事件去重分析表 | 配置摘要、数据约定、存储重试 |
+| `common/network.py` | 网络线程、请求预算、限速、完成消息和关闭 | 配置、AI 请求与响应约定、HTTPX |
+| `common/execution.py`、`persistence.py` | 共用分段执行、指定列写入、排序及整批存储重试 | 网络作业、pandas |
+| `initialization/post_tasks.py` | 根据完整源帖子建立round1帖子事件提取表，返回 InitializationSummary | 事件数据约定、pandas |
+| `initialization/event_records.py` | 固定round1事件提取校验、事件与代币展开、确定性 ID、去重、自动导入和独立续建 | 事件数据约定、共用存储重试 |
+| `round1/` | round1事件提取按月加载、任务协调和成功帖回调 | common |
+| `round2/` | round2事件去重归组：bge-m3 接口、表内向量复用、按组评分及阈值筛选、候选校验和同币时间推进 | common、HTTPX、NumPy |
+| `round3/` | round3事件影响分析：全范围前提检查、必要历史准备和分段任务 | common |
+| `entrypoints/` | 配置定位、日志、客户端接入、独立启动；round1事件提取入口协调自动导入 | 对应业务入口、运行环境提供的 xdata |
+| `main.py` | 根目录round1事件提取及自动导入启动入口 | entrypoints.run_round1 |
 
-`job_config.yaml` 指定数据路径、处理范围和日志；`ai_config.yaml` 指定提示词、接口及运行参数；认证信息由环境变量或可选的 `.env` 提供。
+目录之间直接导入，例如 `from round1.runner import run_extraction`。`common` 包含基础能力及共用业务约定，不导入初始化、轮次或入口；三个轮次不互相导入。round1事件提取与round3事件影响分析共用分段执行器，round2事件去重归组保留按币和时间推进的独立调度。两种业务 Store 在同一模块内继承 TableStore，round2事件去重归组与round3事件影响分析继续写同一张事件去重分析表。
+
+## 配置与运行环境
+
+非敏感配置集中在 `configs/`。`job_config.yaml` 指定源帖子、round1帖子事件提取表、处理范围、round1事件提取 AI 配置和日志；`event_config.yaml` 指定事件去重分析表、日期范围、映射、检索及两份 AI 配置路径。三份 AI 配置分别为 `round1_ai_config.yaml`、`round2_ai_config.yaml`、`round3_ai_config.yaml`；`embedding_config.yaml` 独立提供向量服务、批量及相似度阈值参数。各接口参数独立，不增加配置继承。
+
+2026-10-16 已按用户提供的 TradeCoins 50 名单（生成于 2026-09-18）填入 `event_config.yaml` 的 `user_name_to_tickers`：原 `screen_name` 作为用户名，原 `ticker` 转为单元素列表，共 50 组，保留大小写及原名单迁移备注。映射沿用现有规则，仅在导入事件的 tickers 为空时按原帖 user_name 精确匹配；实际源帖的用户名仍待核对。
+
+入口按自身文件位置定位项目根目录，读取 `configs`，不依赖当前工作目录。任务配置中的相对 AI 配置路径按 `configs` 目录解析；绝对路径继续支持。数据系统路径原样交给客户端。认证信息来自进程环境或与 AI 配置同目录的 `.env`，进程环境优先；默认即 `configs/.env`，示例在 `configs/.env.example`。
 
 ## 总体数据流
 
-建立任务表：
-
 ```text
-现有源帖子 → 初始化接入 → 任务模块建立完整任务表 → 注册目标并写入数据系统
+源帖子 → 初始化round1帖子事件提取表
+                  ↓
+round1事件提取任务 → 按日期范围读取 → 跳过已成功帖 → AI 提取并保存
+                  ↓ 正常返回后交出成功帖的内存副本
+              事件导入 → 按事件 × 代币展开、去重 → 事件去重分析表
+                                                       ↓
+round2事件去重归组 → 阶段恢复和前史检查 → 同币时间队列 → 检索候选 → 关联 AI
+                                                       ↓
+                                  保存确认 → 更新历史 → 推进下一时点
+                                                       ↓
+round3事件影响分析 → 全范围关联前提检查 → 准备跨月历史 → new/update 并发分析
+                                                       ↓
+                                      第三轮回答 JSON 和状态共同批量保存
 ```
 
-处理已有任务：
+日常由 `main.py` 在round1事件提取正常返回后自动导入本次范围的成功帖，round2事件去重归组与round3事件影响分析分别启动。round1事件提取处理函数只通过回调交出数据，不依赖导入业务。round1事件提取异常或中断时不自动导入；普通单帖失败不阻止其他成功帖导入。导入失败保留已保存的round1事件提取结果，重跑同范围时跳过成功帖 AI 并补导。
 
-```text
-任务配置与客户端 → 启动入口 → 批量运行模块 ↔ 任务模块 ↔ 数据系统
-                                  ↓
-                         配置模块构造 AI 请求
-                                  ↓
-                              AI 服务
-                                  ↓
-                         响应模块提取最终结果
-                                  ↓
-                         任务模块保存状态与结果
-```
+初始化有两个独立职责。round1事件提取初始化完整读取源帖，校验后注册并一次完整写入，不读取 AI 配置、不重试。事件导入负责映射、展开、固定输入核对和追加；主入口自动导入与独立 auto/create/resume 入口保留各自规则。
 
-以后新增帖子由现有流程直接建立对应任务，供后续运行读取。批量处理完成指定范围后返回统计。
+## 跨模块接口
 
-## 跨模块接口与数据
+- `initialization.post_tasks.initialize_tasks(source_df, write_tasks)`：建立完整round1帖子事件提取表；接入函数为 `entrypoints.initialize_tasks.initialize_existing_posts(cli, settings)`。
+- `round1.runner.run_extraction(cli, task_path, config_path, start_time=None, end_time=None, *, on_successful_posts=None)`：返回原 ExtractionSummary；分段保存并检查结束后，可通过回调交出本次新成功及读取时已成功的帖子副本。
+- `initialization.event_records.import_event_records_from_posts(cli, settings, new_posts=None, previous_posts=None)`：从内存成功帖导入事件，返回本次新增行数，不重读round1事件提取。
+- `initialization.event_records.import_event_records_from_table(cli, settings, *, successful_only=False)`：独立导入及续建，返回 InitializationSummary。
+- `round2.runner.run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker)`：返回 StageSummary；同币当前时点全部保存后才推进历史。
+- `round3.runner.run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, validator=validate_impact_output)`：返回 StageSummary；只分析已关联的待处理 new/update。
+- `common.store.TableStore` 提供快照、阶段恢复、选择、认领、写入和结束状态统计；PostTaskStore、EventRecordStore 保留各自转换和表约定。
+- `common.store.read_stage_hashes(cli, task_path, hash_column)` 调用 `cli.read(task_path, start_time='', end_time='', columns=[hash_column])` 读取全表单列，返回 DataFrame 中该列的原值；三轮在本次首次认领前核对一次，跨月复用。
+- `common.config.load_job_config`、`load_event_config`、`load_ai_config` 分别加载任务、事件及 AI 配置；不会因为共用模块而提前读取 AI 配置。
+- `common.config.load_embedding_config` 加载向量服务及阈值配置；`round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings)` 读取原键、event 和表内向量，按批生成缺失或标识不匹配的向量，调用 `EventRecordStore.save_embeddings` 只更新 embedding 列。保存完成后才认领关联，评分对象接收 current/searchable 并返回 RetrievalSelection。生成向量不代表关联完成，业务阶段只做内存比较，round3事件影响分析不修改或发送向量。
+- `common.event_context.build_relation_input`、`build_impact_input` 在原调用时机组织业务文本；`common.ai_protocol.render_payload` 只把文本填入请求模板。
+- `common.validation.validate_extraction_output`、`validate_relation_output`、`validate_impact_output` 分别检查三轮输出；round2事件去重归组使用本次候选 ID，round3事件影响分析保留五字段非空文本检查及 validator 注入接口。
 
-- `run_worker(cli, task_path, config_path, start_time=None, end_time=None)`：调用方提供客户端、任务表路径、AI 配置路径及可选日期范围，返回 `RunSummary`。
-- `TaskStore(config, cli, task_path, start_time=None, end_time=None)`：运行模块向任务模块提供同一客户端、配置及当前分段范围。
-- 客户端通过 `read` 返回任务表，通过 `update_by_column(task_path, df)` 按原索引更新指定列；未提交列必须保留原值。
-- 并发答复携带原任务键；任务模块在统一更新入口拒绝重复键，并将索引与整行字段一起按 `(date, id)` 排列，保证每批提交行严格递增。任务选择和请求并发继续沿用现有规则。
-- `initialize_existing_posts(cli, settings)`：初始化接入读取完整源帖子，并提供目标注册与写入的操作。
-- `initialize_tasks(source_df, write_tasks)`：任务模块根据源表建立完整任务表，交给写入操作保存，返回 `InitializationSummary`。
-- 源表与任务表按原 `(date, id)` 定位记录，正文为 `text`，用户名为 `user_name`。字段及初始值见 [任务表](docs/data/TABLE_DESIGN.md)。
-- 运行模块将原任务键和单帖正文交给请求处理；任务键用于关联结果，AI 消息内容来自提示词和正文。
-- 响应模块返回成功与否、实际 HTTP 状态及必要结果；生成时间返回北京时间 `YYYY-MM-DD HH:mm:ss` 字符串，缺失时为空。时间转换失败时返回失败及空的全部 AI 结果，保留失败原因。运行模块决定是否继续请求，任务模块保存最终状态和结果。
+调用方管理数据客户端生命周期及同表写入协调。数据操作在调用线程，AI 请求在独立网络线程；同一张处理表由一个处理程序写入，不支持多实例抢占。
 
-## 关键假设与阅读入口
+## 保持不变的关键约定
 
-调用方负责客户端生命周期，以及同一任务表的写入协调。数据操作使用调用入口线程，AI 请求使用独立网络线程；核心模块通过传入的客户端访问数据。
+round1帖子事件提取表按原 `(date, id)` 定位，事件去重分析表按原 `(date, record_id)` 定位；事件 ID 由 `source_post_id:event_index:asset` 确定性生成，日期不做时区转换。round1事件提取请求和事件导入共用 events/event/tickers 格式校验，空事件及空代币数组仍按原规则处理。
 
-真实 xdata 的索引读写、日期解释、异常后的读取和写入一致性仍需验证。源帖子完整性及新增任务完整性由现有数据流程保证。
+空 events 不生成事件任务，也不要求账号映射。空 tickers 在第一轮格式校验中合法；导入时若账号也无映射，本次导入调用的全部事件在写入前停止，第一轮已保存结果保留，不生成失败事件行。补齐映射后可重跑同范围补导。缺少 tickers 字段则属于第一轮输出错误。完整边界和例子见 [事件展开规则](docs/rules/EVENT_RULES.md#2-检查round1事件提取并展开记录)。
 
-2026-10-14 的真实运行反馈已发现：原实现通过 `update_by_index` 提交部分列后，已成功任务的 `config_hash/text/user_name` 变为缺失值。用户确认 xdata 支持 `update_by_column` 按列更新，任务保存统一使用该接口。[关键规则第 7 节](docs/KEY_RULES.md#7-保存时只改哪些内容) 记录接口修正及已有损坏数据的手动恢复方式。
+三轮状态继续使用字符串 `0`、`9`、`1`、`-1`。重启只恢复所运行阶段遗留的 `9/-1`，不根据残留结果推断成功，不质检或补写历史普通列。认领时按全表本阶段摘要核对配置；读回普通列原值使用。
 
-后续用户反馈仍出现未提交字段缺失，并确认新启动进程使用 `update_by_column`、手动按列更新可成功、接口允许只提交部分行。真实运行中字段保留问题的原因尚未确定，下一步检查实际更新参数和保存前后的记录。未成功记录的旧结果格式已放宽，便于重新处理并继续检查；模拟测试通过只说明模拟客户端下的行为符合约定。
+客户端 write、update_by_column、update_by_index 正常返回即本次整批写入，抛异常即本次未写入；存储整批重试与 AI 请求预算独立。运行结果仅按原索引更新目标列，数据库写入成功后才同步内存；预算耗尽停止，不在收尾额外开启保存预算。
 
-## 三轮扩展中已确认的规则（尚未实现）
+round2事件去重归组同刻记录不互用本时刻结果；普通最终失败暂停同币后续关联，其他币继续。合法 uncertain 的业务关系保存为 new，AI 原文保留；repeat 同时完成round3事件影响分析状态且第三轮回答列留空。round3事件影响分析失败只影响本条，不重做round2事件去重归组。具体边界和例子由以下规则文档维护。
 
-扩展目标是将已有第一轮结果展开为按代币划分的披露记录，组织历史候选，交给第二轮判断事件关联，再对有效信息进行独立第三轮经济影响分析。详细方案见 [三轮计划](第一轮+第二轮+第三轮计划)。现有代码仍为上述通用批处理工具，扩展模块与接口尚未实施。
+## 文档与验证入口
 
-- 第一轮实际结果保存在第一轮任务表的 `ai_response_content`，结构为 `{"events":[{"event":"事件事实","tickers":["ETH","LEND"]}]}`。后续程序使用固定结果，按单个事件对象与单个 ticker 展开，不在运行中重新生成第一轮结果。
-- 路径从配置读取，由用户填写。统一结果表的 `date` 直接沿用第一轮对应帖子的原值和精度，不做时区转换；记录 ID 按 `source_post_id:event_index:asset` 确定性生成，原事件序号从 0 开始。固定第一轮结果和映射配置下，重复导入或重启得到同样的 ID；改变输入或已有代币映射后的重算范围另行确认。
-- 空 `tickers` 按原帖 `user_name` 从配置映射代币，映射不到报错；已有代币时不额外追加账号映射。`events=[]` 是正常无事件结果，不展开，也不要求该用户名存在映射。原第一轮结果保持不变。
-- 第二轮正常返回且通过格式校验的 `uncertain` 按新事件建档：主表保存 `event_relation='new'`、`event_id=record_id`、`new_information=null`；处理记录保留模型原始输出。保存后可进入后续历史检索和第三轮。
-- 请求失败、回答截断、无效 JSON、非法匹配 ID 等仍按失败处理，不转换为新事件。
-- 两轮状态直接加入统一结果表，分别为 `round2_status`、`round3_status`，并共用一个 `error_message`。表结构共 16 项，包括 `date/record_id` 两个索引项和 14 个普通列，不另建状态表。两列均使用字符串 "0" 待处理、"9" 已认领处理中、"1" 本阶段已完成、"-1" 本轮最终失败；初始化均为 "0"，错误字段初始为空字符串。
-- 第二轮完成时，关联结果与 `round2_status="1"` 在同一次按列更新中提交。`new/update` 的第三轮保持 "0"；`repeat` 按规则跳过第三轮，同一次更新将 `round3_status` 标为 "1"，经济影响字段留空。正常 uncertain 转为 new 并保存、程序自动判 new 并保存，第二轮均算完成，第三轮等待分析。
-- 第三轮只处理第二轮为 "1"、第三轮为 "0" 且关系为 `new/update` 的记录。分析输出与 `round3_status="1"` 在同一次更新中提交；第三轮失败或续跑不重做第二轮。日常任务选择依据状态和阶段前提，结果校验及保存确认仍需执行。
-- `error_message` 保存最近一次最终失败原因，与对应失败状态共同提交；当前阶段成功后清空。恢复状态、认领或跳过已完成任务时不清空错误，避免第二轮续跑擦掉第三轮失败原因。完整失败过程保留在日志中。
-- 第二轮输入、候选列表和检索得分不默认持久保存。续跑保留已完成的关联结果，仅恢复所运行阶段的遗留 "9"/"-1"；异常中断后先核对状态与结果是否一致，避免直接重复调用 AI。单次提交的原子性及真实按列更新行为仍需接入核实。
-- 导入、第二轮、第三轮分别启动、各自续跑。每轮启动前检查该范围内上一轮所有任务已完成且业务结果合法；第二轮另检查所需历史关联是否完整，有缺口停止提示，由用户手动补跑，不自动扩大范围。
-- 第二轮普通任务最终失败后暂停该代币的后续关联，其他代币继续；第三轮普通任务失败只影响本条。网络故障、可重试 5xx 和 AI 业务输出校验失败共用 `run.max_attempts` 总请求预算，当前默认 3 次且包含首次；存储重试独立。停止型 HTTP 或接口错误仍按第一轮规则停止整轮。
-- 预计半年展开约 5,000 条记录。检索排序规则和提示词暂缓确定。
-- 已确认的实施约定及映射配置示例见三轮计划第十一章。检索评分、历史裁剪预算和提示词仍后置细化，真实数据库操作需接入验证；当前代码及配置尚未实施扩展功能。
+- [运行和配置方法](README.md)
+- [代码结构与接口](docs/CODE_ARCHITECTURE.md)
+- [round1事件提取关键规则](docs/rules/KEY_RULES.md)
+- [事件导入、round2事件去重归组及round3事件影响分析规则](docs/rules/EVENT_RULES.md)
+- [round1帖子事件提取表](docs/data/TABLE_DESIGN.md)、[事件去重分析表](docs/data/EVENT_RESULT_TABLE.md)
+- [真实接入和规模验证待办](docs/IMPLEMENTATION_ISSUES.md)
+- [研究总计划](docs/plans/项目总计划书.md)、[三轮业务计划](docs/plans/第一轮+第二轮+第三轮计划.md)
 
-## 第二轮与第三轮架构草案（待确认）
-
-建议保留第一轮的公开入口、配置和任务表，把 runner 内的网络执行与 tasks 内的按列保存核心抽为共用模块，新增 event_pipeline 承担记录导入、统一结果表、历史检索、事件关联和经济影响分析。第二轮按同代币时间顺序协调，第三轮独立批量并发，均调用共用网络与保存能力。
-
-第二轮和第三轮的结构化输入可序列化为 JSON 文本，通过已有 task.text 模板变量发送。新增业务输出校验函数接入共用请求循环，保证非法输出与网络错误共用请求预算；第一轮保持原外层校验行为。
-
-目录、职责、接口、真实处理顺序及改动验证范围见 [代码架构草案](docs/CODE_ARCHITECTURE.md)。此部分为结构提案，尚未移动或实现代码。
-
-- [使用说明](README.md)：环境、配置、初始化、启动与调试。
-- [关键规则](docs/KEY_RULES.md)：日期、状态、请求、失败、保存和恢复。
-- [任务表](docs/data/TABLE_DESIGN.md)：索引、字段及有效数据要求。
+全表按列摘要读取使用用户确认的 `cli.read(..., start_time='', end_time='', columns=[hash_column])`，返回 DataFrame，空日期表示全表；读取失败时停止，不回退整表读取。纯向量评分器已实现，真实 Embedding 接口地址与认证、round2事件去重归组与round3事件影响分析提示词及具体经济评分枚举仍待配置或接入；召回质量须用真实标注样本验证。

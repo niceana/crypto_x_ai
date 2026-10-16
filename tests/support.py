@@ -1,4 +1,5 @@
 import json
+import logging
 import tempfile
 import threading
 from datetime import date, timedelta
@@ -9,9 +10,10 @@ import httpx
 import pandas as pd
 import yaml
 
-from ai_batch import run_worker
-from ai_batch.config import load_config
-from ai_batch.tasks import TASK_COLUMNS
+from round1.runner import run_extraction
+from common.config import load_ai_config
+from common.store import read_stage_hashes
+from common.validation import TASK_COLUMNS
 
 
 def tasks(dates):
@@ -30,18 +32,31 @@ def success(content="ok", **extra):
     return httpx.Response(200, json=body)
 
 
+def event_content(event="事实"):
+    return json.dumps({"events": [{"event": event, "tickers": ["ETH"]}]}, ensure_ascii=False)
+
+
+def event_success(event="事实", **extra):
+    return success(event_content(event), **extra)
+
+
 class FakeCli:
     def __init__(self, frame):
         self.frame = frame.copy(deep=True)
         self.reads = []
         self.read_paths = []
+        self.column_reads = []
         self.updates = []
         self.update_paths = []
         self.threads = []
         self.update_hook = None
         self.read_hook = None
 
-    def read(self, path, start_time=None, end_time=None):
+    def read(self, path, start_time=None, end_time=None, columns=None):
+        if columns is not None:
+            self.column_reads.append((path, start_time, end_time, list(columns)))
+        if start_time == "" and end_time == "":
+            start_time = end_time = None
         if (start_time is None) != (end_time is None):
             raise ValueError("cli.read 日期参数必须同时设置")
         if start_time is not None:
@@ -49,15 +64,19 @@ class FakeCli:
                 if not isinstance(value, str) or date.fromisoformat(value).isoformat() != value:
                     raise ValueError("cli.read 日期参数必须为 YYYY-MM-DD 字符串")
         self.threads.append(threading.get_ident())
-        self.reads.append((start_time, end_time))
-        self.read_paths.append(path)
-        if self.read_hook:
-            self.read_hook(start_time, end_time)
-        if start_time is None:
-            return self.frame.copy(deep=True)
-        dates = self.frame.index.get_level_values("date")
-        end_next_day = (date.fromisoformat(end_time) + timedelta(days=1)).isoformat()
-        return self.frame[(dates >= start_time) & (dates < end_next_day)].copy(deep=True)
+        if columns is None:
+            self.reads.append((start_time, end_time))
+            self.read_paths.append(path)
+            if self.read_hook:
+                self.read_hook(start_time, end_time)
+        frame = self.frame
+        if start_time is not None:
+            dates = frame.index.get_level_values("date")
+            end_next_day = (date.fromisoformat(end_time) + timedelta(days=1)).isoformat()
+            frame = frame[(dates >= start_time) & (dates < end_next_day)]
+        if columns is not None:
+            frame = frame[columns]
+        return frame.copy(deep=True)
 
     def apply(self, patch_frame):
         self.frame.loc[patch_frame.index, patch_frame.columns] = patch_frame.to_numpy()
@@ -77,6 +96,11 @@ class FakeCli:
 
 class Fixture:
     def setUp(self):
+        # 记录摘要核对次数，同时执行真实读取入口，列查询由模拟客户端处理。
+        self.hash_reads = []
+        self.hash_reader = patch("common.store.read_stage_hashes", side_effect=self.read_test_hashes)
+        self.hash_reader.start()
+        self.addCleanup(self.hash_reader.stop)
         self.temporary = tempfile.TemporaryDirectory(prefix=".test-", dir=str(Path.cwd()))
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "config.yaml"
@@ -93,14 +117,21 @@ class Fixture:
         }
         self.write_config()
 
+    def read_test_hashes(self, cli, task_path, hash_column):
+        self.hash_reads.append((task_path, hash_column))
+        return read_stage_hashes(cli, task_path, hash_column)
+
+    def counts(self, store):
+        return store.summarize("round1", already=store.already_completed)
+
     def write_config(self):
         self.path.write_text(yaml.safe_dump(self.document, allow_unicode=True), encoding="utf-8")
 
     def config(self):
         self.write_config()
-        return load_config(self.path)
+        return load_ai_config(self.path)
 
-    def worker(self, cli, handler, start_time=None, end_time=None):
+    def worker(self, cli, handler, start_time=None, end_time=None, *, on_successful_posts=None):
         self.write_config()
         clients = []
 
@@ -111,8 +142,13 @@ class Fixture:
 
         # 捕获模块日志，继续核对异常路径不会误报“全部处理完成”。
         try:
-            with patch("ai_batch.runner._create_client", side_effect=create), self.assertLogs("ai_batch", level="DEBUG") as captured:
-                return run_worker(cli, self.task_path, self.path, start_time, end_time)
+            with patch("round1.runner._create_client", side_effect=create), self.assertLogs(level="DEBUG") as captured:
+                # 公共能力与round1事件提取现在位于不同目录；只捕获项目日志，保持原验证范围。
+                logging.getLogger().handlers[0].addFilter(
+                    lambda record: record.name.startswith(("common.", "round1."))
+                )
+                return run_extraction(cli, self.task_path, self.path, start_time, end_time,
+                                  on_successful_posts=on_successful_posts)
         finally:
             self.last_output = "\n".join(captured.output)
             self.log_records = captured.records

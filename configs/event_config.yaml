@@ -1,0 +1,78 @@
+# round2事件去重归组、round3事件影响分析及事件导入的共用配置。
+# first_round_task_path 是 round1帖子事件提取表，与 job_config.yaml 的 task_path 对应。
+# result_path 是两轮共用的事件去重分析表；本次保留现有配置键和实际路径值。
+# 以下路径占位文本也保持原样，填写时按上述表名区分来源和目标。
+first_round_task_path: "填写第一轮任务表路径"
+result_path: "填写统一结果表路径"
+round2_ai_config_path: "round2_ai_config.yaml"
+round3_ai_config_path: "round3_ai_config.yaml"
+start_time: null
+end_time: null
+# 本项只控制独立导入入口；main.py 使用内存导入，不依赖此模式。
+initialize_mode: auto
+# 来源：用户提供的 TradeCoins 50 名单，生成于 2026-09-18。
+# 将原名单 screen_name 作为 user_name，ticker 转为列表。
+# 事件 tickers 为空时，按原帖 user_name 精确匹配，区分大小写。
+user_name_to_tickers:
+  BitcoinMagazine: ["BTC"]
+  ethereum: ["ETH"]
+  Ripple: ["XRP"]
+  solana: ["SOL"]
+  dogecoin: ["DOGE"]
+  bnbchain: ["BNB"]
+  chainlink: ["LINK"]
+  aave: ["AAVE"]
+  Uniswap: ["UNI"]
+  trondao: ["TRX"]
+  worldnetwork: ["WLD"]
+  NEARProtocol: ["NEAR"]
+  CurveFinance: ["CRV"]
+  Fetch_ai: ["FET"]
+  LidoFinance: ["LDO"]
+  Injective: ["INJ"]
+  # 原名单备注：原 MakerDAO/MKR，官方 X 已迁至 @SkyEcosystem。
+  SkyEcosystem: ["SKY"]
+  PancakeSwap: ["CAKE"]
+  GoGalaGames: ["GALA"]
+  thorchain: ["RUNE"]
+  pendle_fi: ["PENDLE"]
+  Livepeer: ["LPT"]
+  ensdomains: ["ENS"]
+  domodata: ["ORDI"]
+  # 原名单备注：原 @jito_sol 返回 UserNotFound，官方 X 已迁至 @jito。
+  jito: ["JTO"]
+  TheSandboxGame: ["SAND"]
+  apecoin: ["APE"]
+  # 原名单备注：原 @realMaskNetwork 返回 UserNotFound。
+  masknetwork: ["MASK"]
+  JasmyMGT: ["JASMY"]
+  compoundfinance: ["COMP"]
+  WeAreTellor: ["TRB"]
+  # 原名单备注：原 @ArkhamIntel 无帖子，官方 X 已迁至 @arkham。
+  arkham: ["ARKM"]
+  Immutable: ["IMX"]
+  bounce_finance: ["AUCTION"]
+  PythNetwork: ["PYTH"]
+  graphprotocol: ["GRT"]
+  # 原名单备注：ConstitutionDAO 已于 2021 年结束运作、约 3 帖；此处使用社区后续项目 PeopleDAO。
+  The_PeopleDAO: ["PEOPLE"]
+  AlchemyPay: ["ACH"]
+  decentraland: ["MANA"]
+  AxieInfinity: ["AXS"]
+  reserveprotocol: ["RSR"]
+  Stepnofficial: ["GMT"]
+  SushiSwap: ["SUSHI"]
+  chiliz: ["CHZ"]
+  # 原名单备注：原 @quant_network 返回 UserNotFound。
+  quantnetwork: ["QNT"]
+  API3DAO: ["API3"]
+  TheTNetwork: ["T"]
+  playbigtime: ["BIGTIME"]
+  Treasure_DAO: ["MAGIC"]
+  memeland: ["MEME"]
+# 默认使用纯向量检索；也可填写 retriever=模块:函数 覆盖。
+retriever: ""
+embedding_config_path: "embedding_config.yaml"
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"

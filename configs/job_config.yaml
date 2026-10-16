@@ -1,0 +1,14 @@
+# round1事件提取及 round1帖子事件提取表初始化配置。
+# source_path 是原始帖子来源；task_path 是 round1帖子事件提取表的实际路径。
+# 本次仅统一称呼，保留现有路径值；首次初始化仍须使用尚未创建的目标。
+source_path: "填写现有帖子路径"
+task_path: "填写新任务表路径"
+ai_config_path: "round1_ai_config.yaml"
+start_time: "2021-01-01"
+end_time: "2021-12-31"
+
+# 初始化启动入口、main.py 和接入函数使用此配置；应用已有日志处理器时保持它们。
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(threadName)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"

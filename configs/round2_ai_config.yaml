@@ -1,0 +1,28 @@
+# round2事件去重归组：提示词、AI 接口、请求及运行参数。
+# 提示词和真实接口尚未配置；不会使用占位内容调用 AI。
+prompts:
+  system: ""
+  user: "{{task.text}}"
+api:
+  url: ""
+  headers:
+    Authorization: "Bearer ${AI_API_KEY}"
+  trust_env: false
+  payload:
+    model: ""
+    messages:
+      - role: system
+        content: "{{prompts.system}}"
+      - role: user
+        content: "{{prompts.user}}"
+    temperature: 0
+    stream: false
+run:
+  concurrency: 10
+  timeout_seconds: 120
+  requests_per_second: 0
+  max_attempts: 3
+  backoff_base_seconds: 1
+  backoff_max_seconds: 30
+  storage_max_attempts: 3
+  storage_retry_seconds: 1
