@@ -1,13 +1,14 @@
-"""验证内存位置索引、按币时间窗口及历史资格，不连接真实服务。"""
+"""验证历史读取范围、窗口资格和内存索引，不连接真实服务。"""
 
 import unittest
+from datetime import date
 from types import SimpleNamespace
 
 import pandas as pd
 
 from common.event_context import EventHistory
 from common.store import is_stored_relation_valid, validate_relation_history
-from common.time_rules import history_window_start
+from common.time_rules import history_read_bounds, history_window_start, is_history_needed
 from initialization.event_records import expand_first_round
 from tests.event_support import source_posts
 
@@ -20,6 +21,55 @@ def completed_records(posts):
     frame["event_relation"] = "new"
     frame["event_id"] = frame.index.get_level_values("record_id")
     return frame
+
+
+class HistoryRangeTests(unittest.TestCase):
+    def test_read_bounds_accept_unsorted_iterator_and_calendar_years(self):
+        times = [pd.Timestamp("2026-01-01 00:00:00", tz="Asia/Shanghai"),
+                 pd.Timestamp("2024-02-29 12:00:00.123456789", tz="Asia/Shanghai")]
+        before = list(times)
+        self.assertEqual(history_read_bounds(iter(times), "2024-03-01", 5),
+                         (date(2019, 2, 28), date(2024, 2, 29)))
+        self.assertEqual(history_read_bounds(iter(times), "2024-03-01", 2),
+                         (date(2022, 2, 28), date(2024, 2, 29)))
+        self.assertEqual(times, before)
+
+    def test_read_bounds_skip_empty_or_already_covered_dates_and_keep_one_day(self):
+        for times, scope, expected in (
+            ([], "2025-01-01", None),
+            (["2025-01-01 12:00:00"], "2020-01-01", None),
+            (["2025-01-01 12:00:00"], "2019-01-01", None),
+            (["2025-01-01 12:00:00"], "2020-01-02", (date(2020, 1, 1), date(2020, 1, 1))),
+        ):
+            with self.subTest(times=times, scope=scope):
+                self.assertEqual(history_read_bounds(iter(times), scope, 5), expected)
+
+    def test_needed_history_keeps_precise_left_closed_right_open_window(self):
+        current = pd.Timestamp("2024-02-29 12:00:00.123456789", tz="Asia/Shanghai")
+        begin = pd.Timestamp("2019-02-28 12:00:00.123456789", tz="Asia/Shanghai")
+        for stamp, expected in ((begin - pd.Timedelta(1, "ns"), False), (begin, True),
+                                (current - pd.Timedelta(1, "ns"), True), (current, False),
+                                (current + pd.Timedelta(1, "ns"), False)):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(is_history_needed(stamp, (current,), 5), expected)
+        self.assertFalse(is_history_needed(begin, (), 5))
+        self.assertFalse(is_history_needed(begin, (current,), 2))
+
+    def test_needed_history_handles_later_tasks_and_duplicate_times_without_mutating(self):
+        history = pd.Timestamp("2025-01-01 00:00:00")
+        times = [history, history, pd.Timestamp("2026-01-01 00:00:00")]
+        before = list(times)
+        self.assertTrue(is_history_needed(history, times, 5))
+        self.assertFalse(is_history_needed(history, times[:2], 5))
+        self.assertFalse(is_history_needed(pd.Timestamp("2010-01-01"), times, 5))
+        self.assertEqual(times, before)
+
+    def test_existing_cross_leap_day_limitation_is_preserved(self):
+        history = pd.Timestamp("2019-02-28 12:00:00")
+        times = [pd.Timestamp("2024-02-28 23:00:00"), pd.Timestamp("2024-02-29 01:00:00")]
+        # 用户确认本次只抽取。单独查询第二个窗口可纳入历史，既有多时点算法仍会漏掉。
+        self.assertTrue(is_history_needed(history, times[1:], 5))
+        self.assertFalse(is_history_needed(history, times, 5))
 
 
 class HistoryIndexTests(unittest.TestCase):

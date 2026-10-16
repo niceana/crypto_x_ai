@@ -1,21 +1,20 @@
 """round3事件影响分析独立分析和并发调度；评分口径由待配置提示词与校验接口提供。"""
 
 import logging
-from bisect import bisect_right
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 
 from common.config import load_ai_config, require_prompts
 from common.execution import month_ranges, run_segments
 from common.event_context import EventHistory, build_impact_input, load_source_texts
 from common.network import NetworkWorker, RequestJob
-from common.validation import validate_impact_output, validate_index
+from common.validation import validate_impact_output
 from common.store import (
-    EventRecordStore, StageSummary, is_stored_relation_valid,
+    EventRecordStore, StageSummary, is_stored_relation_valid, read_event_history,
     validate_stage_config_hash, summarize,
 )
-from common.time_rules import history_window_start, published_time
+from common.time_rules import history_read_bounds, history_window_start, is_history_needed, published_time
 
 logger = logging.getLogger(__name__)
 
@@ -78,24 +77,16 @@ def _prepare_impact(cli, settings, run, ranges):
         _select_impact_history(context, key, row, times, root_ids, selected_records)
     del scope_records
 
-    if pending_updates:
-        begin = min(history_window_start(key[0], HISTORY_LOOKBACK_YEARS).date()
-                    for key, _ in pending_updates)
-        history_end = date.fromisoformat(settings.start_time) - timedelta(days=1)
-        # 当前范围的事实已在首遍暂存；只补读该范围之前缺少的日期。
-        if begin <= history_end:
-            for start, end in month_ranges(begin, history_end):
-                frame = cli.read(settings.result_path, start_time=start, end_time=end, columns=HISTORY_COLUMNS)
-                validate_index(frame, "record_id")
-                if not set(HISTORY_COLUMNS).issubset(frame.columns):
-                    raise ValueError("第三轮历史读取缺少必要列")
-                first_day, last_day = date.fromisoformat(start), date.fromisoformat(end)
-                for key, row in frame.iterrows():
-                    if not first_day <= published_time(key[0]).date() <= last_day:
-                        raise ValueError("第三轮历史读取返回了分段日期以外的行")
-                    _remember_record_key(record_keys, key)
-                    _select_impact_history(context, key, row, times, root_ids, selected_records)
-                frame = None
+    bounds = history_read_bounds((key[0] for key, _ in pending_updates), settings.start_time, HISTORY_LOOKBACK_YEARS)
+    # 当前范围的事实已在首遍暂存；只补读该范围之前缺少的日期。
+    if bounds is not None:
+        for start, end in month_ranges(*bounds):
+            frame = read_event_history(cli, settings.result_path, start, end,
+                                       columns=HISTORY_COLUMNS, label="第三轮历史读取")
+            for key, row in frame.iterrows():
+                _remember_record_key(record_keys, key)
+                _select_impact_history(context, key, row, times, root_ids, selected_records)
+            frame = None
 
     # 一次建立有序索引，避免先载入当前事实、再插入多年旧事实产生大量列表移动。
     context.history.add_records(selected_records)
@@ -137,9 +128,7 @@ def _select_impact_history(context, key, row, times, root_ids, selected_records)
     stamps = times.get((row["asset"], row["event_id"]))
     if not stamps or row["round2_status"] != "1":
         return
-    stamp = published_time(key[0])
-    position = bisect_right(stamps, stamp)
-    if position < len(stamps) and stamp >= history_window_start(stamps[position], HISTORY_LOOKBACK_YEARS):
+    if is_history_needed(key[0], stamps, HISTORY_LOOKBACK_YEARS):
         if row["event_relation"] == "new" and row["event_id"] != key[1]:
             raise ValueError("第三轮窗口内组起点未引用自身：{}".format(key[1]))
         selected_records.append((key, {name: row[name] for name in HISTORY_COLUMNS}))

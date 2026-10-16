@@ -2,7 +2,6 @@
 
 import logging
 import queue
-from bisect import bisect_right
 from collections import defaultdict, deque
 from datetime import date, timedelta
 
@@ -13,10 +12,10 @@ from common.event_context import (
     build_current_record_input,
 )
 from common.network import BatchRunError, NetworkWorker, RequestJob
-from common.validation import validate_index, validate_relation_output
+from common.validation import validate_relation_output
 from common.persistence import BatchPersistenceError
-from common.store import EventRecordStore, validate_relation_history, summarize
-from common.time_rules import history_window_start, published_time, table_date_bounds
+from common.store import EventRecordStore, read_event_history, validate_relation_history, summarize
+from common.time_rules import history_read_bounds, is_history_needed, published_time, table_date_bounds
 from round2.retrieval import validate_retrieval_selection, load_retriever
 from round2.embedding import EmbeddingRetriever
 
@@ -26,10 +25,11 @@ logger = logging.getLogger(__name__)
 def _load_relation_history(store, pending_keys):
     """按日期补入必要前史，范围之后仅读取补录检查所需的两列。"""
     settings = store.settings
+    # 第二轮继续以原有的最早待处理时刻作为补读基准。
     earliest = min(published_time(key[0]) for key in pending_keys)
-    begin = history_window_start(earliest, settings.history_lookback_years).date()
-    history_end = date.fromisoformat(settings.start_time) - timedelta(days=1)
-    if begin <= history_end:
+    bounds = history_read_bounds((earliest,), settings.start_time, settings.history_lookback_years)
+    if bounds is not None:
+        begin, history_end = bounds
         store.load_relation_history(begin.isoformat(), history_end.isoformat())
     _, table_end = table_date_bounds(store.cli.read_meta(settings.result_path))
     if table_end is None:
@@ -38,14 +38,8 @@ def _load_relation_history(store, pending_keys):
     if scope_end >= table_end:
         return None
     later_begin = scope_end + timedelta(days=1)
-    later = store.cli.read(settings.result_path, start_time=later_begin.isoformat(),
-                           end_time=table_end.isoformat(), columns=["asset", "round2_status"])
-    validate_index(later, "record_id")
-    if not {"asset", "round2_status"}.issubset(later.columns):
-        raise ValueError("补录检查读取缺少 asset/round2_status 列")
-    if any(not later_begin <= published_time(key[0]).date() <= table_end for key in later.index):
-        raise ValueError("补录检查读取返回了分段日期以外的行")
-    return later
+    return read_event_history(store.cli, settings.result_path, later_begin.isoformat(), table_end.isoformat(),
+                              columns=["asset", "round2_status"], label="补录检查读取")
 
 
 def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker):
@@ -93,11 +87,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         for key, row in store.df.iterrows():
             if row["round2_status"] != "1" or row["asset"] not in times:
                 continue
-            stamp = published_time(key[0])
-            current_times = times[row["asset"]]
-            position = bisect_right(current_times, stamp)
-            if position < len(current_times) and stamp >= history_window_start(
-                    current_times[position], settings.history_lookback_years):
+            if is_history_needed(key[0], times[row["asset"]], settings.history_lookback_years):
                 embedding_keys.add(key)
         # 编码固定事实可以提前批处理；实际候选仍由 history 严格按披露时点筛选。
         # 向量按批写入事件去重分析表后才开始认领，避免同步请求阻塞关联结果的保存。

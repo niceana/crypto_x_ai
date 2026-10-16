@@ -20,6 +20,7 @@ from common.validation import (
     validate_post_task_structure as _validate_tasks,
     validate_task_range as _validate_range,
     validate_event_table_structure,
+    validate_index,
 )
 from common.time_rules import history_window_start, in_scope, published_time
 
@@ -27,6 +28,29 @@ logger = logging.getLogger(__name__)
 
 # 日期沿用原索引；复合键只用于内部关联，不进入 AI 请求。
 TaskKey = Tuple[Any, str]
+
+
+def read_event_history(cli, task_path, start_time, end_time, *, columns=None, label="历史读取"):
+    """按日期读取一次历史，检查结构、必需列和日期边界，原值返回 DataFrame。
+
+    未指定 columns 时沿用完整事件表结构检查；指定列时只检查事件索引和所需列，
+    不要求未查询的字段。调用方决定分段及列，不修改普通值、不重试或回退全表。
+    label 仅用于在错误中标明本次读取用途。
+    """
+    options = {"start_time": start_time, "end_time": end_time}
+    if columns is not None:
+        options["columns"] = columns
+    frame = cli.read(task_path, **options)
+    if columns is None:
+        validate_event_table_structure(frame)
+    else:
+        validate_index(frame, "record_id")
+        if not set(columns).issubset(frame.columns):
+            raise ValueError("{}缺少必要列".format(label))
+    begin, end = date.fromisoformat(start_time), date.fromisoformat(end_time)
+    if any(not begin <= published_time(key[0]).date() <= end for key in frame.index):
+        raise ValueError("{}返回了分段日期以外的行".format(label))
+    return frame
 
 
 def read_stage_hashes(cli, task_path, hash_column):
@@ -311,11 +335,7 @@ class EventRecordStore(TableStore):
 
     def load_relation_history(self, start_time, end_time):
         """第二轮按日期补入较早历史，重建原行位置，不认领或恢复历史任务。"""
-        history = self.cli.read(self.task_path, start_time=start_time, end_time=end_time)
-        validate_event_table_structure(history)
-        start, end = date.fromisoformat(start_time), date.fromisoformat(end_time)
-        if any(not start <= published_time(key[0]).date() <= end for key in history.index):
-            raise ValueError("历史读取返回了分段日期以外的行")
+        history = read_event_history(self.cli, self.task_path, start_time, end_time)
         if history.empty:
             return
         combined = pd.concat([history, self.df])

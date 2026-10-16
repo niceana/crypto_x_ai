@@ -13,8 +13,8 @@
 │  ├─ ai_protocol.py             大模型请求体构造、响应解析及答复类型
 │  ├─ validation.py              表字段、结构检查和三轮输出校验
 │  ├─ event_context.py           原帖正文、业务输入、候选及组内时间线
-│  ├─ time_rules.py              事件时间解析和范围选择
-│  ├─ store.py                   TableStore、PostTaskStore、EventRecordStore 及汇总
+│  ├─ time_rules.py              时间解析、历史补读范围和窗口判断
+│  ├─ store.py                   历史读取检查、三类 Store 及汇总
 │  ├─ network.py                 作业、限速、重试、完成消息和线程关闭
 │  ├─ execution.py               round1事件提取与round3事件影响分析共用分段并发执行
 │  └─ persistence.py             排序、按列更新和存储重试
@@ -43,6 +43,8 @@ common.event_context 的 build_current_record_input 供第二、三轮组织固�
 
 EventHistory 在批量加入已完成记录后，按币将候选列表按发布时间和 record_id 排序；add_frame 和 add_records 共用批量登记，后者接收筛选后的原键和必要字段，避免第三轮分段补入旧历史时逐条移动有序列表。运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 二分定位按 history_lookback_years 回推的左闭右开窗口，默认 5 个日历年。第二、三轮均启用 truncate_group_history，组输入只取各条披露自己的窗口；缺起点时 first_disclosure=null、history_trimmed=true，并提供 first_available_disclosure。第三轮固定 5 年。common.store.validate_relation_history 保持第二轮按配置期限检查前史的规则，向量临时矩阵和评分方式保留。
 
+两轮重复的基础处理提取到现有 common 模块，不新增包或依赖。time_rules.history_read_bounds(current_times, scope_start, years) 返回需要补读的首尾 date；没有输入或下界不早于处理起点时返回 None。第二轮传入原有最早待处理时刻，第三轮传入各待分析 update 时刻，保留两轮原有的时间选取口径。is_history_needed(history_time, current_times, years) 接收本轮按币或按组排好序的时刻序列，沿用二分选择第一个严格晚于历史的时点、再比较回看下界的算法。分组、状态和组起点合法性检查不移入该函数；已知闰日边界限制按用户要求保留。
+
 第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历年边界，table_date_bounds 供第二轮解析元数据。
 
 第三轮也必须配置日期。round3.runner._prepare_impact 先只读本范围任务，检查第二轮状态和基本关系，并暂存历史必要字段；无记录或全部完成时直接返回。根据未完成 update 确定组与每条披露的 5 年窗口，复用范围内事实，再按月和六个必要列补读范围之前的历史，不读取元数据或范围之后的事件内容。只保留至少能进入一条任务窗口的同组完成事实，批量建立 EventHistory；窗口内已知起点仍检查合法性，缺失或窗口外起点按截断处理，完全没有组历史时停止。EventRecordStore.require_relation 可接收期限并复用既有 origin_start 检查，不改变未传期限调用的完整起点要求。所有任务和所需历史通过后才恢复状态，之后沿用原有正文读取、并发、批量保存和全表摘要单列核对。
@@ -64,6 +66,8 @@ common.validation 集中 parse_strict_json 和三轮独立校验：
 OutputValidationError 由网络层计入同一任务的原请求预算。HTTP 外层响应及生成时间解析继续位于 common.ai_protocol，不与正文校验混合。common.time_rules 只解析业务时间用于校验、排序和范围选择，保存仍用原索引。
 
 ## 4. Store 与保存
+
+common.store.read_event_history(cli, task_path, start_time, end_time, *, columns=None, label="历史读取") 每次只执行一次原有日期查询。未指定 columns 时按完整事件表检查结构，指定列时检查 date/record_id 索引和所需列；随后检查返回日期是否在闭区间内，普通值和原索引原样返回。读取或校验失败直接停止，不重试读取、不回退全表。第二轮完整历史和较晚记录的两列检查、第三轮按月六列历史均使用该入口；读取的日期、分段数、列和异常发生前的状态修改顺序保持原样。
 
 三个 Store 集中在 common.store，各自职责保留。TableStore 负责工作快照、原索引定位、阶段恢复、认领、字符串更新检查、提交和统计，不解释 new/update/repeat。PostTaskStore 负责round1事件提取任务选择及答复转换；EventRecordStore 负责事件去重分析表的round2事件去重归组与round3事件影响分析保存及跨阶段约定，不拆成重复的两个 Store。
 

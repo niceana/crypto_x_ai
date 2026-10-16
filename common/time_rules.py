@@ -2,8 +2,9 @@
 
 import json
 import re
+from bisect import bisect_right
 from calendar import monthrange
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -27,6 +28,32 @@ def history_window_start(value, years):
     year = stamp.year - years
     day = min(stamp.day, monthrange(year, stamp.month)[1])
     return stamp.replace(year=year, day=day)
+
+
+def history_read_bounds(current_times, scope_start, years):
+    """计算已读任务范围之前需补读的首尾日期，无需补读时返回 None。
+
+    current_times 由各轮按自己的业务规则选定，可以是一次性迭代器。取这些
+    时刻回推日历年后的最早日期，下界包含当天，上界为 scope_start 的前一天。
+    此函数不读取数据；下界当天的精确时刻仍由后续内存窗口判断。
+    """
+    begin = min((history_window_start(stamp, years).date() for stamp in current_times), default=None)
+    if begin is None:
+        return None
+    end = date.fromisoformat(scope_start) - timedelta(days=1)
+    return (begin, end) if begin <= end else None
+
+
+def is_history_needed(history_time, current_times, years):
+    """沿用现有算法判断历史是否需要为待处理时点准备，输入时刻须已升序排列。
+
+    current_times 是本币或本组的 pd.Timestamp 序列，允许重复，不在本函数中
+    排序或修改。二分选出第一个严格晚于历史的时点，再比较该时点的回看下界；
+    组与状态由调用方筛选。跨闰日时其他窗口可能有更早下界，这一已有限制保留。
+    """
+    stamp = published_time(history_time)
+    position = bisect_right(current_times, stamp)
+    return position < len(current_times) and stamp >= history_window_start(current_times[position], years)
 
 
 def table_date_bounds(document):

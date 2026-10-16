@@ -3,7 +3,7 @@
 import json
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -11,12 +11,95 @@ from common.config import ai_config_hash, EventConfig
 from common.persistence import BatchPersistenceError, TaskValidationError
 from common.ai_protocol import parse_response
 from round1.runner import ExtractionSummary
-from common.store import PostTaskStore, EventRecordStore
-from initialization.event_records import import_event_records_from_table
+from common.store import PostTaskStore, EventRecordStore, read_event_history
+from initialization.event_records import expand_first_round, import_event_records_from_table
 from round2.runner import run_relation
 from round3.runner import run_impact
 from tests.support import FakeCli, Fixture, event_success, request_text, success, tasks
 from tests.event_support import Tables, choose, impact_result, new_result, source_posts
+
+
+class HistoryReadTests(unittest.TestCase):
+    def frame(self):
+        return expand_first_round(source_posts([
+            ("2025-01-02T12:00:00.123456789+08:00", "later", ["ETH"], "a"),
+            ("2025-01-01T00:00:00+08:00", "earlier", ["ETH"], "a"),
+        ]), {})
+
+    def test_full_history_read_preserves_values_original_index_and_query_arguments(self):
+        frame = self.frame()
+        frame.loc[:, "event"] = None
+        frame.loc[:, "round2_status"] = "unknown"
+        before = frame.copy(deep=True)
+        cli = Mock()
+        cli.read.return_value = frame
+        actual = read_event_history(cli, "events", "2025-01-01", "2025-01-02")
+        self.assertIs(actual, frame)
+        pd.testing.assert_frame_equal(actual, before)
+        cli.read.assert_called_once_with("events", start_time="2025-01-01", end_time="2025-01-02")
+
+    def test_projected_history_read_needs_only_requested_columns_and_keeps_raw_values(self):
+        columns = ["asset", "round2_status"]
+        frame = self.frame()[columns]
+        frame.iloc[0, 1] = pd.NA
+        before = frame.copy(deep=True)
+        cli = Mock()
+        cli.read.return_value = frame
+        actual = read_event_history(cli, "events", "2025-01-01", "2025-01-02", columns=columns)
+        self.assertIs(actual, frame)
+        pd.testing.assert_frame_equal(actual, before)
+        cli.read.assert_called_once_with("events", start_time="2025-01-01", end_time="2025-01-02", columns=columns)
+
+    def test_empty_full_and_projected_frames_are_valid(self):
+        for columns in (None, ["asset", "round2_status"]):
+            with self.subTest(columns=columns):
+                frame = self.frame().iloc[:0]
+                if columns is not None:
+                    frame = frame[columns]
+                cli = Mock()
+                cli.read.return_value = frame
+                self.assertIs(read_event_history(cli, "events", "2025-01-01", "2025-01-02", columns=columns), frame)
+                self.assertEqual(cli.read.call_count, 1)
+
+    def test_bad_full_structure_missing_projected_column_and_duplicate_index_stop(self):
+        for problem in ("full-columns", "projected-columns", "projected-index"):
+            with self.subTest(problem=problem):
+                frame, columns = self.frame(), None
+                if problem == "full-columns":
+                    frame = frame.drop(columns="embedding")
+                else:
+                    columns = ["asset", "round2_status"]
+                    frame = frame[columns]
+                    if problem == "projected-columns":
+                        frame = frame.drop(columns="asset")
+                    else:
+                        frame.index = pd.MultiIndex.from_tuples([frame.index[0]] * len(frame), names=frame.index.names)
+                cli = Mock()
+                cli.read.return_value = frame
+                with self.assertRaises(ValueError):
+                    read_event_history(cli, "events", "2025-01-01", "2025-01-02", columns=columns)
+                self.assertEqual(cli.read.call_count, 1)
+
+    def test_full_and_projected_dates_outside_query_fail_with_read_context(self):
+        for columns in (None, ["asset", "round2_status"]):
+            with self.subTest(columns=columns):
+                frame = self.frame()
+                if columns is not None:
+                    frame = frame[columns]
+                cli = Mock()
+                cli.read.return_value = frame
+                with self.assertRaisesRegex(ValueError, "测试读取返回了分段日期以外的行"):
+                    read_event_history(cli, "events", "2025-01-02", "2025-01-02", columns=columns, label="测试读取")
+                self.assertEqual(cli.read.call_count, 1)
+
+    def test_read_failure_propagates_without_retry_or_full_table_fallback(self):
+        cli = Mock()
+        failure = RuntimeError("数据库读取失败")
+        cli.read.side_effect = failure
+        with self.assertRaises(RuntimeError) as captured:
+            read_event_history(cli, "events", "2025-01-01", "2025-01-02", columns=["asset"])
+        self.assertIs(captured.exception, failure)
+        cli.read.assert_called_once_with("events", start_time="2025-01-01", end_time="2025-01-02", columns=["asset"])
 
 
 class StoreTests(Fixture, unittest.TestCase):

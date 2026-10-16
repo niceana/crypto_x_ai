@@ -40,8 +40,8 @@
 | `common/ai_protocol.py` | 三轮大模型请求体构造、接口响应解析及答复类型 | 配置对象、标准库 |
 | `common/validation.py` | 两张表字段及结构、严格 JSON 解析、三轮各自的输出校验 | 时间规则、公共异常、pandas |
 | `common/event_context.py` | 原帖正文和业务输入、候选检索、批量建立历史索引及两轮窗口内的组事实与截断标记 | 数据约定、时间规则 |
-| `common/time_rules.py` | 完整发布时间解析、包含首尾日的范围判断和选择，原索引及时区不变 | pandas、标准库 |
-| `common/store.py` | TableStore 共用保存；PostTaskStore 管理 round1帖子事件提取表，EventRecordStore 管理事件去重分析表 | 配置摘要、数据约定、存储重试 |
+| `common/time_rules.py` | 完整发布时间解析、历史补读日期范围和窗口资格判断、包含首尾日的范围选择，原索引及时区不变 | pandas、标准库 |
+| `common/store.py` | 共用事件历史读取检查、TableStore 保存；PostTaskStore 管理第一轮任务，EventRecordStore 管理事件去重分析表 | 配置摘要、数据约定、存储重试 |
 | `common/network.py` | 网络线程、请求预算、限速、完成消息和关闭 | 配置、AI 请求与响应约定、HTTPX |
 | `common/execution.py`、`persistence.py` | 共用分段执行、指定列写入、排序及整批存储重试 | 网络作业、pandas |
 | `initialization/post_tasks.py` | 根据完整源帖子建立round1帖子事件提取表，返回 InitializationSummary | 事件数据约定、pandas |
@@ -53,6 +53,8 @@
 | `main.py` | 根目录round1事件提取及自动导入启动入口 | entrypoints.run_round1 |
 
 目录之间直接导入，例如 `from round1.runner import run_extraction`。`common` 包含基础能力及共用业务约定，不导入初始化、轮次或入口；三个轮次不互相导入。round1事件提取与round3事件影响分析共用分段执行器，round2事件去重归组保留按币和时间推进的独立调度。两种业务 Store 在同一模块内继承 TableStore，round2事件去重归组与round3事件影响分析继续写同一张事件去重分析表。
+
+第二、三轮共用 common.time_rules.history_read_bounds 计算任务范围之前需要补读的日期，复用 is_history_needed 判断历史是否符合现有窗口选择算法；共用 common.store.read_event_history 读取并检查索引、所需列和返回日期。调用方继续决定时间基准、年数、查询分段和列：第二轮整段读取完整历史，第三轮按月只读六列。筛选、前置检查、状态恢复顺序和运行中历史推进仍由各轮负责，两轮独立启动时仍各自读库和建立内存历史。本次不修改现有闰日窗口算法，其限制见 [实现问题](docs/IMPLEMENTATION_ISSUES.md)。
 
 ## 配置与运行环境
 
