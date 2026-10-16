@@ -17,7 +17,7 @@
 | `asset` | 单个代币，去掉首尾空白并转为大写。导入后不修改。 |
 | `source_post_id` | 原帖 ID 的字符串形式。导入后不修改；round1事件提取原 ID 类型不变。 |
 | `event_relation` | 初始为空；完成后为 new/update/repeat。模型正常 uncertain 转为 new。 |
-| `new_information` | update 的非空新增事实；其他关系为空字符串。 |
+| `new_information` | update 的非空变化说明，包含必要的此前已知状态、本次新增或修正、变化后的状态及条件，供第三轮独立理解本次变化；旧状态来自匹配组历史，新事实来自当前 event，缺失处不补造。其他关系为空字符串。 |
 | `round2_ai_response` | 第二轮 AI 原始回答和调用信息的 JSON 字符串，初始为空；程序自动判新时为空。 |
 | `round3_ai_response` | 第三轮 AI 原始回答和调用信息的 JSON 字符串，替代五个独立影响列；初始及 repeat 跳过时为空。 |
 | `round2_status` | round2事件去重归组状态，初始为 `"0"`。 |
@@ -63,6 +63,8 @@ round2事件去重归组与round3事件影响分析读取事件去重分析表�
 
 例如第三轮正文为 `{"direction":"利好","materiality":"中","certainty":"已发生","persistence":"一次性","materiality_reason":"减少流通供给"}`，实际仍原样保存在 round3_ai_response 的 ai_response_content 字符串内。后续研究先解析回答列，再解析正文 JSON，即可展开五个影响字段。
 
+第二轮 AI 正文现为 event_relation、matched_candidate_id、new_information 三字段，matched_candidate_id 使用当前请求内的 E1、E2 等短编号。程序先校验并映射回真实 event_id，数据库 event_id 列继续保存真实组 ID；round2_ai_response.ai_response_content 保留 AI 原始短编号，不改写正文。不新增列、映射表或持久状态，旧回答正文也不迁移；研究时优先使用该行 event_id，不把原始回答中的 E1 当作跨请求可用的组 ID。
+
 例如第一次 AI 输出格式错误、usage.total_tokens=100，第二次成功、usage.total_tokens=13，则保存第二次原始正文、usage.total_tokens=13、attempts=2，不保存 113。若 18:20:30 提交失败，18:20:35 重试成功，created 保存当天 `18:20:35`，attempts 仍为 2，接口返回的 response_created 也不因存储重试而改变。
 
 第二轮合法 uncertain 的正文仍保存 uncertain，业务 event_relation 按既有规则保存 new。程序自动判新不伪造 AI 回答，round2_ai_response 为空；repeat 不调用第三轮，round3_ai_response 为空。已完成历史结果不会为了补回答而重调 AI。
@@ -71,7 +73,7 @@ round2事件去重归组与round3事件影响分析读取事件去重分析表�
 
 存储失败不重新调用 AI；重试保持原记录键、正文、usage、attempts、状态和错误，只重新取得 created。数据库写入确认后，内存使用实际提交的整批值同步。沿用事件表尚未创建的已确认前提，本次不增加旧结构迁移；若另有旧表，不能直接作为新结构读取。
 
-导入程序负责round1事件提取结果校验、事件展开、映射和追加；独立导入入口另做严格的固定输入核对。round2事件去重归组与round3事件影响分析以本表已有记录为任务，按阶段状态处理，不再展开round1事件提取或比较导入覆盖。第二轮只使用 event 和候选历史，不读原文；第三轮需要时按 date/source_post_id 从原表读取 text，不在本表增加正文副本。日常漏导任务通过再次运行覆盖相应帖子日期范围的 main.py 补齐；历史输入或映射变更另行确定重算范围。
+导入程序负责round1事件提取结果校验、事件展开、映射和追加；独立导入入口另做严格的固定输入核对。round2事件去重归组与round3事件影响分析以本表已有记录为任务，按阶段状态处理，不再展开round1事件提取或比较导入覆盖。第二轮只使用 event 和候选历史，不读原文；第三轮只使用本行 asset、event、new_information，不读取原帖或组历史。日常漏导任务通过再次运行覆盖相应帖子日期范围的 main.py 补齐；历史输入或映射变更另行确定重算范围。
 
 main.py 自动导入按以下步骤使用本表：
 

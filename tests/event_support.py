@@ -127,7 +127,7 @@ def choose(current, searchable):
 
 
 def new_result():
-    return {"event_relation": "new", "matched_event_id": None, "new_information": None}
+    return {"event_relation": "new", "matched_candidate_id": None, "new_information": None}
 
 
 def impact_result():

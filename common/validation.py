@@ -164,26 +164,32 @@ def validate_extraction_output(content):
         raise OutputValidationError(str(exc)) from exc
 
 
-def validate_relation_output(content, candidate_ids):
-    """候选 ID 快照固定在当前请求中，不在校验时重新查询历史。"""
+def validate_relation_output(content, candidate_event_ids):
+    """校验 AI 的请求内短编号，再返回带真实 matched_event_id 的内部结果。
+
+    candidate_event_ids 是本任务首次提交时固定的短编号到真实组 ID 映射，
+    重试不重新编号，不接受 AI 返回真实长 ID，也不改写待保存的原始正文。
+    """
     try:
         value = parse_strict_json(content)
-        if not isinstance(value, dict) or set(value) != {"event_relation", "matched_event_id", "new_information"}:
+        if not isinstance(value, dict) or set(value) != {"event_relation", "matched_candidate_id", "new_information"}:
             raise ValueError("第二轮须恰好返回三个关联字段")
-        relation, matched, info = value["event_relation"], value["matched_event_id"], value["new_information"]
+        relation, matched, info = value["event_relation"], value["matched_candidate_id"], value["new_information"]
         if relation not in ("new", "update", "repeat", "uncertain"):
             raise ValueError("event_relation 枚举不合法")
         if relation in ("new", "uncertain"):
             if matched is not None or info is not None:
                 raise ValueError("new/uncertain 的匹配 ID 和新增信息须为 null")
         else:
-            if not isinstance(matched, str) or matched not in candidate_ids:
-                raise ValueError("matched_event_id 不属于本次合法候选")
+            if not isinstance(matched, str) or matched not in candidate_event_ids:
+                raise ValueError("matched_candidate_id 不属于本次合法候选")
             if relation == "update" and (not isinstance(info, str) or not info.strip()):
                 raise ValueError("update 须有非空新增信息")
             if relation == "repeat" and info is not None:
                 raise ValueError("repeat 的新增信息须为 null")
-        return value
+        return {"event_relation": relation,
+                "matched_event_id": candidate_event_ids[matched] if matched is not None else None,
+                "new_information": info}
     except (ValueError, TypeError, UnicodeError) as exc:
         raise OutputValidationError(str(exc)) from exc
 

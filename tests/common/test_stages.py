@@ -26,7 +26,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 result = expand_first_round(source.iloc[:1], {"a": ["ETH"]})
                 backend = Tables(source, result)
                 source = backend.tables["first"]
-                source.loc[source.index[0], "text"] = "请求仍携带这段原帖正文"
+                source.loc[source.index[0], "text"] = "第三轮不应读取这段原帖正文"
                 source.loc[source.index[1], "text"] = None
                 source.loc[:, "status"] = "-1"
                 source.loc[:, "ai_response_content"] = "invalid JSON"
@@ -39,7 +39,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                     seen.append(json.loads(request_text(request))["current"])
                     return success(json.dumps(new_result()))
                 def impact(request):
-                    seen.append(json.loads(request_text(request))["current"])
+                    seen.append(json.loads(request_text(request)))
                     return success(json.dumps(impact_result()))
                 with patch("initialization.event_records.expand_first_round", side_effect=AssertionError("不应重新展开")):
                     second = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
@@ -49,10 +49,10 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 self.assertEqual(len(backend.tables["result"]), 1)
                 self.assertFalse(backend.appends or backend.registers or backend.writes)
                 self.assertEqual(len(seen), 2)
-                for current in seen:
-                    self.assertEqual((current["event"], current["asset"]), ("已导入事件", "ETH"))
-                self.assertNotIn("source_text", seen[0])
-                self.assertEqual(seen[1]["source_text"], "请求仍携带这段原帖正文")
+                self.assertEqual(seen[0], {"event": "已导入事件"})
+                self.assertEqual((seen[1]["event"], seen[1]["asset"]), ("已导入事件", "ETH"))
+                self.assertEqual(seen[1], {"asset": "ETH", "event": "已导入事件"})
+                self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
                 pd.testing.assert_frame_equal(backend.tables["first"], baseline)
 
     def test_completed_stages_do_not_require_source_table_or_ai_configuration(self):
@@ -70,8 +70,8 @@ class EventStageTests(EventFixture, unittest.TestCase):
         self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
         self.assertEqual(len(backend.updates), count)
 
-    def test_third_round_source_text_errors_stop_before_claiming_tasks(self):
-        for problem in ("missing_post", "wrong_date", "missing_column"):
+    def test_third_round_runs_without_usable_source_table(self):
+        for problem in ("missing_post", "wrong_date", "missing_column", "missing_table"):
             with self.subTest(problem=problem):
                 backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
                 self.relate(backend)
@@ -81,15 +81,18 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 elif problem == "wrong_date":
                     source.index = pd.MultiIndex.from_tuples([(pd.Timestamp("2021-01-02"), "100")],
                                                             names=["date", "id"])
-                else:
+                elif problem == "missing_column":
                     backend.tables["first"] = source.drop(columns="text")
-                before = backend.tables["result"].copy(deep=True)
-                count = len(backend.updates)
-                with self.assertRaisesRegex(ValueError, "原帖"):
-                    run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
-                               network_factory=lambda config: self.fail("不应发请求"))
-                self.assertEqual(len(backend.updates), count)
-                pd.testing.assert_frame_equal(backend.tables["result"], before)
+                else:
+                    del backend.tables["first"]
+                backend.reads.clear()
+                seen = []
+                summary = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
+                                     network_factory=self.factory(lambda req: seen.append(json.loads(request_text(req)))
+                                                                  or success(json.dumps(impact_result()))))
+                self.assertEqual(summary.new_completed, 1)
+                self.assertEqual(seen, [{"asset": "ETH", "event": "one"}])
+                self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
 
     def test_stages_find_integer_source_ids_and_preserve_original_dates(self):
         for stamp in ("2021-01-01 12:12:12.123456789", pd.Timestamp("2021-01-01T12:12:12.123456789+08:00")):

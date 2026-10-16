@@ -1,26 +1,31 @@
 """固定round1事件提取回答展开、去重和导入；自动导入与独立续建保留各自检查。"""
 
+import logging
 import re
 
 import pandas as pd
 
 from common.validation import (
-    validate_extraction_output,
     RESULT_COLUMNS,
     INPUT_COLUMNS,
     validate_index,
     validate_event_source_index,
 )
 from common.time_rules import in_scope, select_scope
+from initialization.first_round_answers import parse_first_round_answer
+
+
+logger = logging.getLogger(__name__)
 
 
 def expand_first_round(source, mapping):
-    """导入时要求本范围所有帖子成功，返回完整初始行；空代币按账号映射。"""
+    """检查本批全部帖子并展开；仅在内存修复正文引号，有错误时整批停止。"""
     validate_event_source_index(source)
     required = {"status", "ai_response_content", "user_name", "text"}
     if not required.issubset(source.columns):
         raise ValueError("第一轮缺少字段：{}".format(sorted(required - set(source.columns))))
-    rows, keys = [], []
+    rows, keys, errors = [], [], []
+    repaired_count = 0
     for (raw_date, raw_id), post in source.iterrows():
         post_id = str(raw_id)
         try:
@@ -30,7 +35,10 @@ def expand_first_round(source, mapping):
                 raise ValueError("原文和用户名必须为字符串")
             post["text"].encode("utf-8")
             post["user_name"].encode("utf-8")
-            body = validate_extraction_output(post["ai_response_content"])
+            body, repaired = parse_first_round_answer(post["ai_response_content"])
+            if repaired:
+                repaired_count += 1
+                logger.warning("第一轮帖子 %s 已在导入内存中修复 event 引号；原始回答保留", post_id)
             for slot, event in enumerate(body["events"]):
                 tickers = event["tickers"] or mapping.get(post["user_name"], [])
                 if not tickers or any(not isinstance(ticker, str) or not ticker.strip() for ticker in tickers):
@@ -43,7 +51,14 @@ def expand_first_round(source, mapping):
                     rows.append(row)
                     keys.append((raw_date, record_id))
         except (ValueError, TypeError, UnicodeError) as exc:
-            raise ValueError("第一轮帖子 {} 不合法：{}".format(post_id, exc)) from exc
+            errors.append((post_id, str(exc)))
+            logger.error("第一轮帖子 %s 不合法：%s", post_id, exc)
+    logger.info("第一轮事件导入校验完成：帖子数=%d，引号修复数=%d，不合法数=%d",
+                len(source), repaired_count, len(errors))
+    if errors:
+        post_id, reason = errors[0]
+        raise ValueError("第一轮帖子 {} 不合法：{}；本批共 {} 条不合法记录，详情见日志；"
+                         "本批在建表或写入前停止".format(post_id, reason, len(errors)))
     if keys:
         index = pd.MultiIndex.from_tuples(keys, names=["date", "record_id"])
     else:

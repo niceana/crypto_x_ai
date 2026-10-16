@@ -1,12 +1,14 @@
 """验证历史读取范围、窗口资格和内存索引，不连接真实服务。"""
 
+import copy
+import json
 import unittest
 from datetime import date
 from types import SimpleNamespace
 
 import pandas as pd
 
-from common.event_context import EventHistory
+from common.event_context import EventHistory, build_relation_input
 from common.store import is_stored_relation_valid, validate_relation_history
 from common.time_rules import history_read_bounds, history_window_start, is_history_needed
 from initialization.event_records import expand_first_round
@@ -73,6 +75,43 @@ class HistoryRangeTests(unittest.TestCase):
 
 
 class HistoryIndexTests(unittest.TestCase):
+    def test_relation_input_keeps_full_events_without_metadata_or_mutating_history(self):
+        frame = completed_records([
+            ("2021-01-01", "ABC 提出计划，原文保留日期2021-02-01及金额100万美元。", "ETH"),
+            ("2021-01-02", "ABC 更新额度至200万美元。", "ETH"),
+            ("2021-01-03", "ABC 更新额度至200万美元。", "ETH"),
+        ])
+        root, first, second = frame.index
+        frame.loc[[first, second], ["event_id", "event_relation", "new_information"]] = [root[1], "update", "仅供第三轮的增量"]
+        history = EventHistory(frame.iloc[::-1], truncate_group_history=True)
+        group = history.build_group_history("ETH", root[1], "2021-01-04 00:00:00")
+        current = {"event": 'ABC 宣布“开始执行”，保留原文中的"引号"。', "date": "2021-01-04 00:00:00",
+                   "record_id": "current", "source_post_id": "source", "asset": "ETH"}
+        before = copy.deepcopy((current, group))
+
+        text, candidate_event_ids = build_relation_input(current, [group])
+        body = json.loads(text)
+
+        self.assertEqual(body, {"current": {"event": current["event"]}, "candidates": [
+            {"candidate_id": "E1", "history": frame["event"].tolist()}]})
+        self.assertEqual(candidate_event_ids, {"E1": root[1]})
+        self.assertEqual((current, group), before)
+        self.assertNotIn("仅供第三轮的增量", json.dumps(body, ensure_ascii=False))
+
+    def test_relation_candidate_numbers_follow_order_through_e10_and_restart_per_request(self):
+        frame = completed_records([("2021-01-01", "fact-{}".format(index), "ETH") for index in range(10)])
+        history = EventHistory(frame, truncate_group_history=True)
+        event_ids = list(frame.index.get_level_values("record_id"))[::-1]
+        groups = [history.build_group_history("ETH", event_id, "2021-01-02 00:00:00") for event_id in event_ids]
+        text, mapping = build_relation_input({"event": "current"}, groups)
+        self.assertEqual([group["candidate_id"] for group in json.loads(text)["candidates"]],
+                         ["E{}".format(index) for index in range(1, 11)])
+        self.assertEqual(list(mapping.values()), event_ids)
+        next_text, next_mapping = build_relation_input({"event": "next"}, groups[-1:])
+        self.assertEqual(json.loads(next_text)["candidates"][0]["candidate_id"], "E1")
+        self.assertEqual(next_mapping, {"E1": event_ids[-1]})
+        self.assertEqual(len(mapping), 10)
+
     def test_window_preserves_precise_boundaries_assets_statuses_and_tie_order(self):
         current = pd.Timestamp("2025-10-01 12:00:00.123456789", tz="Asia/Shanghai")
         begin = pd.Timestamp("2020-10-01 12:00:00.123456789", tz="Asia/Shanghai")

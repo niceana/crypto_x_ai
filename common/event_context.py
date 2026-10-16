@@ -1,11 +1,9 @@
-"""维护事件历史索引，读取任务所需原帖正文，组织round2事件去重归组与round3事件影响分析业务输入。"""
+"""维护第二轮事件历史索引，组织第二轮候选输入和第三轮本条事件输入。"""
 
 import json
 from bisect import bisect_left
 from collections import defaultdict
-from datetime import date
 
-from common.validation import validate_event_source_index
 from common.time_rules import history_window_start, published_time
 
 
@@ -106,59 +104,41 @@ class EventHistory:
 
 
 def build_current_record_input(key, row):
-    """组织固定事件事实和定位字段；第二轮无需回读原帖。"""
+    """为第二轮内部检索组织固定事件事实和定位字段。"""
     return {"record_id": key[1], "date": str(key[0]), "asset": row["asset"],
             "event": row["event"], "source_post_id": row["source_post_id"]}
 
 
-def load_source_texts(store, keys):
-    """为第三轮待分析任务查找原文，不展开第一轮结果或核对任务覆盖。
-
-    只返回任务实际使用的正文；已完成、repeat 或空分段无需读原帖。
-    按导入时保留的日期和原帖 ID 定位；缺少对应原帖或 text 列时在认领前
-    停止，正文单元格原样交给业务输入构造，不在读取阶段检查内容。
-    """
-    if not keys:
-        return {}
-    start = store.start_time or store.settings.start_time
-    end = store.end_time or store.settings.end_time
-    if start is None:
-        source = store.cli.read(store.settings.first_round_task_path)
-    else:
-        source = store.cli.read(store.settings.first_round_task_path, start_time=start, end_time=end)
-    validate_event_source_index(source)
-    if start is not None:
-        begin, finish = date.fromisoformat(start), date.fromisoformat(end)
-        if any(not begin <= published_time(key[0]).date() <= finish for key in source.index):
-            raise ValueError("原帖读取返回了分段日期以外的行")
-    if "text" not in source.columns:
-        raise ValueError("原帖缺少 text 字段")
-    positions = {(raw_date, str(raw_id)): i for i, (raw_date, raw_id) in enumerate(source.index)}
-    texts = {}
-    for key in keys:
-        post_id = store.df.loc[key, "source_post_id"]
-        source_key = (key[0], post_id)
-        if source_key not in positions:
-            raise ValueError("任务对应原帖不存在：{}，source_post_id={}".format(key[1], post_id))
-        if post_id in texts:
-            continue
-        text = source.iloc[positions[source_key]]["text"]
-        texts[post_id] = text
-    return texts
-
-
 def build_relation_input(current, candidates):
-    """将已经选定的当前记录和候选历史序列化，不重新检索或改变候选。"""
-    return json.dumps({"current": current, "candidates": candidates}, ensure_ascii=False, allow_nan=False)
+    """返回第二轮事件文本输入及本次短编号到真实事件组 ID 的映射。
 
-
-def build_impact_input(store, key, source_texts, history):
-    """认领确认后逐条组织业务输入，不预存整月正文和历史输入副本。"""
-    row = store.df.loc[key]
-    current = build_current_record_input(key, row)
-    current.update(source_text=source_texts[row["source_post_id"]],
-                   event_relation=row["event_relation"], new_information=row["new_information"] or None)
-    previous = (history.build_group_history(row["asset"], row["event_id"], key[0])
-                if row["event_relation"] == "update" else None)
-    return json.dumps({"current": current, "previous_history": previous},
+    候选已经完成同币、时间窗口筛选并排好顺序。缺少起点时保留最早可用
+    披露；它若同时也是首条 update，按披露 ID 排除重复，不按文本合并事实。
+    每组依候选顺序编号 E1、E2 等；调用方将文本与映射固定在同一请求中，
+    重试复用，不修改内部记录。第三轮不使用组历史。
+    """
+    groups, candidate_event_ids = [], {}
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_id = "E{}".format(index)
+        candidate_event_ids[candidate_id] = candidate["event_id"]
+        first = candidate["first_disclosure"] or candidate["first_available_disclosure"]
+        records = [first] + candidate["timeline"]
+        seen, events = set(), []
+        for record in records:
+            if record["record_id"] not in seen:
+                seen.add(record["record_id"])
+                events.append(record["event"])
+        groups.append({"candidate_id": candidate_id, "history": events})
+    text = json.dumps({"current": {"event": current["event"]}, "candidates": groups},
                       ensure_ascii=False, allow_nan=False)
+    return text, candidate_event_ids
+
+
+def build_impact_input(store, key):
+    """认领后组织代币和事件，仅在新增信息有内容时附带该字段。"""
+    row = store.df.loc[key]
+    current = {"asset": row["asset"], "event": row["event"]}
+    information = row["new_information"]
+    if information and information.strip():
+        current["new_information"] = information
+    return json.dumps(current, ensure_ascii=False, allow_nan=False)

@@ -1,4 +1,4 @@
-"""验证研究流程的历史边界、任务状态、重试与续跑；不访问真实服务。"""
+"""验证第三轮事件输入、读取范围、任务状态、重试与续跑；不访问真实服务。"""
 
 import asyncio
 import json
@@ -14,7 +14,7 @@ from common.config import ai_config_hash
 from common.network import BatchRunError
 from common.persistence import BatchPersistenceError
 from round2.runner import run_relation
-from round3.runner import HISTORY_COLUMNS, run_impact
+from round3.runner import run_impact
 from common.validation import HASH_COLUMNS, validate_impact_output
 from tests.support import request_text, success
 from tests.event_support import EventFixture, new_result, impact_result
@@ -29,17 +29,16 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
                 run_impact(backend, self.settings(**values))
         self.assertFalse(backend.reads or backend.column_reads or backend.meta_reads or backend.updates)
 
-    def test_impact_five_year_boundary_truncated_repeat_and_no_outside_writes(self):
+    def test_impact_update_only_reads_scope_and_sends_three_fields(self):
         backend = self.backend([
             ("2010-01-01", "old-origin", ["ETH"], "a"),
-            ("2020-10-16 11:59:59.999999999", "outside", ["ETH"], "a"),
-            ("2020-10-16 12:00:00", "boundary", ["ETH"], "a"),
+            ("2020-10-16", "outside", ["ETH"], "a"),
             ("2025-10-16 12:00:00", "current", ["ETH"], "a"),
             ("2025-10-16 12:00:00", "same-time", ["ETH"], "a"),
             ("2026-01-01", "future", ["ETH"], "a"),
         ])
         frame = backend.tables["result"]
-        root, outside, boundary, current, same_time, future = frame.index
+        root, outside, current, same_time, future = frame.index
         frame.loc[:, "event_id"] = root[1]
         frame.loc[:, "event_relation"] = "repeat"
         frame.loc[:, "round2_status"] = "1"
@@ -47,109 +46,86 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         frame.loc[root, ["event_relation", "round2_status"]] = ["new", "0"]
         frame.loc[current, ["event_relation", "round3_status", "new_information"]] = ["update", "9", "新进展"]
         before = frame.drop(index=current).copy(deep=True)
+        del backend.tables["first"]
+        read = backend.read
+        def scoped_read(path, start_time=None, end_time=None, columns=None):
+            self.assertEqual(path, "result", "第三轮不应读取原帖")
+            if columns is None:
+                self.assertEqual((start_time, end_time), ("2025-10-16", "2025-10-16"), "不应补读历史或扩大日期范围")
+            else:
+                self.assertEqual((start_time, end_time, columns), ("", "", ["round3_config_hash"]))
+            return read(path, start_time, end_time, columns)
         seen = []
-        summary = run_impact(backend, self.settings(start_time="2025-10-16", end_time="2025-10-16"),
-                             ai_config=self.config(), network_factory=self.factory(
-                                 lambda req: seen.append(json.loads(request_text(req)))
-                                 or success(json.dumps(impact_result()))))
-        self.assertEqual(summary.new_completed, 1)
-        history = seen[0]["previous_history"]
-        self.assertEqual(history["event_id"], root[1])
-        self.assertIsNone(history["first_disclosure"])
-        self.assertTrue(history["history_trimmed"])
-        self.assertEqual(history["first_available_disclosure"]["event"], "boundary")
-        self.assertEqual((history["repeat_count"], history["disclosure_count"]), (1, 1))
-        self.assertEqual(history["timeline"], [])
-        reads = [item for item in backend.column_reads if item[3] == HISTORY_COLUMNS]
-        self.assertEqual(reads[0][1], "2020-10-16")
-        self.assertEqual(reads[-1][2], "2025-10-15")
+        with patch.object(backend, "read", side_effect=scoped_read):
+            summary = run_impact(backend, self.settings(start_time="2025-10-16", end_time="2025-10-16"),
+                                 ai_config=self.config(), network_factory=self.factory(
+                                     lambda req: seen.append(json.loads(request_text(req)))
+                                     or success(json.dumps(impact_result()))))
+        self.assertEqual((summary.total, summary.already_completed, summary.new_completed), (2, 1, 1))
+        self.assertEqual(seen, [{"asset": "ETH", "event": "current", "new_information": "新进展"}])
+        self.assertEqual(backend.column_reads, [("result", "", "", ["round3_config_hash"])])
         self.assertFalse(backend.meta_reads)
-        self.assertEqual(backend.reads[0], ("result", "2025-10-16", "2025-10-16"))
         pd.testing.assert_frame_equal(frame.drop(index=current), before)
 
-    def test_impact_uses_each_task_window_and_fixed_years_independent_of_round2(self):
-        backend = self.backend([
-            ("2018-01-01", "origin", ["ETH"], "a"),
-            ("2020-01-01", "early", ["ETH"], "a"),
-            ("2024-01-01", "recent-repeat", ["ETH"], "a"),
-            ("2026-01-01", "late", ["ETH"], "a"),
-        ])
+    def test_impact_asset_and_new_information_follow_each_record(self):
+        backend = self.backend([("2025-01-01", "多币事件", ["BTC", "ETH"], "a"),
+                                ("2025-01-02", "本次进展含旧事实", ["ETH"], "a")])
         frame = backend.tables["result"]
-        root, early, repeat, late = frame.index
-        frame.loc[:, "event_id"] = root[1]
-        frame.loc[:, "event_relation"] = "update"
-        frame.loc[:, "round2_status"] = "1"
-        frame.loc[:, "new_information"] = frame["event"]
-        frame.loc[root, ["event_relation", "round3_status"]] = ["new", "1"]
-        frame.loc[repeat, ["event_relation", "round3_status"]] = ["repeat", "1"]
-        seen = {}
-        def handler(req):
-            body = json.loads(request_text(req))
-            seen[body["current"]["event"]] = body["previous_history"]
-            return success(json.dumps(impact_result()))
-        summary = run_impact(backend, self.settings(start_time="2020-01-01", end_time="2026-01-01",
-                                                  history_lookback_years=1),
-                             ai_config=self.config(), network_factory=self.factory(handler))
-        self.assertEqual(summary.new_completed, 2)
-        self.assertEqual(seen["early"]["first_disclosure"]["event"], "origin")
-        self.assertFalse(seen["early"]["history_trimmed"])
-        self.assertIsNone(seen["late"]["first_disclosure"])
-        self.assertEqual(seen["late"]["first_available_disclosure"]["event"], "recent-repeat")
-        self.assertEqual(seen["late"]["disclosure_count"], 1)
-
-    def test_impact_leap_day_keeps_timezone_and_nanosecond_window(self):
-        boundary = pd.Timestamp("2019-02-28T12:00:00.123456789+08:00")
-        current_time = pd.Timestamp("2024-02-29T12:00:00.123456789+08:00")
-        backend = self.backend([(boundary - pd.Timedelta(1, "ns"), "outside", ["ETH"], "a"),
-                                (boundary, "origin", ["ETH"], "a"),
-                                (current_time, "current", ["ETH"], "a")])
-        frame = backend.tables["result"]
-        outside, root, current = frame.index
         frame.loc[:, "round2_status"] = "1"
         frame.loc[:, "event_relation"] = "new"
         frame.loc[:, "event_id"] = frame.index.get_level_values("record_id")
-        frame.loc[current, ["event_relation", "event_id"]] = ["update", root[1]]
+        current = frame.index[-1]
+        info = '本次新增 "5000万美元"；附带条件保持原样。'
+        frame.loc[current, ["event_relation", "event_id", "new_information"]] = ["update", "missing-group", info]
+        del backend.tables["first"]
         seen = []
-        run_impact(backend, self.settings(start_time="2024-02-29", end_time="2024-02-29"),
-                   ai_config=self.config(), network_factory=self.factory(
-                       lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(impact_result()))))
-        self.assertEqual(seen[0]["previous_history"]["first_disclosure"]["record_id"], root[1])
-        self.assertEqual(seen[0]["previous_history"]["disclosure_count"], 1)
-        self.assertEqual(next(item[1] for item in backend.column_reads if item[3] == HISTORY_COLUMNS), "2019-02-28")
-        self.assertEqual(frame.index[-1][0], current_time)
+        summary = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-02", history_lookback_years=1),
+                             ai_config=self.config(), network_factory=self.factory(
+                                 lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(impact_result()))))
+        self.assertEqual(summary.new_completed, 3)
+        self.assertCountEqual(seen, [{"asset": "BTC", "event": "多币事件"},
+                                     {"asset": "ETH", "event": "多币事件"},
+                                     {"asset": "ETH", "event": "本次进展含旧事实", "new_information": info}])
+        self.assertTrue(all(path == "result" for path, _, _ in backend.reads))
+        self.assertEqual(backend.column_reads, [("result", "", "", ["round3_config_hash"])])
 
-    def test_impact_empty_group_window_stops_before_recovery_or_ai(self):
-        backend = self.backend([("2010-01-01", "old-origin", ["ETH"], "a"),
-                                ("2025-01-01", "current", ["ETH"], "a")])
-        frame = backend.tables["result"]
-        root, current = frame.index
-        frame.loc[:, "round2_status"] = "1"
-        frame.loc[:, "event_id"] = root[1]
-        frame.loc[root, "event_relation"] = "new"
-        frame.loc[current, ["event_relation", "round3_status"]] = ["update", "-1"]
-        before = frame.copy(deep=True)
-        with self.assertRaisesRegex(ValueError, "5年窗口内没有可用"):
-            run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
-                       network_factory=lambda config: self.fail("不应发请求"))
-        self.assertFalse(backend.updates or backend.meta_reads)
-        self.assertTrue(all(start >= "2020-01-01" for _, start, _, _ in backend.column_reads))
-        pd.testing.assert_frame_equal(frame, before)
+    def test_impact_omits_empty_new_information_and_preserves_nonempty_text(self):
+        for information in ("", None, " \t\n", "  本次新增事实  "):
+            with self.subTest(information=information):
+                backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
+                frame = backend.tables["result"]
+                key = frame.index[0]
+                frame.loc[key, ["round2_status", "event_relation", "event_id"]] = ["1", "new", key[1]]
+                expected = {"asset": "ETH", "event": "current"}
+                if information == "  本次新增事实  ":
+                    frame.loc[key, ["event_relation", "event_id"]] = ["update", "existing-group"]
+                    expected["new_information"] = information
+                frame.at[key, "new_information"] = information
+                seen = []
+                summary = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
+                                     ai_config=self.config(), network_factory=self.factory(
+                                         lambda req: seen.append(json.loads(request_text(req)))
+                                         or success(json.dumps(impact_result()))))
+                self.assertEqual(summary.new_completed, 1)
+                self.assertEqual(seen, [expected])
+                self.assertEqual(frame.at[key, "new_information"], information)
 
-    def test_impact_reuses_scope_history_without_external_reads(self):
-        backend = self.backend([("2023-01-01", "origin", ["ETH"], "a"),
-                                ("2025-01-01", "current", ["ETH"], "a")])
-        frame = backend.tables["result"]
-        root, current = frame.index
-        frame.loc[:, "round2_status"] = "1"
-        frame.loc[:, "event_id"] = root[1]
-        frame.loc[root, ["event_relation", "round3_status"]] = ["new", "1"]
-        frame.loc[current, "event_relation"] = "update"
-        seen = []
-        run_impact(backend, self.settings(start_time="2019-01-01", end_time="2025-01-01"),
-                   ai_config=self.config(), network_factory=self.factory(
-                       lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(impact_result()))))
-        self.assertFalse(any(columns == HISTORY_COLUMNS for _, _, _, columns in backend.column_reads))
-        self.assertEqual(seen[0]["previous_history"]["first_disclosure"]["event"], "origin")
+    def test_impact_update_without_history_or_source_can_resume(self):
+        for status in ("0", "9", "-1"):
+            with self.subTest(status=status):
+                backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
+                frame = backend.tables["result"]
+                current = frame.index[0]
+                frame.loc[current, ["round2_status", "event_relation", "event_id", "new_information", "round3_status"]] = ["1", "update", "missing-group", "本次新增", status]
+                second_before = frame[["event_id", "event_relation", "new_information", "round2_status", "round2_ai_response", "round2_config_hash"]].copy(deep=True)
+                del backend.tables["first"]
+                summary = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
+                                     ai_config=self.config(), network_factory=self.factory(
+                                         lambda req: success(json.dumps(impact_result()))))
+                self.assertEqual((summary.new_completed, summary.http_attempts_started), (1, 1))
+                self.assertEqual(frame.loc[current, "round3_status"], "1")
+                pd.testing.assert_frame_equal(frame[second_before.columns], second_before)
+                self.assertTrue(all(path == "result" for path, _, _ in backend.reads))
 
     def test_completed_update_only_reads_scope_without_rechecking_old_origin(self):
         backend = self.backend([("2010-01-01", "old-origin", ["ETH"], "a"),
@@ -164,67 +140,65 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertFalse(backend.column_reads or backend.meta_reads or backend.updates)
         pd.testing.assert_frame_equal(frame, before)
 
-    def test_impact_invalid_window_origin_stops_before_recovery(self):
-        backend = self.backend([("2023-01-01", "wrong-asset-origin", ["BTC"], "a"),
-                                ("2025-01-01", "current", ["ETH"], "a")])
-        frame = backend.tables["result"]
-        root, current = frame.index
-        frame.loc[:, "round2_status"] = "1"
-        frame.loc[:, "event_id"] = root[1]
-        frame.loc[root, "event_relation"] = "new"
-        frame.loc[current, ["event_relation", "round3_status"]] = ["update", "9"]
-        with self.assertRaisesRegex(ValueError, "第二轮未完成或结果不合法"):
-            run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"))
-        self.assertFalse(backend.updates)
-
-    def test_impact_invalid_history_projection_stops_before_recovery(self):
-        for problem, message in (("missing-column", "缺少必要列"), ("wrong-range", "分段日期以外"),
-                                 ("false-origin", "组起点未引用自身")):
-            with self.subTest(problem=problem):
-                backend = self.backend([("2020-01-01", "origin", ["ETH"], "a"),
-                                        ("2025-01-01", "current", ["ETH"], "a")])
+    def test_impact_invalid_local_relations_stop_before_recovery_or_ai(self):
+        cases = [("0", "new", "self"), ("-1", "new", "self"),
+                 ("1", "", "group"), ("1", "uncertain", "group"),
+                 ("1", "new", "other"), ("1", "update", ""),
+                 ("1", "update", " "), ("1", "update", None),
+                 ("1", "update", "self"), ("1", "repeat", "self"), ("1", "repeat", "")]
+        for status, relation, group in cases:
+            with self.subTest(status=status, relation=relation, group=group):
+                backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
                 frame = backend.tables["result"]
-                root, current = frame.index
-                frame.loc[:, "round2_status"] = "1"
-                frame.loc[:, "event_id"] = root[1]
-                frame.loc[root, "event_relation"] = "new"
-                frame.loc[current, ["event_relation", "round3_status"]] = ["update", "9"]
+                current = frame.index[0]
+                group = current[1] if group == "self" else group
+                frame.loc[current, ["round2_status", "event_relation", "event_id", "round3_status"]] = [status, relation, group, "9"]
+                before = frame.copy(deep=True)
+                with self.assertRaisesRegex(ValueError, "第二轮未完成或结果不合法"):
+                    run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
+                               ai_config=self.config(), network_factory=lambda config: self.fail("不应发请求"))
+                self.assertFalse(backend.updates or backend.column_reads or backend.meta_reads)
+                pd.testing.assert_frame_equal(frame, before)
+
+    def test_impact_invalid_task_projection_stops_before_recovery(self):
+        for problem in ("missing-column", "wrong-range"):
+            with self.subTest(problem=problem):
+                backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
+                frame = backend.tables["result"]
+                current = frame.index[0]
+                frame.loc[current, ["round2_status", "event_relation", "event_id", "round3_status"]] = ["1", "new", current[1], "9"]
                 before = frame.copy(deep=True)
                 read = backend.read
                 def faulty_read(path, start_time=None, end_time=None, columns=None):
                     result = read(path, start_time, end_time, columns)
-                    if columns == HISTORY_COLUMNS:
-                        if problem == "missing-column":
-                            return result.drop(columns="event")
-                        if problem == "wrong-range":
-                            return frame.loc[[current], HISTORY_COLUMNS].copy(deep=True)
-                        if not result.empty:
-                            result.index = pd.MultiIndex.from_tuples([(root[0], "false-id")], names=result.index.names)
+                    if problem == "missing-column":
+                        return result.drop(columns="event")
+                    result.index = pd.MultiIndex.from_tuples([(pd.Timestamp("2025-01-02"), current[1])], names=result.index.names)
                     return result
-                with patch.object(backend, "read", side_effect=faulty_read), self.assertRaisesRegex(ValueError, message):
-                    run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"))
+                with patch.object(backend, "read", side_effect=faulty_read), self.assertRaises(ValueError):
+                    run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
+                               ai_config=self.config(), network_factory=lambda config: self.fail("不应发请求"))
                 self.assertFalse(backend.updates or backend.meta_reads)
                 pd.testing.assert_frame_equal(frame, before)
 
-    def test_impact_missing_later_source_preserves_saved_earlier_month(self):
+    def test_impact_missing_source_does_not_block_later_month(self):
         backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"), ("2021-02-01", "feb", ["ETH"], "a")])
         self.relate(backend)
         backend.tables["first"] = backend.tables["first"].iloc[:1].copy(deep=True)
         seen = []
         def handler(request):
-            seen.append(json.loads(request_text(request))["current"]["event"])
+            seen.append(json.loads(request_text(request))["event"])
             return success(json.dumps(impact_result()))
-        with self.assertRaisesRegex(ValueError, "原帖不存在"):
-            run_impact(backend, self.settings(start_time="2021-01-01", end_time="2021-02-01"),
-                       ai_config=self.config(), network_factory=self.factory(handler))
-        self.assertEqual(seen, ["jan"])
-        frame = backend.tables["result"]
-        self.assertEqual(list(frame["round3_status"]), ["1", "0"])
-        self.assertEqual(json.loads(json.loads(frame.iloc[0]["round3_ai_response"])["ai_response_content"])["materiality_reason"], impact_result()["materiality_reason"])
-        self.assertTrue(frame["round2_status"].eq("1").all())
+        summary = run_impact(backend, self.settings(start_time="2021-01-01", end_time="2021-02-01"),
+                             ai_config=self.config(), network_factory=self.factory(handler))
+        self.assertEqual(seen, ["jan", "feb"])
+        self.assertEqual(summary.new_completed, 2)
+        self.assertTrue(backend.tables["result"]["round3_status"].eq("1").all())
+        self.assertTrue(backend.tables["result"]["round2_status"].eq("1").all())
+        self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
         self.assertFalse(any(thread.name == "ai-batch-network" for thread in threading.enumerate()))
 
-    def test_impact_requires_all_previous_records_complete(self):
+    def test_impact_requires_all_scope_relations_complete(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         with self.assertRaisesRegex(ValueError, "第二轮未完成"):
             run_impact(backend, self.relation_settings(backend))
@@ -236,7 +210,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.relate(backend)
         seen = []
         def handler(request):
-            event = json.loads(request_text(request))["current"]["event"]
+            event = json.loads(request_text(request))["event"]
             seen.append(event)
             return success("{}" if event == "bad" else json.dumps(impact_result()))
         result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(handler))
@@ -260,7 +234,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
             body = json.loads(request_text(request))
             if not body["candidates"]:
                 return success(json.dumps(new_result()))
-            return success(json.dumps({"event_relation": "repeat", "matched_event_id": body["candidates"][0]["event_id"], "new_information": None}))
+            return success(json.dumps({"event_relation": "repeat", "matched_candidate_id": body["candidates"][0]["candidate_id"], "new_information": None}))
         self.relate(backend, handler)
         source_before = backend.tables["first"].copy(deep=True)
         result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
@@ -309,7 +283,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.relate(backend)
         old_hash = ai_config_hash(self.config())
         def first_handler(request):
-            event = json.loads(request_text(request))["current"]["event"]
+            event = json.loads(request_text(request))["event"]
             return success("{}" if event == "bad" else json.dumps(impact_result()))
         run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(first_handler))
         error = backend.tables["result"].iloc[1]["error_message"]
@@ -358,7 +332,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
             return run_segments(ranges, load, *args)
 
         async def handler(request):
-            current = json.loads(request_text(request))["current"]
+            current = json.loads(request_text(request))
             month = current["event"].split("-")[0]
             busy[0] += 1
             maximum[0] = max(maximum[0], busy[0])
@@ -389,10 +363,9 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual([json.loads(json.loads(value)["ai_response_content"])["materiality_reason"] for value in backend.tables["result"]["round3_ai_response"]], ["jan-a", "jan-b", "feb-a", "feb-b"])
         self.assertTrue(all(ref() is None for ref in snapshots))
 
-        # 两个月：合并只读检查 2 次、恢复 2 次、执行 2 次；不为月末检查再读表。
+        # 两个月：范围检查 2 次、恢复 2 次、执行 2 次；不为月末检查再读表。
         self.assertEqual(len([read for read in backend.reads if read[0] == "result"]), 6)
-        self.assertEqual([read for read in backend.reads if read[0] == "first"],
-                         [("first", "2021-01-31", "2021-01-31"), ("first", "2021-02-01", "2021-02-28")])
+        self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
 
     def test_impact_later_month_not_ready_stops_before_any_recovery_or_request(self):
         backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"),
@@ -408,28 +381,29 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(len(backend.updates), count)
         pd.testing.assert_frame_equal(frame, baseline)
 
-    def test_impact_old_origin_history_preserved_and_future_excluded(self):
+    def test_impact_only_changes_current_scope_and_preserves_other_records(self):
         backend = self.backend([("2020-01-01", "origin", ["ETH"], "a"),
                                 ("2021-02-01", "progress", ["ETH"], "a"),
                                 ("2021-03-01", "current", ["ETH"], "a"),
                                 ("2021-04-01", "future", ["ETH"], "a")])
         frame = backend.tables["result"]
-        root = frame.index[0]
+        root, progress, current, future = frame.index
         frame.loc[:, "round2_status"] = "1"
         frame.loc[:, "round2_config_hash"] = ai_config_hash(self.config())
         frame.loc[:, "event_id"] = root[1]
         frame.loc[:, "event_relation"] = "update"
         frame.loc[:, "new_information"] = frame["event"]
         frame.loc[root, ["event_relation", "new_information"]] = ["new", ""]
+        outside_before = frame.drop(index=current).copy(deep=True)
         seen = []
         run_impact(backend, self.settings(start_time="2021-03-01", end_time="2021-03-31"),
                    ai_config=self.config(), network_factory=self.factory(
                        lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(impact_result()))))
-        history = seen[0]["previous_history"]
-        self.assertEqual(history["first_disclosure"]["event"], "origin")
-        self.assertEqual([item["event"] for item in history["timeline"]], ["progress"])
-        self.assertEqual(history["disclosure_count"], 2)
+        self.assertEqual(seen, [{"asset": "ETH", "event": "current", "new_information": "current"}])
         self.assertEqual(list(frame["round3_status"]), ["0", "0", "1", "0"])
+        pd.testing.assert_frame_equal(frame.drop(index=current), outside_before)
+        self.assertTrue(all(path == "result" and start == "2021-03-01" and end == "2021-03-31"
+                            for path, start, end in backend.reads))
 
     def test_impact_stop_does_not_execute_next_month(self):
         backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"),
@@ -496,7 +470,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         calls = []
 
         def handler(request):
-            event = json.loads(request_text(request))["current"]["event"]
+            event = json.loads(request_text(request))["event"]
             calls.append(event)
             return success("{}" if event == "jan" else json.dumps(impact_result()))
 
@@ -507,7 +481,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual((summary.failed, summary.new_completed, summary.processing), (1, 1, 0))
         self.assertEqual(list(backend.tables["result"]["round3_status"]), ["-1", "1"])
 
-    def test_impact_partial_month_collects_roots_before_checking_and_scopes_month_end(self):
+    def test_impact_partial_month_excludes_outside_processing_states(self):
         backend = self.backend([("2021-01-05", "origin", ["ETH"], "a"),
                                 ("2021-01-15", "current", ["ETH"], "a"),
                                 ("2021-01-25", "future", ["ETH"], "a")])
@@ -520,7 +494,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         frame.loc[:, "new_information"] = frame["event"]
         frame.loc[root, ["event_relation", "new_information"]] = ["new", ""]
         frame.loc[[root, future], "round3_status"] = "9"
-        # 起点排在当前记录之后，且范围外的 9 不应被恢复或阻止本范围结束。
+        # 任务表乱序，范围外的 9 不应被恢复或阻止本范围结束。
         backend.tables["result"] = frame.iloc[[2, 1, 0]].copy(deep=True)
         seen = []
         summary = run_impact(backend, self.settings(start_time="2021-01-15", end_time="2021-01-15"),
@@ -528,14 +502,12 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
                                  lambda req: seen.append(json.loads(request_text(req)))
                                  or success(json.dumps(impact_result()))))
         self.assertEqual((summary.total, summary.new_completed), (1, 1))
-        self.assertEqual(seen[0]["previous_history"]["first_disclosure"]["event"], "origin")
-        self.assertEqual(seen[0]["previous_history"]["disclosure_count"], 1)
+        self.assertEqual(seen, [{"asset": "ETH", "event": "current", "new_information": "current"}])
         self.assertEqual(backend.tables["result"].loc[current, "round3_status"], "1")
         self.assertTrue(backend.tables["result"].loc[[root, future], "round3_status"].eq("9").all())
         self.assertEqual([read for read in backend.reads if read[0] == "result"],
                          [("result", "2021-01-15", "2021-01-15")] * 3)
-        self.assertTrue(all(not start or end < "2021-01-15" for _, start, end, columns in
-                            backend.column_reads if columns == HISTORY_COLUMNS))
+        self.assertEqual(backend.column_reads, [("result", "", "", ["round3_config_hash"])])
 
     def test_impact_scope_without_imported_tasks_returns_empty_without_reading_source(self):
         for missing, retained in (("2021-01-01", "2021-02-01"), ("2021-02-01", "2021-01-01")):
@@ -575,8 +547,6 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
                                 ("2021-03-05 12:00:00", "current", ["ETH"], "a")])
         self.relate(backend)
         backend.reads.clear()
-        backend.metadata["result"] = json.dumps({"meta": {"start_time": "2021-01-31T20:00:00",
-                                                          "end_time": "2021-03-05T12:00:00"}})
         snapshots = []
         read = backend.read
         def checked_read(*args, **kwargs):
@@ -591,31 +561,26 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(summary.new_completed, 1)
         result_reads = [read for read in backend.reads if read[0] == "result"]
         self.assertEqual(result_reads, [("result", "2021-03-05", "2021-03-05")] * 3)
-        self.assertEqual(len(backend.reads), 4)
+        self.assertEqual(len(backend.reads), 3)
         self.assertTrue(all(start is not None for _, start, _ in backend.reads))
         self.assertTrue(all(ref() is None for ref in snapshots))
 
-    def test_impact_history_read_failure_never_falls_back_or_recovers(self):
-        backend = self.backend([("2020-01-01", "origin", ["ETH"], "a"),
-                                ("2025-01-01", "current", ["ETH"], "a")])
+    def test_impact_task_read_failure_never_falls_back_or_recovers(self):
+        backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
         frame = backend.tables["result"]
-        root, current = frame.index
-        frame.loc[:, "round2_status"] = "1"
-        frame.loc[:, "event_id"] = root[1]
-        frame.loc[root, "event_relation"] = "new"
-        frame.loc[current, ["event_relation", "round3_status"]] = ["update", "9"]
-        baseline = backend.tables["result"].copy(deep=True)
+        current = frame.index[0]
+        frame.loc[current, ["round2_status", "event_relation", "event_id", "round3_status"]] = ["1", "new", current[1], "9"]
+        baseline = frame.copy(deep=True)
         read = backend.read
-        def fail_history(path, start_time=None, end_time=None, columns=None):
-            if columns == HISTORY_COLUMNS:
-                raise RuntimeError("历史读取失败")
-            return read(path, start_time, end_time, columns)
-        with patch.object(backend, "read", side_effect=fail_history), self.assertRaisesRegex(RuntimeError, "历史读取失败"):
+        def fail_tasks(path, start_time=None, end_time=None, columns=None):
+            read(path, start_time, end_time, columns)
+            raise RuntimeError("任务读取失败")
+        with patch.object(backend, "read", side_effect=fail_tasks), self.assertRaisesRegex(RuntimeError, "任务读取失败"):
             run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-01"),
                        ai_config=self.config(), network_factory=lambda config: self.fail("不能发请求"))
         self.assertEqual(backend.reads, [("result", "2025-01-01", "2025-01-01")])
-        self.assertFalse(backend.updates or backend.meta_reads)
-        pd.testing.assert_frame_equal(backend.tables["result"], baseline)
+        self.assertFalse(backend.updates or backend.meta_reads or backend.column_reads)
+        pd.testing.assert_frame_equal(frame, baseline)
 
     def test_impact_single_hash_column_detects_config_conflict_after_processing_end(self):
         backend = self.backend([("2021-01-01", "pending", ["ETH"], "a"),

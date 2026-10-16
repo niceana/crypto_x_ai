@@ -252,12 +252,12 @@ def summarize(store, keys, stage, already, attempts=0, blocked=()):
                         http_attempts_started=attempts, blocked_assets=tuple(sorted(blocked)))
 
 
-def is_stored_relation_valid(key, row, frame, roots=None, record_positions=None,
+def is_stored_relation_valid(key, row, frame, record_positions=None,
                              origin_start=None):
-    """检查组引用、阶段、资产及时间；可复用起点或原行位置的内存索引。
+    """检查第二轮前史的组引用、阶段、资产及时间，可复用原行位置索引。
 
-    roots 供跨月历史检查，record_positions 供当前表前史校验；未传索引的
-    既有调用保留按表查找的行为。传入 origin_start 时，允许未读到或早于下界
+    record_positions 供当前表前史校验；未传索引时按表查找。
+    传入 origin_start 时，允许未读到或早于下界
     的组起点，其引用无法核实，必须在业务输入中标记历史截断。
     """
     relation, event_id = row["event_relation"], row["event_id"]
@@ -267,11 +267,7 @@ def is_stored_relation_valid(key, row, frame, roots=None, record_positions=None,
         return False
     if origin_start is not None and (not isinstance(event_id, str) or not event_id.strip()):
         return False
-    if roots is not None:
-        if event_id not in roots:
-            return origin_start is not None
-        root_key, origin = roots[event_id]
-    elif record_positions is not None:
+    if record_positions is not None:
         position = record_positions.get(event_id)
         if position is None:
             return origin_start is not None
@@ -343,13 +339,15 @@ class EventRecordStore(TableStore):
         self.df = combined
         self.positions = {key: position for position, key in enumerate(self.df.index)}
 
-    def require_relation(self, keys, roots=None, history_lookback_years=None):
+    def require_relation(self, keys):
+        """第三轮只核对本条已完成关联，不读取或重新验证组历史。"""
         for key in keys:
             row = self.df.loc[key]
-            begin = (history_window_start(key[0], history_lookback_years)
-                     if history_lookback_years is not None else None)
-            if row["round2_status"] != "1" or not is_stored_relation_valid(
-                    key, row, self.df, roots, origin_start=begin):
+            relation, event_id = row["event_relation"], row["event_id"]
+            valid = (event_id == key[1] if relation == "new" else
+                     relation in ("update", "repeat") and isinstance(event_id, str)
+                     and bool(event_id.strip()) and event_id != key[1])
+            if row["round2_status"] != "1" or not valid:
                 raise ValueError("第二轮未完成或结果不合法：{}".format(key[1]))
 
     def recover(self, stage, keys):

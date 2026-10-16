@@ -12,7 +12,7 @@
 │  ├─ config.py                  配置加载、对象、模板检查和摘要
 │  ├─ ai_protocol.py             大模型请求体构造、响应解析及答复类型
 │  ├─ validation.py              表字段、结构检查和三轮输出校验
-│  ├─ event_context.py           原帖正文、业务输入、候选及组内时间线
+│  ├─ event_context.py           业务输入、第二轮候选及组内时间线
 │  ├─ time_rules.py              时间解析、历史补读范围和窗口判断
 │  ├─ store.py                   历史读取检查、三类 Store 及汇总
 │  ├─ network.py                 作业、限速、重试、完成消息和线程关闭
@@ -20,10 +20,11 @@
 │  └─ persistence.py             排序、按列更新和存储重试
 ├─ initialization/
 │  ├─ post_tasks.py              round1事件提取任务初始化及 InitializationSummary
+│  ├─ first_round_answers.py     历史第一轮回答解析及正文引号兼容
 │  └─ event_records.py           事件展开、自动导入和独立续建
 ├─ round1/runner.py              round1事件提取执行和成功帖回调
 ├─ round2/                       round2事件去重归组：调度、候选校验及向量检索
-├─ round3/runner.py              round3事件影响分析前提检查、历史准备和执行
+├─ round3/runner.py              round3事件影响分析前提检查、事件输入和执行
 ├─ entrypoints/                  五种独立任务入口及 runtime.py
 ├─ tests/                        common、initialization、各轮及 entrypoints
 └─ docs/                         规则、字段、研究计划及历史方案
@@ -39,15 +40,15 @@ common.config 按配置类别提供加载入口：load_job_config 读取round1�
 
 四类配置加载入口统一使用 common.config 已有的 _UniqueLoader，沿用安全 YAML 解析和字符串键要求；每个字典独立检查重复键，根层及嵌套层重复均抛 ConfigError，不静默覆盖，不新增加载封装或配置项。任务和事件配置在创建数据客户端前完成检查。
 
-common.event_context 的 build_current_record_input 供第二、三轮组织固定 event 和定位字段；第二轮不读取原帖。load_source_texts 仅供第三轮，build_impact_input 在认领后补入原帖正文及必要历史；build_relation_input 在检索后序列化当前事件及候选。round1事件提取仍直接使用原帖正文。
+common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.event 和各候选组的 candidate_id、history 字符串列表，按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。round1事件提取仍直接使用原帖正文。
 
-EventHistory 在批量加入已完成记录后，按币将候选列表按发布时间和 record_id 排序；add_frame 和 add_records 共用批量登记，后者接收筛选后的原键和必要字段，避免第三轮分段补入旧历史时逐条移动有序列表。运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 二分定位按 history_lookback_years 回推的左闭右开窗口，默认 5 个日历年。第二、三轮均启用 truncate_group_history，组输入只取各条披露自己的窗口；缺起点时 first_disclosure=null、history_trimmed=true，并提供 first_available_disclosure。第三轮固定 5 年。common.store.validate_relation_history 保持第二轮按配置期限检查前史的规则，向量临时矩阵和评分方式保留。
+EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_years 定位左闭右开窗口，默认 5 个日历年。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成事件文本。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
 
-两轮重复的基础处理提取到现有 common 模块，不新增包或依赖。time_rules.history_read_bounds(current_times, scope_start, years) 返回需要补读的首尾 date；没有输入或下界不早于处理起点时返回 None。第二轮传入原有最早待处理时刻，第三轮传入各待分析 update 时刻，保留两轮原有的时间选取口径。is_history_needed(history_time, current_times, years) 接收本轮按币或按组排好序的时刻序列，沿用二分选择第一个严格晚于历史的时点、再比较回看下界的算法。分组、状态和组起点合法性检查不移入该函数；已知闰日边界限制按用户要求保留。
+common.time_rules.history_read_bounds(current_times, scope_start, years) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, years) 使用已有窗口算法筛选历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责；既有闰日边界限制保留。
 
 第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历年边界，table_date_bounds 供第二轮解析元数据。
 
-第三轮也必须配置日期。round3.runner._prepare_impact 先只读本范围任务，检查第二轮状态和基本关系，并暂存历史必要字段；无记录或全部完成时直接返回。根据未完成 update 确定组与每条披露的 5 年窗口，复用范围内事实，再按月和六个必要列补读范围之前的历史，不读取元数据或范围之后的事件内容。只保留至少能进入一条任务窗口的同组完成事实，批量建立 EventHistory；窗口内已知起点仍检查合法性，缺失或窗口外起点按截断处理，完全没有组历史时停止。EventRecordStore.require_relation 可接收期限并复用既有 origin_start 检查，不改变未传期限调用的完整起点要求。所有任务和所需历史通过后才恢复状态，之后沿用原有正文读取、并发、批量保存和全表摘要单列核对。
+第三轮也必须配置日期。round3.runner._prepare_impact 逐月读取本范围任务，检查全部第二轮状态、本条基本关联和跨月 record_id 唯一性，不保留事件事实副本；无记录或全部完成时直接返回。整个范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮不读取原帖、历史或元数据，build_impact_input 只使用当前任务行；并发、批量保存和停止恢复沿用共用执行器。
 
 common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮按配置日期读取任务和必要历史，窗口筛选及按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
@@ -60,14 +61,16 @@ common.validation 的 POST_RESULT_COLUMNS 和 TASK_COLUMNS 定义round1帖子事
 common.validation 集中 parse_strict_json 和三轮独立校验：
 
 - validate_extraction_output 检查 events/event/tickers，供round1事件提取请求及事件导入共用；空事件和空代币数组在格式层面合法。导入另对空 tickers 查账号映射，无映射时停止本次全部导入，尚未写入事件表；缺少 tickers 字段则不通过格式校验。
-- validate_relation_output 检查三字段、关系枚举及本次候选 ID，候选快照由调用方传入。
+- validate_relation_output(content, candidate_event_ids) 检查 event_relation、matched_candidate_id、new_information 三字段、关系枚举及本次短编号，再返回带真实 matched_event_id 的内部结果。runner 将映射固定在各自 RequestJob 的回调中，同一任务重试复用输入和映射，并发不共享；Store 和数据库列保持不变，原始 AI 正文仍保留短编号。
 - validate_impact_output 保留五字段非空字符串检查，round3事件影响分析仍支持注入 validator；具体评分枚举没有新增。
+
+initialization.first_round_answers.parse_first_round_answer 仅供事件导入使用，先调用 validate_extraction_output；只有 JSON 语法错误时尝试在 event 正文引号前增加反斜杠，再调用同一个严格校验，返回对象和是否修复。模块独立承担当次导入的历史格式兼容，不增加外部依赖，第一轮新请求继续直接使用严格校验。event_records.expand_first_round 记录修复 ID，汇总本批全部帖子错误，有错误时在访问或写入目标表前停止，第一轮原始回答和状态保留。边界和例子由 [事件规则](rules/EVENT_RULES.md#历史回答中未转义引号的批量处理) 维护。
 
 OutputValidationError 由网络层计入同一任务的原请求预算。HTTP 外层响应及生成时间解析继续位于 common.ai_protocol，不与正文校验混合。common.time_rules 只解析业务时间用于校验、排序和范围选择，保存仍用原索引。
 
 ## 4. Store 与保存
 
-common.store.read_event_history(cli, task_path, start_time, end_time, *, columns=None, label="历史读取") 每次只执行一次原有日期查询。未指定 columns 时按完整事件表检查结构，指定列时检查 date/record_id 索引和所需列；随后检查返回日期是否在闭区间内，普通值和原索引原样返回。读取或校验失败直接停止，不重试读取、不回退全表。第二轮完整历史和较晚记录的两列检查、第三轮按月六列历史均使用该入口；读取的日期、分段数、列和异常发生前的状态修改顺序保持原样。
+common.store.read_event_history(cli, task_path, start_time, end_time, *, columns=None, label="历史读取") 供第二轮读取历史和较晚记录。未指定 columns 时按完整事件表检查结构，指定列时检查 date/record_id 索引和所需列，再检查返回日期；读取或校验失败直接停止，不重试读取、不回退全表。第三轮不调用此接口。
 
 三个 Store 集中在 common.store，各自职责保留。TableStore 负责工作快照、原索引定位、阶段恢复、认领、字符串更新检查、提交和统计，不解释 new/update/repeat。PostTaskStore 负责round1事件提取任务选择及答复转换；EventRecordStore 负责事件去重分析表的round2事件去重归组与round3事件影响分析保存及跨阶段约定，不拆成重复的两个 Store。
 
@@ -99,7 +102,7 @@ entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客
 
 本次公共模块归并完整保留当前 255 项测试及原断言，包含已确认的表内向量与阈值规则。迁移后 54 个源码及测试模块对照实际工作区语法树，处理代码和数据字面值一致，9 份配置文件指纹保持原样；验证结果见 [公共模块收拢记录](history/COMMON_MODULE_CONSOLIDATION.md)。此前符号变化见 [命名统一记录](history/NAMING_CONSISTENCY.md)，目录迁移背景保留在 [合并记录](history/COMMON_DIRECTORY_MERGE.md)。
 
-按列摘要 CLI 已按用户确认的调用方式接入；真实 Embedding 服务配置、提示词和经济评分枚举仍待接入，检索召回质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
+按列摘要 CLI 已按用户确认的调用方式接入，第二轮事件文本输入及第二、三轮正式提示词已配置；第三轮字段口径和取值见 configs/round3_ai_config.yaml，代码仍仅校验五字段非空字符串。真实 AI/Embedding 服务及第一轮正式提示词仍待接入，检索召回、归组及经济评分质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
 
 上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当时完整 267 项模拟测试通过；内存索引优化新增 7 项，当时完整 274 项测试通过，覆盖时间边界、按币隔离、乱序载入与加入、返回副本、完整组前史及起点合法性。事件去重分析表仍为 14 个普通列，向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
 

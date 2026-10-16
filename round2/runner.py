@@ -171,10 +171,11 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                         logger.info("round2事件去重归组自动判新：record_id=%s，decision_source=auto_new，规则及原因=%s", key[1], selection.reason)
                     else:
                         candidates = [history.build_group_history(asset, event_id, key[0]) for event_id in selection.event_ids]
-                        text = build_relation_input(current, candidates)
-                        allowed = frozenset(selection.event_ids)
+                        text, candidate_event_ids = build_relation_input(current, candidates)
                         active[key] = asset
-                        network.submit(RequestJob(key, text, lambda content, ids=allowed: validate_relation_output(content, ids)))
+                        # 每个作业独立捕获映射，所有重试复用它，避免并发请求的 E1 串组。
+                        network.submit(RequestJob(key, text, lambda content, ids=candidate_event_ids:
+                                                  validate_relation_output(content, ids)))
                     launched = True
                 advance()
                 if not active and not any(batches and asset not in blocked for asset, batches in waves.items()):

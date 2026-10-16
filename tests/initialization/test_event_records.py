@@ -18,6 +18,85 @@ from tests.event_support import EventFixture, source_posts, DataNotFound, Tables
 
 
 class EventImportTests(EventFixture, unittest.TestCase):
+    def test_table_import_repairs_quotes_without_changing_first_round_and_can_resume(self):
+        event = '机构表态：加密货币"正常化"'
+        source = source_posts([("2021-01-01", event, [], "account")])
+        source.loc[source.index[0], "ai_response_content"] = (
+            '{"events":[{"event":"机构表态：加密货币"正常化"","tickers":[]}]}')
+        backend = Tables(source)
+        before = backend.tables["first"].copy(deep=True)
+        settings = self.settings(initialize_mode="auto", user_name_to_tickers={"account": ["BTC"]})
+        with self.assertLogs("initialization.event_records", level="WARNING") as logged:
+            self.assertEqual(import_event_records_from_table(backend, settings).written, 1)
+        self.assertIn("100", "\n".join(logged.output))
+        self.assertNotIn(event, "\n".join(logged.output))
+        self.assertEqual(list(backend.tables["result"]["event"]), [event])
+        self.assertEqual(list(backend.tables["result"]["asset"]), ["BTC"])
+        pd.testing.assert_frame_equal(backend.tables["first"], before)
+        self.assertFalse(backend.updates)
+        self.relate(backend)
+        finished = backend.tables["result"].copy(deep=True)
+        with self.assertLogs("initialization.event_records", level="WARNING"):
+            self.assertEqual(import_event_records_from_table(backend, settings).written, 0)
+        pd.testing.assert_frame_equal(backend.tables["result"], finished)
+
+    def test_memory_import_uses_same_quote_repair_and_preserves_input(self):
+        source = source_posts([("2021-01-01", '事实"一"', ["ETH"], "a"),
+                               ("2021-01-02", '事实"二"', ["ETH"], "a")])
+        for position in range(2):
+            source.iloc[position, source.columns.get_loc("ai_response_content")] = (
+                source.iloc[position]["ai_response_content"].replace('\\"', '"'))
+        backend = Tables(source)
+        previous, new = source.iloc[:1].copy(deep=True), source.iloc[1:].copy(deep=True)
+        before_previous, before_new = previous.copy(deep=True), new.copy(deep=True)
+        with self.assertLogs("initialization.event_records", level="WARNING"):
+            self.assertEqual(import_event_records_from_posts(backend, self.settings(), new, previous), 2)
+        self.assertEqual(list(backend.tables["result"]["event"]), ['事实"一"', '事实"二"'])
+        pd.testing.assert_frame_equal(previous, before_previous)
+        pd.testing.assert_frame_equal(new, before_new)
+        pd.testing.assert_frame_equal(backend.tables["first"], source)
+        self.assertFalse(backend.updates)
+
+    def test_import_collects_all_bad_posts_before_creating_or_writing_table(self):
+        source = source_posts([("2021-01-01", "ready", ["ETH"], "a"),
+                               ("2021-01-02", '修复"引号"', ["ETH"], "a"),
+                               ("2021-01-03", "bad", ["ETH"], "a"),
+                               ("2021-01-04", "bad", ["ETH"], "a")])
+        source.iloc[1, source.columns.get_loc("ai_response_content")] = (
+            source.iloc[1]["ai_response_content"].replace('\\"', '"'))
+        source.iloc[2, source.columns.get_loc("ai_response_content")] = '{"events":['
+        source.iloc[3, source.columns.get_loc("ai_response_content")] = '{"events":[{"event":"缺字段"}]}'
+        for memory in (False, True):
+            with self.subTest(memory=memory):
+                backend = Tables(source)
+                before = backend.tables["first"].copy(deep=True)
+                with self.assertLogs("initialization.event_records", level="WARNING") as logged:
+                    with self.assertRaisesRegex(ValueError, "共 2 条不合法记录"):
+                        if memory:
+                            import_event_records_from_posts(backend, self.settings(), new_posts=source)
+                        else:
+                            import_event_records_from_table(backend, self.settings())
+                messages = "\n".join(logged.output)
+                self.assertIn("101 已在导入内存中修复", messages)
+                self.assertIn("102 不合法", messages)
+                self.assertIn("103 不合法", messages)
+                self.assertNotIn("缺字段", messages)
+                self.assertFalse(backend.registers or backend.writes or backend.appends or backend.updates)
+                pd.testing.assert_frame_equal(backend.tables["first"], before)
+
+    def test_quote_repair_and_errors_are_limited_to_import_date_scope(self):
+        source = source_posts([("2021-01-01", "bad", ["ETH"], "a"),
+                               ("2021-01-02", '事实"引号"', ["ETH"], "a")])
+        source.iloc[0, source.columns.get_loc("ai_response_content")] = "bad JSON outside scope"
+        source.iloc[1, source.columns.get_loc("ai_response_content")] = (
+            source.iloc[1]["ai_response_content"].replace('\\"', '"'))
+        backend = Tables(source)
+        with self.assertLogs("initialization.event_records", level="WARNING"):
+            result = import_event_records_from_table(
+                backend, self.settings(start_time="2021-01-02", end_time="2021-01-02"))
+        self.assertEqual(result.written, 1)
+        self.assertEqual(list(backend.tables["result"]["event"]), ['事实"引号"'])
+
     def test_memory_import_appends_new_posts_without_reading_source_or_existing_rows(self):
         source = source_posts([("2021-01-01", "old", ["ETH"], "a"),
                                ("2021-01-02", "new", ["ETH"], "a")])

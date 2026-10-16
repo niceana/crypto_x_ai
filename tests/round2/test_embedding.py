@@ -350,7 +350,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             seen.append(body)
             self.assertTrue(all(client.is_closed for client in clients))
             self.assertTrue(backend.tables["result"]["embedding"].ne("").all())
-            return success(json.dumps({"event_relation": "update", "matched_event_id": body["candidates"][0]["event_id"],
+            return success(json.dumps({"event_relation": "update", "matched_candidate_id": body["candidates"][0]["candidate_id"],
                                        "new_information": "开始执行"}))
         settings = self.relation_settings(backend, embedding_config_path="unused.yaml")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), patch("round2.embedding._create_client", create):
@@ -358,7 +358,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         self.assertEqual(calls, [["plan", "peer", "execute"]])
         self.assertEqual((summary.http_attempts_started, summary.new_completed), (1, 4))
         self.assertEqual(len(seen), 1)
-        self.assertEqual([item["first_disclosure"]["event"] for item in seen[0]["candidates"]], ["plan"])
+        self.assertEqual([item["history"] for item in seen[0]["candidates"]], [["plan"]])
         self.assertNotIn('"embedding"', json.dumps(seen))
         self.assertEqual(list(backend.updates[0].columns), ["embedding"])
         with patch("round2.runner.load_embedding_config", side_effect=AssertionError("完成后不加载 Embedding")):
@@ -393,16 +393,13 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         handler = self.vector_handler({"current": [1, 0], "progress": [1, 0]}, calls)
         def relation(request):
             seen.append(json.loads(request_text(request)))
-            return success(json.dumps({"event_relation": "repeat", "matched_event_id": root[1], "new_information": None}))
+            return success(json.dumps({"event_relation": "repeat", "matched_candidate_id": "E1", "new_information": None}))
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
                 patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["progress", "current"]])
         candidate = seen[0]["candidates"][0]
-        self.assertIsNone(candidate["first_disclosure"])
-        self.assertTrue(candidate["history_trimmed"])
-        self.assertEqual(candidate["first_available_disclosure"]["event"], "progress")
-        self.assertEqual([item["event"] for item in candidate["timeline"]], ["progress"])
+        self.assertEqual(candidate, {"candidate_id": "E1", "history": ["progress"]})
         self.assertEqual(summary.new_completed, 1)
         self.assertEqual(frame.loc[current, "round3_status"], "1")
         self.assertEqual(frame.loc[root, "embedding"], "")
@@ -425,7 +422,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                 lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
         self.assertEqual(calls, [["boundary", "current"]])
         self.assertEqual(result.new_completed, 1)
-        self.assertEqual(seen[0]["candidates"][0]["first_disclosure"]["event"], "boundary")
+        self.assertEqual(seen[0]["candidates"][0]["history"], ["boundary"])
         self.assertEqual(frame.iloc[0]["embedding"], "")
 
     def test_vector_write_retries_do_not_repeat_embedding_request(self):

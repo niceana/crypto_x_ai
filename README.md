@@ -62,7 +62,7 @@ python -X utf8 -m entrypoints.run_round3
 
 `main.py` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 job_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
 
-当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型和 system 提示词也为空。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词须理解五年窗口的历史截断标记。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
+当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第二、三轮 system 均已配置正式提示词。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词应按 asset、event 及可选的 new_information 分析本次事件或信息增量。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
 
 round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时round1事件提取结果保留，重新运行同范围可跳过成功帖 AI 并补导。没有成功帖时不创建事件去重分析表。
 
@@ -74,6 +74,8 @@ python -X utf8 -m entrypoints.import_events
 
 独立导入使用 `configs/event_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功；initialize_mode 支持 auto/create/resume，只控制该独立入口。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
 
+已有第一轮回答的 event 正文包含未转义英文双引号时，导入会批量尝试在内存中补转义，再严格校验；第一轮原始回答和状态保留，不调用 AI，也无需新参数或依赖。日志逐条记录修复与失败的帖子 ID，并汇总数量。内容截断、字段缺失或边界不明确的记录集中报错，本批在建表或写入前停止。具体支持范围和例子见 [历史回答引号修复](docs/rules/EVENT_RULES.md#历史回答中未转义引号的批量处理)。
+
 `configs/event_config.yaml` 已包含用户提供的 50 组账号代币映射，保留原名单大小写及迁移备注。原名单 `screen_name` 对应原帖 `user_name`，`ticker` 转为代币列表。空 tickers 使用账号映射，例如：
 
 ```yaml
@@ -84,7 +86,7 @@ user_name_to_tickers:
 
 `tickers: []` 在第一轮属于合法输出，导入时才按原帖 `user_name` 精确查映射；没有映射会报错并停止本次整批导入，其他成功帖的事件本次也不会新增。第一轮已保存结果及成功状态保留，不为无代币事件创建失败行；补齐映射后重跑同一范围的 main.py 可补导。若整个 tickers 字段缺少、为 null 或类型不合法，则第一轮输出校验失败并按请求预算重试。`events: []` 表示没有事件，不查映射。具体例子见 [事件展开规则](docs/rules/EVENT_RULES.md#2-检查round1事件提取并展开记录)。
 
-round2事件去重归组默认使用 `embedding_config_path: "embedding_config.yaml"` 指向的 bge-m3 纯向量检索。填写该文件的 base_url，例如 `https://服务地址/v1`，程序追加 `/embeddings`；把密钥填入 `configs/.env` 的 EMBEDDING_API_KEY 或进程环境。默认每批 8 条，只编码 event；生成后保存到事件去重分析表的 embedding 列，JSON 包含 model、model_version、config_hash 和 vector，重启复用。config_hash 只标识服务、模型、版本和编码规则，不含 event；同名模型更换权重时要修改 model_version，人工修改 event 时须清空该行向量并确定下游重算范围。第二轮只使用 event 和候选历史，不再读取原帖；第三轮保留正文输入。初始化已包含该列，不使用 SQLite。
+round2事件去重归组默认使用 `embedding_config_path: "embedding_config.yaml"` 指向的 bge-m3 纯向量检索。填写该文件的 base_url，例如 `https://服务地址/v1`，程序追加 `/embeddings`；把密钥填入 `configs/.env` 的 EMBEDDING_API_KEY 或进程环境。默认每批 8 条，只编码 event；生成后保存到事件去重分析表的 embedding 列，JSON 包含 model、model_version、config_hash 和 vector，重启复用。config_hash 只标识服务、模型、版本和编码规则，不含 event；同名模型更换权重时要修改 model_version，人工修改 event 时须清空该行向量并确定下游重算范围。第二轮只使用 event 和候选历史，不再读取原帖；第三轮仅使用本条记录的 asset、event、new_information，也不读取原帖。初始化已包含该列，不使用 SQLite。
 
 用户确认模型已输出归一化向量；程序保留返回数值，直接用内积计算余弦相似度，不再归一化或转成 float32。仍校验格式、维度、有限数值、非零向量及单位范数，范数允许绝对误差 1e-5；新响应不满足约定时使用该批剩余请求预算重试，耗尽后停止。
 
@@ -96,9 +98,9 @@ end_time: "2025-12-31"
 history_lookback_years: 5
 ```
 
-每条披露按自身发布时间 t 检索 `[t-5年, t)`，包含下界、排除同刻与未来。普通历史不读取 5 年下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID，提供窗口内进展，first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。无法据此核实窗口外起点是否实际存在，第二、三轮提示词都须理解这些截断标记。
+每条披露按自身发布时间 t 检索 `[t-5年, t)`，包含下界、排除同刻与未来。普通历史不读取 5 年下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID 和窗口内进展；内部 first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。第二轮 AI 只接收 `{"current":{"event":...},"candidates":[{"candidate_id":"E1","history":[...]}]}`，不发送真实 event_id、额外日期、资产、披露标识、增量、次数或截断标记；窗口内起点或最早可用披露与全部 update 的完整 event 按顺序保留。AI 返回 matched_candidate_id，程序校验并映射回真实 event_id 后保存；每个请求独立使用 E1、E2 等编号，重试沿用原输入和映射，数据库结构不变。第三轮不接收组历史，仅使用本条记录的事件输入。输入例子及边界见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
 
-第三轮先按配置范围读任务，无任务或全部完成时直接返回。只为未完成的 update 准备同币、同组、过去 5 个日历年内的第二轮已完成历史，new 不补历史。范围内事实复用，范围外按月仅读 asset、event_id、event_relation、event、new_information、round2_status 六列；不读表元数据或遍历全表事件内容。第三轮固定 5 年，不受第二轮 history_lookback_years 调整影响；窗口内有事实但缺起点时标记截断，完全无该组历史时停止，不自动判新。仍保留全表第三轮配置摘要单列核对，已完成分析不自动重算。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+第三轮先按配置范围读任务，无任务或全部完成时直接返回。检查整个范围的第二轮状态和本条基本关联后，恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new 分析整个 event，update 以第二轮提炼的新增事实为重点，repeat 跳过。第三轮不读组历史、原帖或元数据，不再要求历史窗口内有披露或回查组起点。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
 
 按事件组最高余弦分数筛选，只将分数大于等于 similarity_threshold 的最多 10 组交round2事件去重归组；无历史或所有组都低于阈值时直接 new，继续round3事件影响分析。默认阈值 0.50 是待真实样本标定的试运行起点，可在 Embedding 配置调整：
 
@@ -108,7 +110,9 @@ similarity_threshold: 0.50
 
 调高阈值会增加直接判新，调低会增加round2事件去重归组调用；更改只影响待处理记录，不自动重算已完成关联。Embedding 或向量保存失败停止本轮；存储重试不重复请求向量。自定义检索可用 retriever 的 `模块:函数` 覆盖，应用也可直接注入函数。完整格式与失败规则见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
-round2事件去重归组与round3事件影响分析正式提示词和真实接口仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。
+第二轮正式提示词位于 `configs/round2_ai_config.yaml`，关系选择和新增信息填写融入“判断同一具体事项”“识别新增事实”两个步骤，保留 `# ***标题***` 和四种关系的固定 JSON 输出示例，user 为 `{{task.text}}`；第三轮正式提示词已写入 `configs/round3_ai_config.yaml`，按本次事件或增量分析五个经济字段；两轮真实接口、模型仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。调整任一轮提示词会改变该轮 config_hash；已有不同摘要仍按原规则停止，不自动覆盖或重算历史结果。
+
+update 的 new_information 须独立说明此前已知状态、本次变化及当前状态和条件，不能只写“获批”“金额提高”。旧状态引用唯一匹配组历史，新事实引用当前 event；未知部分说明未披露，不补造，累计总值与本次新增量分清。第三轮不读取历史，依赖这段对照判断本次变化的影响。完整要求及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)；程序的非空字符串校验不能代替真实样本的语义质量验证。
 
 ## 代码目录与应用内调用
 

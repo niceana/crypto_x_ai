@@ -205,7 +205,7 @@ class StoreTests(Fixture, unittest.TestCase):
                                               before.drop(columns=stage + "_status"))
                 pd.testing.assert_frame_equal(store.df, frame)
 
-    def test_source_text_none_is_used_without_read_content_validation(self):
+    def test_event_stages_do_not_read_source_text(self):
         for stage in ("round2", "round3"):
             with self.subTest(stage=stage):
                 backend, settings = self.backend()
@@ -215,6 +215,7 @@ class StoreTests(Fixture, unittest.TestCase):
                     run_relation(backend, relation_settings, ai_config=config, retriever=choose,
                                  network_factory=self.network(lambda request: success(json.dumps(new_result()))))
                 backend.tables["first"]["text"] = None
+                backend.reads.clear()
                 seen = []
                 def handler(request):
                     seen.append(json.loads(request_text(request)))
@@ -225,9 +226,11 @@ class StoreTests(Fixture, unittest.TestCase):
                                     network_factory=self.network(handler), **kwargs)
                 self.assertEqual(summary.new_completed, 1)
                 if stage == "round3":
-                    self.assertIsNone(seen[0]["current"]["source_text"])
+                    self.assertEqual(set(seen[0]), {"asset", "event"})
+                    self.assertNotIn("new_information", seen[0])
                 else:
                     self.assertNotIn("source_text", seen[0]["current"])
+                self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
 
     def test_event_snapshot_and_recovery_preserve_unusable_cells_without_quality_scan(self):
         backend, settings = self.backend()
