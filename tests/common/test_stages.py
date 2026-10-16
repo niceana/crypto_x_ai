@@ -33,7 +33,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 if source_mode == "text_only":
                     backend.tables["first"] = source[["text"]].copy(deep=True)
                 baseline = backend.tables["first"].copy(deep=True)
-                settings = self.settings(user_name_to_tickers={"a": ["BTC"]})
+                settings = self.relation_settings(backend, user_name_to_tickers={"a": ["BTC"]})
                 seen = []
                 def relation(request):
                     seen.append(json.loads(request_text(request))["current"])
@@ -58,13 +58,14 @@ class EventStageTests(EventFixture, unittest.TestCase):
     def test_completed_stages_do_not_require_source_table_or_ai_configuration(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         self.relate(backend)
-        run_impact(backend, self.settings(), ai_config=self.config(),
+        run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                    network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
         del backend.tables["first"]
         backend.reads.clear()
         count = len(backend.updates)
         for operation in (run_relation, run_impact):
-            summary = operation(backend, self.settings(), network_factory=lambda config: self.fail("不应发请求"))
+            settings = self.relation_settings(backend)
+            summary = operation(backend, settings, network_factory=lambda config: self.fail("不应发请求"))
             self.assertEqual((summary.already_completed, summary.http_attempts_started), (1, 0))
         self.assertFalse(any(path == "first" for path, _, _ in backend.reads))
         self.assertEqual(len(backend.updates), count)
@@ -85,7 +86,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 before = backend.tables["result"].copy(deep=True)
                 count = len(backend.updates)
                 with self.assertRaisesRegex(ValueError, "原帖"):
-                    run_impact(backend, self.settings(), ai_config=self.config(),
+                    run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                                network_factory=lambda config: self.fail("不应发请求"))
                 self.assertEqual(len(backend.updates), count)
                 pd.testing.assert_frame_equal(backend.tables["result"], before)
@@ -98,7 +99,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 result = expand_first_round(source, {})
                 backend = Tables(source, result)
                 self.assertEqual(self.relate(backend).new_completed, 1)
-                summary = run_impact(backend, self.settings(), ai_config=self.config(),
+                summary = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                                      network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
                 self.assertEqual(summary.new_completed, 1)
                 self.assertTrue(backend.tables["result"].index.equals(result.index))
@@ -131,7 +132,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                     raise RuntimeError("batch not written")
             backend.apply(path, frame)
         backend.update_hook = hook
-        result = run_impact(backend, self.settings(), ai_config=self.config(), network_factory=self.factory(
+        result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(
             lambda req: count.append(request_text(req)) or success(json.dumps(impact_result()))))
         self.assertEqual(len(count), 2)
         self.assertEqual(writes, [2, 2])
@@ -151,7 +152,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                     if stage == "round2":
                         result = self.relate(backend)
                     else:
-                        result = run_impact(backend, self.settings(), ai_config=self.config(),
+                        result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                                             network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
                 self.assertEqual(result.new_completed, 3)
                 self.assertEqual(check.call_count, 1)
@@ -167,7 +168,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
             backend.apply(path, frame)
         backend.update_hook = hook
         with self.assertRaises(BatchPersistenceError) as caught:
-            run_impact(backend, self.settings(), ai_config=self.config(), network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
+            run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
         self.assertEqual(json.loads(caught.exception.unsaved_results[0][1].ai_response_content), impact_result())
         self.assertEqual(backend.tables["result"].iloc[0]["round3_status"], "9")
 
@@ -182,7 +183,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
         self.document["prompts"]["system"] = "third phase only"
         third_config = self.config()
         self.assertNotEqual(ai_config_hash(third_config), expected_second)
-        run_impact(backend, self.settings(), ai_config=third_config,
+        run_impact(backend, self.relation_settings(backend), ai_config=third_config,
                    network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
         third_position = next(index for index, frame in enumerate(backend.updates) if "round3_config_hash" in frame.columns)
         third_claim = backend.updates[third_position]
@@ -203,8 +204,8 @@ class EventStageTests(EventFixture, unittest.TestCase):
         frame.loc[key, "round3_ai_response"] = None
         before = frame.copy(deep=True)
         self.hash_reads.clear()
-        self.assertEqual(run_relation(backend, self.settings()).already_completed, 1)
-        self.assertEqual(run_impact(backend, self.settings()).already_completed, 1)
+        self.assertEqual(run_relation(backend, self.relation_settings(backend)).already_completed, 1)
+        self.assertEqual(run_impact(backend, self.relation_settings(backend)).already_completed, 1)
         self.assertFalse(self.hash_reads)
         pd.testing.assert_frame_equal(backend.tables["result"], before)
 

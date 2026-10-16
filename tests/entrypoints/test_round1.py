@@ -22,7 +22,7 @@ from tests.support import (
     success as raw_success,
 )
 from round1.runner import ExtractionSummary
-from common.config import ai_config_hash
+from common.config import ConfigError, ai_config_hash
 from common.persistence import BatchPersistenceError
 from initialization.event_records import import_event_records_from_posts
 from tests.event_support import Tables
@@ -98,6 +98,22 @@ class EntryPointTests(Fixture, unittest.TestCase):
 
     def write_job(self, settings):
         self.job_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    def test_duplicate_job_or_event_keys_stop_before_client_creation(self):
+        for path, suffix in (
+            (self.job_path, "\ntask_path: wrong-table\n"),
+            (self.event_path, "\nuser_name_to_tickers:\n  account: [BTC]\n  account: [ETH]\n"),
+        ):
+            with self.subTest(config=path.name):
+                original = path.read_text(encoding="utf-8")
+                path.write_text(original + suffix, encoding="utf-8")
+                try:
+                    with self.assertRaisesRegex(ConfigError, "重复键"):
+                        self.module.main()
+                    self.get_client.assert_not_called()
+                    self.import_events.assert_not_called()
+                finally:
+                    path.write_text(original, encoding="utf-8")
 
     def test_import_does_not_create_client(self):
         self.get_client.assert_not_called()

@@ -25,6 +25,143 @@ from tests.event_support import EventFixture, source_posts, choose, new_result, 
 
 
 class RelationRunnerTests(EventFixture, unittest.TestCase):
+    def test_processing_dates_are_required_before_any_database_access(self):
+        backend = self.backend([("2021-01-01", "current", ["ETH"], "a")])
+        for values in ({}, {"start_time": "2021-01-01"}, {"end_time": "2021-01-01"},
+                       {"start_time": "2021-01-02", "end_time": "2021-01-01"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                run_relation(backend, self.settings(**values))
+        self.assertFalse(backend.reads or backend.column_reads or backend.meta_reads or backend.updates)
+
+    def test_scoped_reads_limit_history_and_leave_outside_task_states_unchanged(self):
+        backend = self.backend([
+            ("2010-01-01", "very-old-gap", ["ETH"], "a"),
+            ("2020-10-01 11:59:59.999999999", "outside", ["ETH"], "a"),
+            ("2020-10-01 12:00:00", "boundary", ["ETH"], "a"),
+            ("2023-01-01", "history", ["ETH"], "a"),
+            ("2025-10-01 12:00:00", "current", ["ETH"], "a"),
+            ("2026-01-01", "other-completed", ["BTC"], "a"),
+            ("2026-01-01", "later-pending", ["ETH"], "a"),
+        ])
+        frame = backend.tables["result"]
+        frame.loc[:, "round2_status"] = "1"
+        frame.loc[:, "event_relation"] = "new"
+        frame.loc[:, "event_id"] = frame.index.get_level_values("record_id")
+        keys = {row["event"]: key for key, row in frame.iterrows()}
+        frame.loc[[keys[name] for name in ("very-old-gap", "outside", "current", "later-pending")], "round2_status"] = "0"
+        before = frame.drop(index=keys["current"]).copy(deep=True)
+        seen = []
+        settings = self.settings(start_time="2025-10-01", end_time="2025-10-01")
+        summary = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
+                               network_factory=self.factory(lambda req: seen.append(json.loads(request_text(req)))
+                                                            or success(json.dumps(new_result()))))
+        self.assertEqual((summary.total, summary.new_completed), (1, 1))
+        self.assertEqual(backend.reads, [("result", "2025-10-01", "2025-10-01"),
+                                       ("result", "2020-10-01", "2025-09-30")])
+        self.assertIn(("result", "2025-10-02", "2026-01-01", ["asset", "round2_status"]), backend.column_reads)
+        self.assertEqual([group["first_disclosure"]["event"] for group in seen[0]["candidates"]],
+                         ["boundary", "history"])
+        self.assertTrue(all(list(batch.index) == [keys["current"]] for batch in backend.updates))
+        pd.testing.assert_frame_equal(backend.tables["result"].drop(index=keys["current"]), before)
+
+    def test_completed_scope_only_reads_requested_task_range(self):
+        backend = self.backend([("2021-01-01", "done", ["ETH"], "a")])
+        backend.tables["result"]["round2_status"] = "1"
+        summary = run_relation(backend, self.relation_settings(backend))
+        self.assertEqual(summary.already_completed, 1)
+        self.assertEqual(backend.reads, [("result", "2021-01-01", "2021-01-01")])
+        self.assertFalse(backend.meta_reads or backend.column_reads or backend.updates)
+
+    def test_later_completed_same_asset_is_checked_using_only_status_columns(self):
+        backend = self.backend([("2021-01-01", "current", ["ETH"], "a"),
+                                ("2026-01-01", "later", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        frame.at[frame.index[-1], "round2_status"] = "1"
+        settings = self.settings(start_time="2021-01-01", end_time="2021-01-01")
+        with self.assertRaisesRegex(ValueError, "疑似历史补录"):
+            run_relation(backend, settings, network_factory=lambda config: self.fail("不应发请求"))
+        self.assertEqual(backend.column_reads, [("result", "2021-01-02", "2026-01-01", ["asset", "round2_status"])])
+        self.assertTrue(all(end <= "2021-01-01" for _, _, end in backend.reads))
+        self.assertFalse(backend.updates)
+
+    def test_history_read_failure_stops_without_full_table_fallback_or_claim(self):
+        backend = self.backend([("2021-01-01", "current", ["ETH"], "a")])
+        def fail_history(path, start, end):
+            if start == "2016-01-01":
+                raise RuntimeError("history read failed")
+        backend.read_hook = fail_history
+        with self.assertRaisesRegex(RuntimeError, "history read failed"):
+            run_relation(backend, self.relation_settings(backend))
+        self.assertEqual(len(backend.reads), 2)
+        self.assertTrue(all(start and end for _, start, end in backend.reads))
+        self.assertFalse(backend.updates or backend.column_reads)
+
+    def test_invalid_meta_or_later_projection_stops_before_claim(self):
+        for problem in ("meta", "missing-status", "wrong-range"):
+            with self.subTest(problem=problem):
+                backend = self.backend([("2021-01-01", "current", ["ETH"], "a"),
+                                        ("2022-01-01", "later-pending", ["ETH"], "a")])
+                if problem == "meta":
+                    backend.metadata["result"] = {"meta": {"start_time": "2021-01-01", "end_time": None}}
+                read = backend.read
+                def faulty_read(path, start_time=None, end_time=None, columns=None):
+                    result = read(path, start_time, end_time, columns)
+                    if columns == ["asset", "round2_status"]:
+                        if problem == "missing-status":
+                            result = result.drop(columns="round2_status")
+                        elif problem == "wrong-range":
+                            result.index = pd.MultiIndex.from_tuples([(pd.Timestamp("2021-01-01"), result.index[0][1])],
+                                                                    names=result.index.names)
+                    return result
+                settings = self.settings(start_time="2021-01-01", end_time="2021-01-01")
+                with patch.object(backend, "read", side_effect=faulty_read), self.assertRaises(ValueError):
+                    run_relation(backend, settings, network_factory=lambda config: self.fail("不应发请求"))
+                self.assertFalse(backend.updates)
+                self.assertTrue(all(start and end for _, start, end in backend.reads))
+
+    def test_repeat_only_truncated_group_preserves_comparable_fact_and_group_id(self):
+        backend = self.backend([("2010-01-01", "unread-origin", ["ETH"], "a"),
+                                ("2024-01-01", "recent-repeat-fact", ["ETH"], "a"),
+                                ("2025-01-01", "current", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        root, repeat, current = frame.index
+        frame.loc[repeat, ["event_id", "event_relation", "round2_status", "round3_status"]] = [root[1], "repeat", "1", "1"]
+        seen = []
+        def relation(request):
+            seen.append(json.loads(request_text(request)))
+            return success(json.dumps({"event_relation": "repeat", "matched_event_id": root[1], "new_information": None}))
+        settings = self.settings(start_time="2025-01-01", end_time="2025-01-01")
+        result = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
+                              network_factory=self.factory(relation))
+        group = seen[0]["candidates"][0]
+        self.assertEqual(group["event_id"], root[1])
+        self.assertIsNone(group["first_disclosure"])
+        self.assertTrue(group["history_trimmed"])
+        self.assertEqual(group["first_available_disclosure"]["event"], "recent-repeat-fact")
+        self.assertEqual(group["first_available_disclosure"]["event_relation"], "repeat")
+        self.assertEqual((group["timeline"], group["repeat_count"], group["disclosure_count"]), ([], 1, 1))
+        self.assertEqual(result.new_completed, 1)
+        self.assertEqual(frame.at[current, "event_id"], root[1])
+        self.assertEqual(frame.at[current, "round3_status"], "1")
+        self.assertEqual(frame.at[root, "round2_status"], "0")
+
+    def test_multiyear_run_uses_each_disclosure_time_for_history_window(self):
+        backend = self.backend([("2018-01-01", "history", ["ETH"], "a"),
+                                ("2020-01-01", "early", ["ETH"], "a"),
+                                ("2026-01-01", "late", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        root = frame.index[0]
+        frame.loc[root, ["event_id", "event_relation", "round2_status"]] = [root[1], "new", "1"]
+        seen = []
+        def retrieve(current, records):
+            seen.append((current["event"], [row["event"] for row in records]))
+            return choose(current, records) if records else RetrievalSelection((), True, "test-empty-window")
+        settings = self.settings(start_time="2020-01-01", end_time="2026-01-01")
+        result = run_relation(backend, settings, ai_config=self.config(), retriever=retrieve,
+                              network_factory=self.factory(lambda req: success(json.dumps(new_result()))))
+        self.assertEqual(seen, [("early", ["history"]), ("late", [])])
+        self.assertEqual((result.new_completed, result.http_attempts_started), (2, 1))
+
     def test_scoped_relation_never_reads_source_and_preserves_history(self):
         backend = self.backend([("2021-01-01", "origin", ["ETH"], "a"),
                                 ("2021-01-02", "update", ["ETH"], "a")])
@@ -44,14 +181,15 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                network_factory=self.factory(handler))
         self.assertEqual(summary.new_completed, 1)
         self.assertEqual(seen[0]["candidates"][0]["first_disclosure"]["event"], "origin")
-        self.assertEqual(backend.reads, [("result", None, None)])
+        self.assertEqual(backend.reads, [("result", "2021-01-02", "2021-01-02"),
+                                       ("result", "2016-01-02", "2021-01-01")])
         self.assertEqual(seen[0]["current"]["event"], "update")
         self.assertNotIn("source_text", seen[0]["current"])
 
     def test_unconfigured_retrieval_and_prompts_do_not_claim(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         with self.assertRaises(RetrievalNotConfigured):
-            run_relation(backend, self.settings())
+            run_relation(backend, self.relation_settings(backend))
         self.assertFalse(backend.updates)
         self.document["prompts"]["system"] = ""
         with self.assertRaisesRegex(ValueError, "提示词尚未配置"):
@@ -85,7 +223,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(backend.tables["result"].iloc[-1]["round3_status"], "1")
         self.assertTrue(all(value == threading.get_ident() for value in backend.threads))
         previous = len(seen)
-        again = run_relation(backend, self.settings())
+        again = run_relation(backend, self.relation_settings(backend))
         self.assertEqual(again.already_completed, 4)
         self.assertEqual(len(seen), previous)
 
@@ -232,7 +370,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                     backend.apply(path, frame)
                 backend.update_hook = update
                 with self.assertRaises(BatchPersistenceError) as caught:
-                    run_relation(backend, self.settings(), ai_config=self.config(), retriever=choose,
+                    run_relation(backend, self.relation_settings(backend), ai_config=self.config(), retriever=choose,
                                  network_factory=lambda config: network)
                 self.assertIs(caught.exception.__cause__, error)
                 self.assertEqual(caught.exception.stage, "round2")
@@ -245,9 +383,16 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(current[0].response.ai_response_content, json.dumps(new_result()))
                 self.assertEqual(caught.exception.completed_results.qsize()
                                  + len(caught.exception.unpublished_results), 1)
-                self.assertEqual(len(backend.reads), 1)
+                self.assertEqual(len(backend.reads), 2)
+                expected_response = json.loads(final_calls[0].iloc[0]["round2_ai_response"])
+                expected_response.pop("created")
                 for frame in final_calls[1:]:
-                    pd.testing.assert_frame_equal(frame, final_calls[0])
+                    # 存储重试允许刷新 created，其他回答内容和提交列必须不变。
+                    response = json.loads(frame.iloc[0]["round2_ai_response"])
+                    response.pop("created")
+                    self.assertEqual(response, expected_response)
+                    pd.testing.assert_frame_equal(frame.drop(columns="round2_ai_response"),
+                                                  final_calls[0].drop(columns="round2_ai_response"))
 
     def test_relation_stop_finishes_answers_and_preserves_failure_during_unpublished_save(self):
         for fail_save in (False, True):
@@ -278,7 +423,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                     backend.apply(path, frame)
                 backend.update_hook = update
                 with self.assertRaises(BatchPersistenceError if fail_save else BatchRunError) as caught:
-                    run_relation(backend, self.settings(), ai_config=self.config(), retriever=choose,
+                    run_relation(backend, self.relation_settings(backend), ai_config=self.config(), retriever=choose,
                                  network_factory=lambda config: network)
                 self.assertEqual(len(final_calls), 4 if fail_save else 2)
                 self.assertEqual(list(backend.tables["result"]["round2_status"]), ["1", "9" if fail_save else "1"])
@@ -327,13 +472,13 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         backend.tables["result"].loc[update, ["event_id", "event_relation", "new_information", "round2_status"]] = [root[1], "update", "批准", "1"]
         backend.tables["result"].loc[:, "round2_config_hash"] = ai_config_hash(self.config())
         backend.tables["result"] = backend.tables["result"].iloc[::-1].copy(deep=True)
-        result = run_relation(backend, self.settings())
+        result = run_relation(backend, self.relation_settings(backend))
         self.assertEqual(result.already_completed, 2)
         self.assertEqual(result.http_attempts_started, 0)
         self.assertFalse(backend.updates)
 
-    def test_window_retrieval_uses_recent_update_and_retains_older_origin(self):
-        backend = self.backend([("2020-01-01", "origin", ["ETH"], "a"),
+    def test_window_retrieval_keeps_recent_update_and_marks_missing_origin(self):
+        backend = self.backend([("2010-01-01", "origin", ["ETH"], "a"),
                                 ("2021-01-01", "progress", ["ETH"], "a"),
                                 ("2021-01-02", "current", ["ETH"], "a")])
         frame = backend.tables["result"]
@@ -346,9 +491,12 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         result = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
                               network_factory=self.factory(lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(new_result()))))
         candidate = seen[0]["candidates"][0]
-        self.assertEqual(candidate["first_disclosure"]["record_id"], root[1])
+        self.assertIsNone(candidate["first_disclosure"])
+        self.assertEqual(candidate["event_id"], root[1])
+        self.assertEqual(candidate["first_available_disclosure"]["record_id"], update[1])
+        self.assertTrue(candidate["history_trimmed"])
         self.assertEqual(candidate["timeline"][0]["new_information"], "执行")
-        self.assertEqual(candidate["disclosure_count"], 2)
+        self.assertEqual(candidate["disclosure_count"], 1)
         self.assertEqual(result.new_completed, 1)
 
     def test_repeat_history_is_not_validated_or_repaired_on_recovery(self):
@@ -407,7 +555,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 if stage == "round2":
                     result = self.relate(backend)
                 else:
-                    result = run_impact(backend, self.settings(), ai_config=self.config(),
+                    result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                                         network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
                 self.assertEqual(len(claims), 2)
                 self.assertTrue(all(set(frame.columns) == {stage + "_status", stage + "_config_hash"} for frame in claims))

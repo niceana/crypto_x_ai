@@ -4,12 +4,23 @@ import os
 import unittest
 from unittest.mock import patch
 
-from common.config import ConfigError, ai_config_hash
+from common.config import ConfigError, ai_config_hash, load_job_config
 from common.ai_protocol import TaskRenderError, render_payload, parse_response, request_failure
 from tests.support import Fixture, success
 
 
 class ConfigTests(Fixture, unittest.TestCase):
+    def test_job_config_rejects_duplicate_root_and_nested_keys(self):
+        base = "source_path: source\ntask_path: tasks\nai_config_path: ai.yaml\n"
+        cases = ("task_path: other-tasks\n", "task_path: tasks\n",
+                 "logging:\n  level: INFO\n  level: DEBUG\n",
+                 "logging:\n  level: INFO\n  level: INFO\n")
+        for suffix in cases:
+            with self.subTest(suffix=suffix):
+                self.path.write_text(base + suffix, encoding="utf-8")
+                with self.assertRaisesRegex(ConfigError, "重复键"):
+                    load_job_config(self.path, ("source_path", "task_path", "ai_config_path"))
+
     def test_render_is_text_only_and_single_pass(self):
         config = self.config()
         original = copy.deepcopy(config.api.payload)

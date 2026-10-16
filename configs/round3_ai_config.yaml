@@ -1,5 +1,7 @@
 # round3事件影响分析：提示词、AI 接口、请求及运行参数。
 # 经济评分规则和提示词尚未定稿，system 留空会阻止调用。
+# update 只提供披露前 5 个日历年的组历史；提示词须理解 history_trimmed、
+# first_disclosure=null 和 first_available_disclosure，不能把窗口内最早披露当作原始起点。
 prompts:
   system: ""
   user: "{{task.text}}"

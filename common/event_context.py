@@ -1,22 +1,24 @@
 """维护事件历史索引，读取任务所需原帖正文，组织round2事件去重归组与round3事件影响分析业务输入。"""
 
 import json
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import date
 
-import pandas as pd
-
 from common.validation import validate_event_source_index
-from common.time_rules import published_time
+from common.time_rules import history_window_start, published_time
 
 
 class EventHistory:
     """保留round2事件去重归组完成记录的内存索引，每次查询再应用当前发布时间边界。
 
-    records 用于窗口召回，groups 用于回查组的完整前史；加入索引前要求保存
-    已确认，所有返回记录都是副本，评分函数不能修改内部历史。
+    records 按币保存有序的 (时间, record_id, 记录)，用于二分定位候选窗口；
+    groups 保存已载入的组事实，启用 truncate_group_history 时只输出窗口内事实
+    并标记截断。加入索引前要求保存已确认，返回记录均为副本，评分函数不能改内部历史。
     """
-    def __init__(self, frame=None):
+    def __init__(self, frame=None, history_lookback_years=5, truncate_group_history=False):
+        self.history_lookback_years = history_lookback_years
+        self.truncate_group_history = truncate_group_history
         self.records = defaultdict(list)
         self.groups = defaultdict(list)
         self.known = set()
@@ -24,15 +26,41 @@ class EventHistory:
             self.add_frame(frame)
 
     def add_frame(self, frame):
-        """逐段加入已完成关联的必要字段，不保留 DataFrame 或行视图。"""
-        for key, row in frame.iterrows():
+        """批量登记必要字段，再按币排序，避免乱序载入时逐条移动有序列表。"""
+        self.add_records(frame.iterrows())
+
+    def add_records(self, records):
+        """批量接收原键与必要字段，供分段读取后筛选的组历史一次建立有序索引。"""
+        assets = set()
+        for key, row in records:
             if row["round2_status"] == "1":
-                self.add(key, row)
+                entry = self._register_record(key, row)
+                if entry is not None:
+                    asset = row["asset"]
+                    self.records[asset].append(entry)
+                    assets.add(asset)
+        for asset in assets:
+            self.records[asset].sort(key=lambda entry: entry[:2])
 
     def add(self, key, row):
-        """只在持久保存确认后加入；重复加入同一行不改变历史。"""
-        if key[1] in self.known:
+        """保存确认后加入有序列表；通常尾部追加，同刻乱序完成时二分插入。"""
+        entry = self._register_record(key, row)
+        if entry is None:
             return
+        records = self.records[row["asset"]]
+        if not records or records[-1][:2] < entry[:2]:
+            records.append(entry)
+        else:
+            records.insert(bisect_left(records, entry[:2]), entry)
+
+    def _register_record(self, key, row):
+        """登记已完成事实及组历史，返回候选索引条目；重复记录返回 None。
+
+        批量载入与运行中加入共用此步骤，记录字典由两种索引共同引用，
+        不保留 DataFrame 行视图；候选列表各自采用批量排序或有序插入。
+        """
+        if key[1] in self.known:
+            return None
         if row["round2_status"] != "1":
             raise ValueError("未完成关联的记录不能进入历史")
         record = {"record_id": key[1], "date": str(key[0]), "event": row["event"],
@@ -40,32 +68,41 @@ class EventHistory:
                   "event_relation": row["event_relation"],
                   "new_information": row["new_information"] or None}
         stamp = published_time(key[0])
-        self.records[row["asset"]].append((stamp, record))
         self.groups[(row["asset"], row["event_id"])].append((stamp, record))
         self.known.add(key[1])
+        return stamp, key[1], record
 
     def get_searchable_records(self, asset, current_time):
-        """返回同资产前 180 天的记录副本，保留中途更新的事实。"""
+        """按配置日历年数二分定位同币历史窗口，只复制左闭右开区间内的事实。"""
         stamp = published_time(current_time)
-        begin = stamp - pd.Timedelta(days=180)
-        values = [(time, record) for time, record in self.records[asset] if begin <= time < stamp]
-        values.sort(key=lambda item: (item[0], item[1]["record_id"]))
-        return tuple(dict(record) for _, record in values)
+        begin = history_window_start(stamp, self.history_lookback_years)
+        records = self.records[asset]
+        # 仅用时间前缀查边界：包括下界全部同刻记录，排除上界全部同刻记录。
+        left = bisect_left(records, (begin,))
+        right = bisect_left(records, (stamp,))
+        return tuple(dict(records[position][2]) for position in range(left, right))
 
     def build_group_history(self, asset, event_id, current_time):
-        """回查窗口外起点；候选只包含当前时点前已披露的组内事实。"""
+        """按当前披露时刻组织组事实；启用截断时缺起点仍保留窗口内历史。"""
         stamp = published_time(current_time)
-        values = sorted(((time, record) for time, record in self.groups[(asset, event_id)] if time < stamp),
+        begin = history_window_start(stamp, self.history_lookback_years) if self.truncate_group_history else None
+        values = sorted(((time, record) for time, record in self.groups[(asset, event_id)]
+                         if time < stamp and (begin is None or time >= begin)),
                         key=lambda item: (item[0], item[1]["record_id"]))
         if not values:
             raise ValueError("事件组不存在或不在当前时点以前：{}".format(event_id))
         starts = [record for _, record in values if record["event_relation"] == "new"]
-        if len(starts) != 1:
+        if len(starts) > 1 or (not starts and not self.truncate_group_history):
             raise ValueError("事件组必须有唯一建档起点：{}".format(event_id))
-        return {"event_id": event_id, "asset": asset, "first_disclosure": dict(starts[0]),
-                "timeline": [dict(record) for _, record in values if record["event_relation"] == "update"],
-                "repeat_count": sum(record["event_relation"] == "repeat" for _, record in values),
-                "disclosure_count": len(values), "history_trimmed": False}
+        result = {"event_id": event_id, "asset": asset,
+                  "first_disclosure": dict(starts[0]) if starts else None,
+                  "timeline": [dict(record) for _, record in values if record["event_relation"] == "update"],
+                  "repeat_count": sum(record["event_relation"] == "repeat" for _, record in values),
+                  "disclosure_count": len(values), "history_trimmed": not starts}
+        if not starts:
+            # 仅剩 repeat 时也提供可比较事实，且不把它伪装成原始建档起点。
+            result["first_available_disclosure"] = dict(values[0][1])
+        return result
 
 
 def build_current_record_input(key, row):

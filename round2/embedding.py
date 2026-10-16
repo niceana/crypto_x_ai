@@ -188,7 +188,7 @@ class EmbeddingRetriever:
 
     def __call__(self, current, searchable):
         if not searchable:
-            return RetrievalSelection((), True, "embedding-event-v2：同币前180天窗口无历史，前史检查已通过")
+            return RetrievalSelection((), True, "embedding-event-v2：同币配置的历史窗口无已完成披露，前史检查已通过")
         text = current["event"]
         if text not in self.vectors or any(record["event"] not in self.vectors for record in searchable):
             raise EmbeddingError("评分前必须准备并保存当前及历史 event 的向量")

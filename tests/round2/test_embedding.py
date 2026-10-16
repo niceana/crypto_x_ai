@@ -24,7 +24,7 @@ from common.validation import RESULT_COLUMNS
 from round2.embedding import EmbeddingError, EmbeddingRetriever
 from round2.runner import run_relation
 from round3.runner import run_impact
-from tests.event_support import EventFixture, impact_result
+from tests.event_support import EventFixture, impact_result, new_result
 from tests.support import request_text, success
 
 
@@ -280,7 +280,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
 
     def test_time_window_includes_lower_boundary_excludes_peers_future_and_other_assets(self):
         current = pd.Timestamp("2021-01-02 12:00:00")
-        begin = current - pd.Timedelta(days=180)
+        begin = pd.Timestamp("2016-01-02 12:00:00")
         backend = self.backend([(str(begin - pd.Timedelta(seconds=1)), "outside", ["ETH"], "a"),
                                 (str(begin), "boundary", ["ETH"], "a"), (str(current), "peer", ["ETH"], "a"),
                                 (str(current + pd.Timedelta(seconds=1)), "future", ["ETH"], "a"),
@@ -352,7 +352,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             self.assertTrue(backend.tables["result"]["embedding"].ne("").all())
             return success(json.dumps({"event_relation": "update", "matched_event_id": body["candidates"][0]["event_id"],
                                        "new_information": "开始执行"}))
-        settings = self.settings(embedding_config_path="unused.yaml")
+        settings = self.relation_settings(backend, embedding_config_path="unused.yaml")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), patch("round2.embedding._create_client", create):
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["plan", "peer", "execute"]])
@@ -374,14 +374,14 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             return client
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), patch("round2.embedding._create_client", create):
             with self.assertRaisesRegex(EmbeddingError, "401"):
-                run_relation(backend, self.settings(embedding_config_path="unused"), ai_config=self.config())
+                run_relation(backend, self.relation_settings(backend, embedding_config_path="unused"), ai_config=self.config())
         self.assertFalse(backend.updates)
         self.assertTrue(backend.tables["result"]["round2_status"].eq("0").all())
         self.assertTrue(all(client.is_closed for client in clients))
 
-    def test_runner_encodes_recent_update_but_recovers_origin_outside_window(self):
-        backend = self.backend([("2020-01-01", "origin", ["ETH"], "a"),
-                                ("2021-01-01", "progress", ["ETH"], "a"),
+    def test_runner_encodes_years_old_update_and_does_not_read_old_origin(self):
+        backend = self.backend([("2010-01-01", "origin", ["ETH"], "a"),
+                                ("2018-01-01", "progress", ["ETH"], "a"),
                                 ("2021-01-02", "current", ["ETH"], "a")])
         frame = backend.tables["result"]
         root, update, current = frame.index
@@ -399,11 +399,34 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["progress", "current"]])
         candidate = seen[0]["candidates"][0]
-        self.assertEqual(candidate["first_disclosure"]["event"], "origin")
+        self.assertIsNone(candidate["first_disclosure"])
+        self.assertTrue(candidate["history_trimmed"])
+        self.assertEqual(candidate["first_available_disclosure"]["event"], "progress")
         self.assertEqual([item["event"] for item in candidate["timeline"]], ["progress"])
         self.assertEqual(summary.new_completed, 1)
         self.assertEqual(frame.loc[current, "round3_status"], "1")
         self.assertEqual(frame.loc[root, "embedding"], "")
+
+    def test_runner_prepares_vectors_at_exact_leap_year_boundary(self):
+        current = pd.Timestamp("2024-02-29 12:00:00.123456789")
+        begin = pd.Timestamp("2019-02-28 12:00:00.123456789")
+        backend = self.backend([(str(begin - pd.Timedelta(nanoseconds=1)), "outside", ["ETH"], "a"),
+                                (str(begin), "boundary", ["ETH"], "a"),
+                                (str(current), "current", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        for key in frame.index[:2]:
+            frame.loc[key, ["event_id", "event_relation", "round2_status"]] = [key[1], "new", "1"]
+        calls, seen = [], []
+        handler = self.vector_handler({"boundary": [1, 0], "current": [1, 0]}, calls)
+        settings = self.settings(start_time="2024-02-29", end_time="2024-02-29", embedding_config_path="unused")
+        with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
+                patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
+            result = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(
+                lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
+        self.assertEqual(calls, [["boundary", "current"]])
+        self.assertEqual(result.new_completed, 1)
+        self.assertEqual(seen[0]["candidates"][0]["first_disclosure"]["event"], "boundary")
+        self.assertEqual(frame.iloc[0]["embedding"], "")
 
     def test_vector_write_retries_do_not_repeat_embedding_request(self):
         for fail_all in (False, True):
@@ -420,7 +443,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                 handler = self.vector_handler({"one": [1, 0]}, calls)
                 with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
                         patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
-                    operation = lambda: run_relation(backend, self.settings(embedding_config_path="unused"), ai_config=self.config(),
+                    operation = lambda: run_relation(backend, self.relation_settings(backend, embedding_config_path="unused"), ai_config=self.config(),
                                                      network_factory=self.factory(lambda req: self.fail("无历史应跳过第二轮")))
                     if fail_all:
                         with self.assertRaises(BatchPersistenceError):
@@ -449,7 +472,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         backend = self.backend([("2021-01-01", "first", ["ETH"], "a"), ("2021-01-02", "second", ["ETH"], "a")])
         calls, seen = [], []
         handler = self.vector_handler({"first": [1, 0], "second": [0, 1]}, calls)
-        settings = self.settings(embedding_config_path="unused")
+        settings = self.relation_settings(backend, embedding_config_path="unused")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
                 patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
             summary = run_relation(backend, settings, ai_config=self.config(),

@@ -127,8 +127,9 @@ class StoreTests(Fixture, unittest.TestCase):
             with self.subTest(stage=stage):
                 backend, settings = self.backend()
                 config = self.config()
+                relation_settings = replace(settings, start_time="2021-01-01", end_time="2021-01-01")
                 if stage == "round3":
-                    run_relation(backend, settings, ai_config=config, retriever=choose,
+                    run_relation(backend, relation_settings, ai_config=config, retriever=choose,
                                  network_factory=self.network(lambda request: success(json.dumps(new_result()))))
                 backend.tables["first"]["text"] = None
                 seen = []
@@ -137,7 +138,7 @@ class StoreTests(Fixture, unittest.TestCase):
                     return success(json.dumps(new_result() if stage == "round2" else impact_result()))
                 kwargs = {"retriever": choose} if stage == "round2" else {}
                 operation = run_relation if stage == "round2" else run_impact
-                summary = operation(backend, settings, ai_config=config,
+                summary = operation(backend, relation_settings, ai_config=config,
                                     network_factory=self.network(handler), **kwargs)
                 self.assertEqual(summary.new_completed, 1)
                 if stage == "round3":

@@ -32,12 +32,14 @@
 
 ## 模块职责与依赖
 
+第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 5 个日历年的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_years，不再读取全表事件内容或回查窗口外组起点。截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true。第三轮现也按任务准备固定 5 年组历史，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
+
 | 目录或文件 | 职责 | 主要依赖 |
 | --- | --- | --- |
 | `common/config.py` | 分别加载任务、事件、AI 及 Embedding 配置，维护配置对象、模板检查和摘要 | PyYAML、python-dotenv、标准库 |
 | `common/ai_protocol.py` | 三轮大模型请求体构造、接口响应解析及答复类型 | 配置对象、标准库 |
 | `common/validation.py` | 两张表字段及结构、严格 JSON 解析、三轮各自的输出校验 | 时间规则、公共异常、pandas |
-| `common/event_context.py` | 原帖正文和业务输入、180 天记录候选及组内起点和 update 时间线 | 数据约定、时间规则、pandas |
+| `common/event_context.py` | 原帖正文和业务输入、候选检索、批量建立历史索引及两轮窗口内的组事实与截断标记 | 数据约定、时间规则 |
 | `common/time_rules.py` | 完整发布时间解析、包含首尾日的范围判断和选择，原索引及时区不变 | pandas、标准库 |
 | `common/store.py` | TableStore 共用保存；PostTaskStore 管理 round1帖子事件提取表，EventRecordStore 管理事件去重分析表 | 配置摘要、数据约定、存储重试 |
 | `common/network.py` | 网络线程、请求预算、限速、完成消息和关闭 | 配置、AI 请求与响应约定、HTTPX |
@@ -56,6 +58,12 @@
 
 非敏感配置集中在 `configs/`。`job_config.yaml` 指定源帖子、round1帖子事件提取表、处理范围、round1事件提取 AI 配置和日志；`event_config.yaml` 指定事件去重分析表、日期范围、映射、检索及两份 AI 配置路径。三份 AI 配置分别为 `round1_ai_config.yaml`、`round2_ai_config.yaml`、`round3_ai_config.yaml`；`embedding_config.yaml` 独立提供向量服务、批量及相似度阈值参数。各接口参数独立，不增加配置继承。
 
+第二、三轮必须在 event_config.yaml 设置 start_time/end_time，两端包含全天，仅处理该范围内的任务。history_lookback_years 默认 5，须为正整数，供第二轮使用；第三轮固定回看 5 个日历年。两轮均按每条披露发布时间回推，不按程序运行日计算；闰日回推平年取 2 月 28 日，保留时区和纳秒。缺失范围时不读数据库，也不默认处理全表；仅独立导入继续允许日期为空。
+
+第三轮先按配置范围读取任务，确定未完成 new/update 后，仅为 update 准备同币、同组且位于其 `[发布时间-5年, 发布时间)` 的第二轮已完成事实。先复用范围内事实，再按月和六个必要列补读范围外历史；不读取表元数据或遍历全表事件内容。窗口外起点不回查，缺起点时复用截断标记，窗口内完全无可用组历史时停止。范围及历史检查通过后才恢复、认领和分析，配置摘要仍保留全表单列核对。模块接口与边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+
+所有 YAML 配置统一使用现有的安全重复键检查加载器。字典键须为字符串，同一个字典内同名键重复时直接报错，即使两次的值相同也不允许；不同字典可以使用相同键名。例如账号映射中两次填写 BitcoinMagazine 会停止加载，不会用后一个代币覆盖前一个；任务或事件配置错误会在创建数据客户端前停止。
+
 2026-10-16 已按用户提供的 TradeCoins 50 名单（生成于 2026-09-18）填入 `event_config.yaml` 的 `user_name_to_tickers`：原 `screen_name` 作为用户名，原 `ticker` 转为单元素列表，共 50 组，保留大小写及原名单迁移备注。映射沿用现有规则，仅在导入事件的 tickers 为空时按原帖 user_name 精确匹配；实际源帖的用户名仍待核对。
 
 入口按自身文件位置定位项目根目录，读取 `configs`，不依赖当前工作目录。任务配置中的相对 AI 配置路径按 `configs` 目录解析；绝对路径继续支持。数据系统路径原样交给客户端。认证信息来自进程环境或与 AI 配置同目录的 `.env`，进程环境优先；默认即 `configs/.env`，示例在 `configs/.env.example`。
@@ -73,7 +81,7 @@ round2事件去重归组 → 阶段恢复和前史检查 → 同币时间队列 
                                                        ↓
                                   保存确认 → 更新历史 → 推进下一时点
                                                        ↓
-round3事件影响分析 → 全范围关联前提检查 → 准备跨月历史 → new/update 并发分析
+round3事件影响分析 → 本范围关联检查 → 未完成 update 的 5 年组历史 → new/update 并发分析
                                                        ↓
                                       第三轮回答 JSON 和状态共同批量保存
 ```

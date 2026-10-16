@@ -251,12 +251,13 @@ class EventConfig:
     initialize_mode: str = "create"
     logging: dict = None
     embedding_config_path: str = ""
+    history_lookback_years: int = 5
 
 
 def load_event_config(path):
-    """按配置文件目录解析 AI 配置路径，数据系统路径原样保留。"""
+    """安全加载并拒绝重复键，按配置目录解析 AI 路径，数据系统路径原样保留。"""
     path = Path(path).absolute()
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueLoader)
     if not isinstance(document, dict):
         raise ValueError("扩展配置必须为字典")
     allowed = set(EventConfig.__dataclass_fields__)
@@ -289,6 +290,9 @@ def load_event_config(path):
         raise ValueError("retriever 必须为字符串")
     if not isinstance(document.get("embedding_config_path", ""), str):
         raise ValueError("embedding_config_path 必须为字符串")
+    years = document.get("history_lookback_years", 5)
+    if type(years) is not int or years <= 0:
+        raise ValueError("history_lookback_years 必须为正整数日历年数")
     if document.get("initialize_mode", "create") not in ("auto", "create", "resume"):
         raise ValueError("initialize_mode 只能为 auto、create 或 resume")
     if not isinstance(document.get("logging", {}), dict):
@@ -364,8 +368,8 @@ def load_embedding_config(path):
 
 
 def load_job_config(path, required_fields):
-    """读取任务 YAML，按入口指定字段检查；其他启动约束由入口按原顺序检查。"""
-    settings = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    """安全加载并拒绝重复键，检查入口必填字段；其他约束由入口继续检查。"""
+    settings = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=_UniqueLoader)
     if not isinstance(settings, dict):
         raise ValueError("任务配置必须为字典")
     for field in required_fields:

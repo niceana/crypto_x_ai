@@ -140,6 +140,13 @@ class EventFixture(Fixture):
         return EventConfig("first", "result", str(self.path), str(self.path),
                            **kwargs)
 
+    def relation_settings(self, backend, **kwargs):
+        """按已有事件确定显式处理日期，供第二、三轮测试复用。"""
+        days = [pd.Timestamp(key[0]).date().isoformat() for key in backend.tables["result"].index]
+        kwargs.setdefault("start_time", min(days) if days else "2021-01-01")
+        kwargs.setdefault("end_time", max(days) if days else "2021-01-01")
+        return self.settings(**kwargs)
+
     def backend(self, posts):
         source = source_posts(posts)
         result = expand_first_round(source, {})
@@ -153,5 +160,5 @@ class EventFixture(Fixture):
         return factory
 
     def relate(self, backend, handler=None, retriever=choose, **kwargs):
-        return run_relation(backend, self.settings(), ai_config=self.config(), retriever=retriever,
+        return run_relation(backend, self.relation_settings(backend), ai_config=self.config(), retriever=retriever,
                             network_factory=self.factory(handler or (lambda req: success(json.dumps(new_result())))), **kwargs)

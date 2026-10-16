@@ -27,7 +27,7 @@ class EventResponseTests(EventFixture, unittest.TestCase):
     def run_stage(self, stage, backend, handler):
         if stage == "round2":
             return self.relate(backend, handler)
-        return run_impact(backend, self.settings(), ai_config=self.config(),
+        return run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                           network_factory=self.factory(handler))
 
     def test_initialization_uses_14_columns_and_empty_response_cells(self):

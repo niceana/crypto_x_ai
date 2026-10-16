@@ -25,6 +25,7 @@ class EventImportTests(EventFixture, unittest.TestCase):
         self.relate(backend)
         saved = backend.tables["result"].copy(deep=True)
         backend.reads.clear()
+        backend.meta_reads.clear()
         new_posts = source.iloc[1:].copy(deep=True)
         before = new_posts.copy(deep=True)
         self.assertEqual(import_event_records_from_posts(backend, self.settings(), new_posts=new_posts), 1)

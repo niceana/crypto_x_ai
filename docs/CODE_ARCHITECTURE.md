@@ -37,9 +37,17 @@ common.config 按配置类别提供加载入口：load_job_config 读取round1�
 
 配置仍位于 configs，相对 AI 配置按任务配置所在目录解析，绝对路径继续支持；环境变量优先于 .env。ai_config_hash 仍只基于原始提示词及 api.payload，URL、认证、并发和重试参数不参与摘要。
 
+四类配置加载入口统一使用 common.config 已有的 _UniqueLoader，沿用安全 YAML 解析和字符串键要求；每个字典独立检查重复键，根层及嵌套层重复均抛 ConfigError，不静默覆盖，不新增加载封装或配置项。任务和事件配置在创建数据客户端前完成检查。
+
 common.event_context 的 build_current_record_input 供第二、三轮组织固定 event 和定位字段；第二轮不读取原帖。load_source_texts 仅供第三轮，build_impact_input 在认领后补入原帖正文及必要历史；build_relation_input 在检索后序列化当前事件及候选。round1事件提取仍直接使用原帖正文。
 
-common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮一次读取全事件表，窗口筛选和按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
+EventHistory 在批量加入已完成记录后，按币将候选列表按发布时间和 record_id 排序；add_frame 和 add_records 共用批量登记，后者接收筛选后的原键和必要字段，避免第三轮分段补入旧历史时逐条移动有序列表。运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 二分定位按 history_lookback_years 回推的左闭右开窗口，默认 5 个日历年。第二、三轮均启用 truncate_group_history，组输入只取各条披露自己的窗口；缺起点时 first_disclosure=null、history_trimmed=true，并提供 first_available_disclosure。第三轮固定 5 年。common.store.validate_relation_history 保持第二轮按配置期限检查前史的规则，向量临时矩阵和评分方式保留。
+
+第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历年边界，table_date_bounds 供第二轮解析元数据。
+
+第三轮也必须配置日期。round3.runner._prepare_impact 先只读本范围任务，检查第二轮状态和基本关系，并暂存历史必要字段；无记录或全部完成时直接返回。根据未完成 update 确定组与每条披露的 5 年窗口，复用范围内事实，再按月和六个必要列补读范围之前的历史，不读取元数据或范围之后的事件内容。只保留至少能进入一条任务窗口的同组完成事实，批量建立 EventHistory；窗口内已知起点仍检查合法性，缺失或窗口外起点按截断处理，完全没有组历史时停止。EventRecordStore.require_relation 可接收期限并复用既有 origin_start 检查，不改变未传期限调用的完整起点要求。所有任务和所需历史通过后才恢复状态，之后沿用原有正文读取、并发、批量保存和全表摘要单列核对。
+
+common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮按配置日期读取任务和必要历史，窗口筛选及按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
 common.ai_protocol.render_payload 接收已准备的文本，完成一次模板替换和请求体编码检查，不读取数据库、不重新查询历史。TaskRenderError 也由 common.ai_protocol 定义。配置加载不依赖 ai_protocol；ai_protocol 使用 AIConfig 和同一模板变量语法。
 
@@ -89,4 +97,8 @@ entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客
 
 按列摘要 CLI 已按用户确认的调用方式接入；真实 Embedding 服务配置、提示词和经济评分枚举仍待接入，检索召回质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
 
-上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当前事件去重分析表为 14 个普通列，完整 267 项模拟测试通过。向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
+上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当时完整 267 项模拟测试通过；内存索引优化新增 7 项，当时完整 274 项测试通过，覆盖时间边界、按币隔离、乱序载入与加入、返回副本、完整组前史及起点合法性。事件去重分析表仍为 14 个普通列，向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
+
+此前内存索引优化使用上一版代码和相同模拟数据对比：4,000 条同币历史的前史校验从约 8.12 秒降至 0.31 秒；2 万条历史、180 条窗口记录连续检索 100 次，结果一致，耗时从约 0.089 秒降至 0.004 秒。这是本机单次模拟观测，只衡量内存校验和窗口查询，不含数据库、Embedding 或 AI 请求；向量临时矩阵保持原实现。
+
+任务和事件配置的重复键修复新增 4 项测试，覆盖根层、嵌套账号与日志键、重复值相同、不同字典同名键、单账号多代币，以及配置出错时不创建数据客户端。当时完整 278 项测试通过；仓库 6 份 YAML 在新旧加载器下解析值一致，50 组账号映射保留。
