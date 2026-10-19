@@ -110,7 +110,7 @@ def build_current_record_input(key, row):
 
 
 def build_relation_input(current, candidates):
-    """返回第二轮事件文本输入及本次短编号到真实事件组 ID 的映射。
+    """将原始 date 索引以 published_at 发送，返回第二轮输入及候选组 ID 映射。
 
     候选已经完成同币、时间窗口筛选并排好顺序。缺少起点时保留最早可用
     披露；它若同时也是首条 update，按披露 ID 排除重复，不按文本合并事实。
@@ -127,9 +127,9 @@ def build_relation_input(current, candidates):
         for record in records:
             if record["record_id"] not in seen:
                 seen.add(record["record_id"])
-                events.append(record["event"])
+                events.append({"published_at": record["date"], "event": record["event"]})
         groups.append({"candidate_id": candidate_id, "history": events})
-    text = json.dumps({"current": {"event": current["event"]}, "candidates": groups},
+    text = json.dumps({"current": {"published_at": current["date"], "event": current["event"]}, "candidates": groups},
                       ensure_ascii=False, allow_nan=False)
     return text, candidate_event_ids
 

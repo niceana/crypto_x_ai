@@ -15,11 +15,14 @@
 
 ## 环境与配置
 
-使用现有 Python 环境安装 `requirements.txt` 中的依赖，并确保运行环境可导入已有数据客户端 `xdata`。仓库中的 `.python38` 用于当前本地验证；正式运行使用已有可访问数据系统的解释器。
+本项目使用 Python 3.8.5。当前机器的整机解释器为 `C:\Program Files\Python38\python.exe`，项目隔离环境为 `.python38\venv\Scripts\python.exe`，VS Code 默认解释器也指向该环境。本地验证使用项目隔离环境；正式读库仍需可导入已有数据客户端 `xdata` 的 Python 3.8.5 环境。
 
 ```powershell
-python -m pip install -r requirements.txt
+.\.python38\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.python38\venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -t .
 ```
+
+下文命令中的 `python` 均应使用 Python 3.8.5；本机可替换为 `.\.python38\venv\Scripts\python.exe`，不依赖系统 PATH 的默认版本。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -98,7 +101,7 @@ end_time: "2025-12-31"
 history_lookback_years: 5
 ```
 
-每条披露按自身发布时间 t 检索 `[t-5年, t)`，包含下界、排除同刻与未来。普通历史不读取 5 年下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID 和窗口内进展；内部 first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。第二轮 AI 只接收 `{"current":{"event":...},"candidates":[{"candidate_id":"E1","history":[...]}]}`，不发送真实 event_id、额外日期、资产、披露标识、增量、次数或截断标记；窗口内起点或最早可用披露与全部 update 的完整 event 按顺序保留。AI 返回 matched_candidate_id，程序校验并映射回真实 event_id 后保存；每个请求独立使用 E1、E2 等编号，重试沿用原输入和映射，数据库结构不变。第三轮不接收组历史，仅使用本条记录的事件输入。输入例子及边界见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
+每条披露按自身发布时间 t 检索 `[t-5年, t)`，包含下界、排除同刻与未来。普通历史不读取 5 年下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID 和窗口内进展；内部 first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。第二轮 AI 只接收 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 来自对应 df 的 date 索引值，以字符串保留完整精度和时区；不发送真实 event_id、资产、披露标识、增量、次数或截断标记。窗口内起点或最早可用披露与全部 update 的完整 event 按顺序保留。AI 返回 matched_candidate_id，程序校验并映射回真实 event_id 后保存；每个请求独立使用 E1、E2 等编号，重试沿用原输入和映射，数据库结构不变。第三轮不接收组历史，仅使用本条记录的事件输入。输入例子及边界见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
 
 第三轮先按配置范围读任务，无任务或全部完成时直接返回。检查整个范围的第二轮状态和本条基本关联后，恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new 分析整个 event，update 以第二轮提炼的新增事实为重点，repeat 跳过。第三轮不读组历史、原帖或元数据，不再要求历史窗口内有披露或回查组起点。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
 
@@ -113,6 +116,10 @@ similarity_threshold: 0.50
 第二轮正式提示词位于 `configs/round2_ai_config.yaml`，关系选择和新增信息填写融入“判断同一具体事项”“识别新增事实”两个步骤，保留 `# ***标题***` 和四种关系的固定 JSON 输出示例，user 为 `{{task.text}}`；第三轮正式提示词已写入 `configs/round3_ai_config.yaml`，按本次事件或增量分析五个经济字段；两轮真实接口、模型仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。调整任一轮提示词会改变该轮 config_hash；已有不同摘要仍按原规则停止，不自动覆盖或重算历史结果。
 
 update 的 new_information 须独立说明此前已知状态、本次变化及当前状态和条件，不能只写“获批”“金额提高”。旧状态引用唯一匹配组历史，新事实引用当前 event；未知部分说明未披露，不补造，累计总值与本次新增量分清。第三轮不读取历史，依赖这段对照判断本次变化的影响。完整要求及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)；程序的非空字符串校验不能代替真实样本的语义质量验证。
+
+## 只读观察已完成批次的相似度
+
+在刚才运行第二轮的 Python 环境执行 `python -X utf8 -m entrypoints.audit_similarity`，按 `event_config.yaml` 的日期范围复用表内向量，导出本地 `events.csv`、`candidates.csv`、`thresholds.csv` 和完成说明。最高相似度对应的具体历史事件、记录 ID、事件组 ID 及低于阈值的候选都可查看；不调用模型、不恢复状态、不写数据库。默认每条导出阈值筛选前的前 10 个组，可用 `--top-k 20` 增加。多阈值统计固定使用已有分组，不代表人工验收准确率。命令参数、观察方法及还原限制见 [相似度只读观察](docs/SIMILARITY_AUDIT.md)。
 
 ## 代码目录与应用内调用
 

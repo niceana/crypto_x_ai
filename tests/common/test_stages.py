@@ -49,7 +49,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
                 self.assertEqual(len(backend.tables["result"]), 1)
                 self.assertFalse(backend.appends or backend.registers or backend.writes)
                 self.assertEqual(len(seen), 2)
-                self.assertEqual(seen[0], {"event": "已导入事件"})
+                self.assertEqual(seen[0], {"published_at": "2021-01-02 00:00:00", "event": "已导入事件"})
                 self.assertEqual((seen[1]["event"], seen[1]["asset"]), ("已导入事件", "ETH"))
                 self.assertEqual(seen[1], {"asset": "ETH", "event": "已导入事件"})
                 self.assertFalse(any(path == "first" for path, _, _ in backend.reads))

@@ -14,7 +14,7 @@
 
 2026-10-16 已将公共代码收拢为 9 个功能模块，按请求与响应、校验、事件上下文合并，并完成导入、测试及文档复查。处理规则、数据字段和配置保持不变，详见 [公共模块收拢记录](docs/history/COMMON_MODULE_CONSOLIDATION.md)。
 
-2026-10-16 已按用户追加要求将向量存入事件去重分析表新增的 embedding 列，取消 SQLite。新增列初始化为空字符串，生成后保存含模型、版本、配置标识及向量的 JSON；config_hash 不含 event，相同向量配置的各行一致。第二轮 AI 输入现仅含 current.event 及 candidates 中各组的 candidate_id、history 事件文本列表，使用 E1、E2 等请求内短编号，不发送真实 event_id、额外时间、资产、披露标识、增量或截断标记。AI 的 matched_candidate_id 校验后映射回真实 event_id，所有重试沿用本请求映射，数据库结构不变。程序仍负责时间窗口和同币筛选，第三轮输入仅为 asset、event、new_information，不读取原帖或组历史。第二轮正式提示词位于 configs/round2_ai_config.yaml，将关系选择和增量填写融入两个判断步骤，保留 `# ***标题***` 和固定 JSON 输出示例。Embedding 复用公共网络异常分类、随机退避和 Retry-After 解析。只提交组分数达到阈值的最多 10 组，不补足，全部低于时直接 new。默认阈值 0.50 是用户授权 AI 建议的试运行值，尚未按实际样本标定。实现及例子见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。用户确认事件去重分析表尚未创建，本次不增加旧表迁移。
+2026-10-16 已按用户追加要求将向量存入事件去重分析表新增的 embedding 列，取消 SQLite。新增列初始化为空字符串，生成后保存含模型、版本、配置标识及向量的 JSON；config_hash 不含 event，相同向量配置的各行一致。第二轮 AI 输入现仅含 current.published_at、current.event 及 candidates 中各组的 candidate_id、history 事件列表，每条历史包含 published_at 和 event，published_at 是对应 df 的 date 索引值的字符串（2026-10-19 补充）。使用 E1、E2 等请求内短编号，不发送真实 event_id、资产、披露标识、增量或截断标记。AI 的 matched_candidate_id 校验后映射回真实 event_id，所有重试沿用本请求映射，数据库结构不变。程序仍负责时间窗口和同币筛选，第三轮输入仅为 asset、event、new_information，不读取原帖或组历史。第二轮正式提示词位于 configs/round2_ai_config.yaml，将关系选择和增量填写融入两个判断步骤，保留 `# ***标题***` 和固定 JSON 输出示例。Embedding 复用公共网络异常分类、随机退避和 Retry-After 解析。只提交组分数达到阈值的最多 10 组，不补足，全部低于时直接 new。默认阈值 0.50 是用户授权 AI 建议的试运行值，尚未按实际样本标定。实现及例子见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。用户确认事件去重分析表尚未创建，本次不增加旧表迁移。
 
 2026-10-16 已按命名检查清单统一代码符号及测试类，并完成导入、测试和文档复查；目录、表字段、配置键和处理规则保持不变。对应关系与验证结果见 [命名统一记录](docs/history/NAMING_CONSISTENCY.md)。
 
@@ -32,7 +32,7 @@
 
 ## 模块职责与依赖
 
-第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 5 个日历年的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_years，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 文本列表。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
+第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 5 个日历年的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_years，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 事件列表，每条包含 published_at、event。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
 
 | 目录或文件 | 职责 | 主要依赖 |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ round3事件影响分析 → 本范围第二轮完成检查 → 事件输入 →
 - `common.store.read_stage_hashes(cli, task_path, hash_column)` 调用 `cli.read(task_path, start_time='', end_time='', columns=[hash_column])` 读取全表单列，返回 DataFrame 中该列的原值；三轮在本次首次认领前核对一次，跨月复用。
 - `common.config.load_job_config`、`load_event_config`、`load_ai_config` 分别加载任务、事件及 AI 配置；不会因为共用模块而提前读取 AI 配置。
 - `common.config.load_embedding_config` 加载向量服务及阈值配置；`round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings)` 读取原键、event 和表内向量，按批生成缺失或标识不匹配的向量，调用 `EventRecordStore.save_embeddings` 只更新 embedding 列。保存完成后才认领关联，评分对象接收 current/searchable 并返回 RetrievalSelection。生成向量不代表关联完成，业务阶段只做内存比较，round3事件影响分析不修改或发送向量。
-- `common.event_context.build_relation_input(current, candidates)` 返回 `(text, candidate_event_ids)`：text 为 `{"current":{"event":...},"candidates":[{"candidate_id":"E1","history":[...]}]}`，candidate_event_ids 为本次短编号到真实 event_id 的映射；起点或最早可用披露与全部 update 按原顺序提供，同一披露不重复发送。`build_impact_input(store, key)` 组织 asset、event 两个必填字段，仅在有内容时附带 new_information；`common.ai_protocol.render_payload` 只把文本填入请求模板。
+- `common.event_context.build_relation_input(current, candidates)` 返回 `(text, candidate_event_ids)`：text 为 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。candidate_event_ids 为本次短编号到真实 event_id 的映射；起点或最早可用披露与全部 update 按原顺序提供，同一披露不重复发送。`build_impact_input(store, key)` 组织 asset、event 两个必填字段，仅在有内容时附带 new_information；`common.ai_protocol.render_payload` 只把文本填入请求模板。
 - `common.validation.validate_extraction_output`、`validate_relation_output`、`validate_impact_output` 分别检查三轮输出；`validate_relation_output(content, candidate_event_ids)` 校验 AI 的 matched_candidate_id，再返回带真实 matched_event_id 的内部结果，保存和数据库结构不变。每个 RequestJob 独立持有输入及映射，所有请求重试复用；round3事件影响分析保留五字段非空文本检查及 validator 注入接口。
 
 第二轮 update 的 new_information 承担第三轮所需的事实对照：结合唯一匹配组历史写清此前已知状态或数值，再依据当前 event 写出本次变化、当前状态和关键条件。只带入解释变化必需的旧事实，不将旧事实重新当作新增；未知旧值或本次未披露的执行情况明确说明，不补造。第三轮只接收 asset、event、new_information，因此第二轮不能只留下“获批”“额度提高”等短摘要。输出仍为原三字段和字符串，数据库不变；格式校验不能替代真实样本的语义质量验收，已完成结果不自动重算。详细规则及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。

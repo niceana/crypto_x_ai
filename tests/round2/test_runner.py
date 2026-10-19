@@ -60,7 +60,8 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                        ("result", "2020-10-01", "2025-09-30")])
         self.assertIn(("result", "2025-10-02", "2026-01-01", ["asset", "round2_status"]), backend.column_reads)
         self.assertEqual([group["history"] for group in seen[0]["candidates"]],
-                         [["boundary"], ["history"]])
+                         [[{"published_at": str(keys[name][0]), "event": name}] for name in ("boundary", "history")])
+        self.assertEqual(seen[0]["current"], {"published_at": str(keys["current"][0]), "event": "current"})
         self.assertTrue(all(list(batch.index) == [keys["current"]] for batch in backend.updates))
         pd.testing.assert_frame_equal(backend.tables["result"].drop(index=keys["current"]), before)
 
@@ -134,7 +135,8 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         result = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
                               network_factory=self.factory(relation))
         group = seen[0]["candidates"][0]
-        self.assertEqual(group, {"candidate_id": "E1", "history": ["recent-repeat-fact"]})
+        self.assertEqual(group, {"candidate_id": "E1", "history": [
+            {"published_at": "2024-01-01 00:00:00", "event": "recent-repeat-fact"}]})
         self.assertEqual(result.new_completed, 1)
         self.assertEqual(frame.at[current, "event_id"], root[1])
         self.assertEqual(frame.at[current, "round3_status"], "1")
@@ -175,10 +177,11 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         summary = run_relation(backend, scope, ai_config=self.config(), retriever=choose,
                                network_factory=self.factory(handler))
         self.assertEqual(summary.new_completed, 1)
-        self.assertEqual(seen[0]["candidates"], [{"candidate_id": "E1", "history": ["origin"]}])
+        self.assertEqual(seen[0]["candidates"], [{"candidate_id": "E1", "history": [
+            {"published_at": "2021-01-01 00:00:00", "event": "origin"}]}])
         self.assertEqual(backend.reads, [("result", "2021-01-02", "2021-01-02"),
                                        ("result", "2016-01-02", "2021-01-01")])
-        self.assertEqual(seen[0]["current"], {"event": "update"})
+        self.assertEqual(seen[0]["current"], {"published_at": "2021-01-02 00:00:00", "event": "update"})
 
     def test_unconfigured_retrieval_and_prompts_do_not_claim(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
@@ -213,7 +216,9 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(summary.http_attempts_started, 5)
         self.assertEqual(summary.new_completed, 4)
         execute = next(body for body in seen if body["current"]["event"] == "execute")
-        self.assertEqual(execute["candidates"][0]["history"], ["plan", "approve"])
+        self.assertEqual(execute["candidates"][0]["history"], [
+            {"published_at": "2021-01-01 00:00:00", "event": "plan"},
+            {"published_at": "2021-01-02 00:00:00", "event": "approve"}])
         self.assertEqual(backend.tables["result"].iloc[-1]["round3_status"], "1")
         self.assertTrue(all(value == threading.get_ident() for value in backend.threads))
         previous = len(seen)
@@ -259,7 +264,9 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 if len(arrivals) == 2:
                     ready.set()
                 await asyncio.wait_for(ready.wait(), timeout=5)
-            self.assertEqual(body["candidates"], [{"candidate_id": "E1", "history": [event.replace("approved", "plan")]}])
+            self.assertEqual(body["candidates"], [{"candidate_id": "E1", "history": [
+                {"published_at": "2021-01-01 00:00:00", "event": event.replace("approved", "plan")}]}])
+            self.assertEqual(body["current"]["published_at"], "2021-01-02 00:00:00")
             candidate_id = "E99" if event == "eth-approved" and len(attempts) == 1 else "E1"
             return success(json.dumps({"event_relation": "update", "matched_candidate_id": candidate_id,
                                        "new_information": event}))
@@ -537,7 +544,8 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         result = run_relation(backend, settings, ai_config=self.config(), retriever=choose,
                               network_factory=self.factory(lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(new_result()))))
         candidate = seen[0]["candidates"][0]
-        self.assertEqual(candidate, {"candidate_id": "E1", "history": ["progress"]})
+        self.assertEqual(candidate, {"candidate_id": "E1", "history": [
+            {"published_at": str(update[0]), "event": "progress"}]})
         self.assertEqual(result.new_completed, 1)
 
     def test_repeat_history_is_not_validated_or_repaired_on_recovery(self):

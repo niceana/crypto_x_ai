@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .python38/
 .env
+reports/

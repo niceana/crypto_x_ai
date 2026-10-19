@@ -40,9 +40,9 @@ common.config 按配置类别提供加载入口：load_job_config 读取round1�
 
 四类配置加载入口统一使用 common.config 已有的 _UniqueLoader，沿用安全 YAML 解析和字符串键要求；每个字典独立检查重复键，根层及嵌套层重复均抛 ConfigError，不静默覆盖，不新增加载封装或配置项。任务和事件配置在创建数据客户端前完成检查。
 
-common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.event 和各候选组的 candidate_id、history 字符串列表，按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。round1事件提取仍直接使用原帖正文。
+common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.published_at、current.event 和各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event；每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。round1事件提取仍直接使用原帖正文。
 
-EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_years 定位左闭右开窗口，默认 5 个日历年。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成事件文本。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
+EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_years 定位左闭右开窗口，默认 5 个日历年。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
 
 common.time_rules.history_read_bounds(current_times, scope_start, years) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, years) 使用已有窗口算法筛选历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责；既有闰日边界限制保留。
 

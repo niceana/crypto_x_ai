@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | 阈值数值 | 默认 similarity_threshold 为 0.50，允许配置 [-1, 1] 内的有限数值。 | 用户授权先建议试运行值，尚未以实际关联样本标定；调高会增加自动 new，调低会增加round2事件去重归组调用。相似度不是事件同一性的概率。 |
 | 一列中的格式 | JSON 对象，字段为 model、model_version、config_hash、vector。 | config_hash 只包含服务地址、模型、版本和编码规则，不含 event；同一配置生成的各行摘要相同。标识不匹配时只重新生成所需行的向量，不重做已完成关联。 |
-| 第二轮输入 | current 只含 event；candidates 每组只含 candidate_id 和 history 事件文本列表，用 E1、E2 等短编号替代真实 event_id，不发送额外时间、资产、披露标识、增量、次数或截断标记，也不读取或发送原帖正文。 | AI 返回 matched_candidate_id，程序校验后映射为真实 event_id，重试沿用本请求的输入及映射，数据库结构不变。第一轮 event 作为完整且固定的事实输入，时间筛选由程序负责；第三轮只读取本条 asset、event、new_information，不读取正文或组历史。 |
+| 第二轮输入 | current 只含 published_at、event；candidates 每组只含 candidate_id 和 history 事件列表，每条历史含 published_at、event。每条 published_at 是对应 df 的 date 索引值的字符串，保留完整精度和时区。用 E1、E2 等短编号替代真实 event_id，不发送资产、披露标识、增量、次数或截断标记，也不读取或发送原帖正文。 | AI 返回 matched_candidate_id，程序校验后映射为真实 event_id，重试沿用本请求的输入及映射，数据库结构不变。第一轮 event 作为完整且固定的事实输入，时间筛选由程序负责；第三轮只读取本条 asset、event、new_information，不读取正文或组历史。 |
 | 达标组数量 | 达标组按相似度排序，最多 10 组，不补足。 | 只有 2 组达标就发 2 组，超过 10 组时取前 10 组。 |
 | 模型输出 | 模型已归一化；接口返回值经校验直接保存，用 float64 数组计算内积。 | 只校验单位范数，不修改分量；服务返回未归一化向量时按无效输出重试，耗尽后停止。 |
 | 旧表新增列 | 事件去重分析表尚未创建，直接修改初始化结构。 | 本次不增加旧表自动加列或迁移功能；缺 embedding 列的旧结构仍报错。 |
@@ -32,7 +32,7 @@
 5. 向量准备、保存结束后才认领关联任务。批量保存成功的向量可在重启后直接从事件去重分析表复用；只有向量不代表round2事件去重归组已完成。
 6. 对合格历史逐条评分，按 event_id 取最高分；仅保留组分数大于等于 similarity_threshold 的组，按分数降序取最多 10 组，同分按 event_id 升序。
 7. 无历史，或所有事件组都严格低于阈值时，直接保存 new，event_id 为当前 record_id，round2事件去重归组完成、round3事件影响分析待处理。日志分别记录无历史或阈值放行及阈值、最高分，便于核查。
-8. 只要至少一个组达到阈值，就组织达标组的 5 年窗口内历史，不回查窗口外起点。内部缺起点时仍设置 first_disclosure=null、history_trimmed=true，并保留 first_available_disclosure；发送第二轮 AI 前按候选顺序分配 candidate_id 短编号，只提供编号和 history 完整事件文本列表。起点或最早可用披露与全部 update 按原顺序提供，同一披露只发送一次。真实 event_id 映射固定在本次请求内供校验和保存，重试不重新检索或编号；具体输入见 [事件规则](../rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。向量接口、解析或存储错误仍停止，不作为低分或无历史。
+8. 只要至少一个组达到阈值，就组织达标组的 5 年窗口内历史，不回查窗口外起点。内部缺起点时仍设置 first_disclosure=null、history_trimmed=true，并保留 first_available_disclosure；发送第二轮 AI 前按候选顺序分配 candidate_id 短编号，只提供编号和 history 事件列表，每条历史含原 date 索引值和完整 event。起点或最早可用披露与全部 update 按原顺序提供，同一披露只发送一次。真实 event_id 映射固定在本次请求内供校验和保存，重试不重新检索或编号；具体输入见 [事件规则](../rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。向量接口、解析或存储错误仍停止，不作为低分或无历史。
 
 使用默认值 0.50 时，A 组最高分 0.49、B 组 0.50、C 组 0.85，只提交 C、B；若所有组最高分都低于 0.50，直接 new。边界使用计算出的浮点分数直接比较，不增加隐藏宽容区间。0.50 仅为试运行起点，不是已经验证的最佳阈值。
 

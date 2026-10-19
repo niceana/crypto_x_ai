@@ -123,7 +123,7 @@ A、B 读取时已经成功，因此本次只读取一次事件去重分析表�
 
 有待处理任务时，从各币最早待处理时刻回推 5 年，取其中最早日期，按日期读取该下界至处理起点前一天的历史，与当前任务组成内存工作表；不重复读取当前任务已有的日期。日期接口按整日读取，精确时刻边界在内存判断。元数据提供表尾日期，处理范围之后若仍有记录，只按日期读取 asset、round2_status 两列检查补录冲突，不读取这些记录的事件、向量或回答，也不加入候选。
 
-范围内全部完成或没有可认领任务时直接返回，不读取全表摘要。第二轮始终不读取原帖正文或第一轮表；当前 event 是完整且固定的事实输入，AI 只接收 current.event 及各候选组的 candidate_id、history 事件文本列表。candidate_id 为本次请求内的 E1、E2 等短编号；真实 event_id、记录定位、时间和代币留在程序内部用于检索和保存。
+范围内全部完成或没有可认领任务时直接返回，不读取全表摘要。第二轮始终不读取原帖正文或第一轮表；当前 event 是完整且固定的事实输入，AI 只接收 current.published_at、current.event 及各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event。每条 published_at 是对应 df 的 date 索引值的字符串，保留完整精度和时区。candidate_id 为本次请求内的 E1、E2 等短编号；真实 event_id、记录定位和代币留在程序内部用于检索和保存。
 
 round2事件去重归组按 batch_size 分批将当前范围 9/-1 恢复为 0，保留错误、旧结果和其他阶段字段。恢复不检查历史 repeat 的空字段或摘要，不补成功状态。窗口内已有起点仍要求阶段已完成、同币且严格早于当前披露；缺失或窗口外起点不再回查或核实，组输入须标记截断。
 
@@ -165,7 +165,7 @@ round2事件去重归组按 batch_size 分批将当前范围 9/-1 恢复为 0，
 
 每批 Embedding 默认最多尝试 3 次，包含首次；网络传输故障、5xx 和无效响应共用预算。复用 common.network 的异常分类、指数随机退避和 Retry-After 解析，本地退避上界从 1 秒翻倍，最高 30 秒，可配置；5xx 的合法 Retry-After 与退避取较长等待。429、其他非成功 HTTP 或预算耗尽停止本轮，不伪造空候选；该预算不占关联 AI 请求次数。表内损坏、程序异常及存储失败不作为接口输出重试。config_hash 只包含服务、模型、人工版本及编码规则，不含实际 event；同一配置各行一致。event 沿用固定输入约定，人工改动时清空对应 embedding 并确定下游重算范围；更换同名模型权重时要更改 model_version。表内已成功保存的批次在重启后复用，Embedding 或存储错误不按低分处理。
 
-- 检索接口的 current 包含 record_id、原发布时间、asset、event 和 source_post_id，不含 source_text；这些定位字段供程序使用，不直接作为第二轮 AI 输入。
+- 检索接口的 current 包含 record_id、原发布时间 date、asset、event 和 source_post_id，不含 source_text；第二轮 AI 仅接收 published_at 和 event，published_at 取内部 date 值，其余定位字段供程序使用。
 - searchable 是同代币、当前披露时间回推配置年数至当前时刻之前的已完成披露副本，默认 5 年，包含 event_id、event_relation 和 update 的 new_information。下界包含，上界排除；返回顺序为时间、record_id。
 - 返回的 event_ids 必须是最多 10 个不同事件组 ID 的元组，顺序表示评分函数选出的相关性顺序，且都来自本次 searchable。
 - 通用接口的 auto_new 默认为 False。内置评分器在前史检查通过且 searchable 为空，或所有组分数都严格低于阈值时，返回空 event_ids、auto_new=True 和带规则标识的非空 reason；阈值放行同时在原因中记录最高分和阈值。空窗口或低分不证明全网没有相关事件。
@@ -174,7 +174,7 @@ round2事件去重归组按 batch_size 分批将当前范围 9/-1 恢复为 0，
 
 选出组 ID 后，内部仍只组织本次 5 年窗口内的组事实。窗口内有唯一合法 new 起点时，first_disclosure 提供该起点、history_trimmed=false；没有窗口内起点时，保留组 ID、first_disclosure=null、history_trimmed=true，并额外提供 first_available_disclosure，表示窗口内最早的原始披露，不把它改成 new。timeline 提供窗口内全部 update，repeat_count/disclosure_count 只统计窗口内记录，不加入同刻及未来披露。这些内部字段仅供第二轮程序组织候选，不原样发送给第二轮 AI；第三轮不使用组历史。
 
-例如 2010 年的组在 2024 年只有一条 repeat，2025 年召回时不读取 2010 年起点；内部 first_available_disclosure 提供 2024 年 repeat 的 event 事实。发送第二轮 AI 时，该候选只包含 candidate_id 和 history，history 为这条 repeat 的完整 event 文本，不发送真实 event_id、截断标记或披露次数。
+例如 2010 年的组在 2024 年只有一条 repeat，2025 年召回时不读取 2010 年起点；内部 first_available_disclosure 提供 2024 年 repeat 的 event 事实。发送第二轮 AI 时，该候选只包含 candidate_id 和 history，history 包含这条 repeat 的 date 索引值和完整 event 文本，不发送真实 event_id、截断标记或披露次数。
 
 每次关联输入、候选和评分不写业务表；生成的向量和模型/配置标识保存在 embedding 列。续跑复用有效向量，重新计算未完成记录的候选，已完成关联不重做。阈值变化不影响向量标识，但只作用于后续待处理记录；不会自动重算历史。原轮次 config_hash 仍不覆盖 Embedding 参数、阈值或 history_lookback_years；需要在一次研究处理中保持检索规则一致，若更改已处理历史的口径，重算范围另行确定。
 
@@ -182,28 +182,35 @@ round2事件去重归组按 batch_size 分批将当前范围 9/-1 恢复为 0，
 
 按代币建立时间队列，不同代币可并发。同币前一时刻的关联全部保存确认后，才启动下一时刻；完全相同的发布时间使用同一份此前历史，可以共同并发。不能靠 ID 排序把同刻披露当作彼此历史。
 
-先共同保存 `round2_status="9"` 和 `round2_config_hash`，再执行该条检索或提交 AI。build_relation_input 按已选候选顺序分配 E1、E2、……、E10，返回精简后的 JSON 文本及“candidate_id → 真实 event_id”映射。文本只包含当前 event、候选短编号和历史 event 字符串列表，通过已有 task.text 模板构造请求，不为业务字段增加模板变量。固定输入结构如下：
+先共同保存 `round2_status="9"` 和 `round2_config_hash`，再执行该条检索或提交 AI。build_relation_input 按已选候选顺序分配 E1、E2、……、E10，返回精简后的 JSON 文本及“candidate_id → 真实 event_id”映射。文本只包含当前 published_at、event、候选短编号和历史 published_at、event 对象列表，通过已有 task.text 模板构造请求，不为业务字段增加模板变量。固定输入结构如下：
 
 ```json
 {
   "current": {
+    "published_at": "2025-01-03 12:00:00",
     "event": "ABC Protocol 已开始执行1000万美元代币回购计划。"
   },
   "candidates": [
     {
       "candidate_id": "E1",
       "history": [
-        "ABC Protocol 提议投入1000万美元回购代币，尚待治理投票。",
-        "ABC Protocol 的1000万美元代币回购提案已通过治理投票。"
+        {
+          "published_at": "2025-01-01 12:00:00",
+          "event": "ABC Protocol 提议投入1000万美元回购代币，尚待治理投票。"
+        },
+        {
+          "published_at": "2025-01-02 12:00:00",
+          "event": "ABC Protocol 的1000万美元代币回购提案已通过治理投票。"
+        }
       ]
     }
   ]
 }
 ```
 
-每组 history 保留窗口内起点及全部 update 的完整 event，由程序按发布时间和 record_id 排序。缺少起点时，以 first_available_disclosure 的 event 开头，再接全部 update；同一条披露同时出现在 first_available_disclosure 和 timeline 时只发送一次，不按文本相同去重。普通 repeat 沿用既有规则，不重复加入历史正文。事件文本中原有的日期、数字、版本和限制条件原样保留，不补写或删改。
+每组 history 保留窗口内起点及全部 update 的 published_at 和完整 event，由程序按发布时间和 record_id 排序。缺少起点时，先提供 first_available_disclosure 的 published_at 和 event（published_at 取内部 date 值），再接全部 update；同一条披露同时出现在 first_available_disclosure 和 timeline 时只发送一次，不按文本相同去重。普通 repeat 沿用既有规则，不重复加入历史正文。当前事件及每条历史的 published_at 都直接取对应 df 的 date 索引值并转为字符串，不转换时区或截断精度；这是披露时间，不必等同事件实际发生时间。事件文本中原有的日期、数字、版本和限制条件原样保留，不补写或删改。
 
-第二轮 AI 不接收真实 event_id、额外日期、资产、record_id、source_post_id、历史 event_relation、new_information、披露次数或 history_trimmed；时间窗口、同币筛选和同刻排除由程序负责。提示词只按两个步骤判断：先比较所有候选，确认均不是同一具体事项才选 new；唯一匹配后比较全部历史，没有新增事实选 repeat，有新增事实选 update 并填写新增信息。任一步无法可靠判断或无法唯一匹配时选 uncertain。正式 system 提示词保存在 configs/round2_ai_config.yaml，关系选择和新增信息填写融入这两个步骤，保留 `# ***标题***`、固定输出结构和四种 JSON 示例，user 继续为 `{{task.text}}`。
+第二轮 AI 不接收真实 event_id、资产、record_id、source_post_id、历史 event_relation、new_information、披露次数或 history_trimmed；时间窗口、同币筛选和同刻排除由程序负责。提示词只按两个步骤判断：先比较所有候选，确认均不是同一具体事项才选 new；唯一匹配后比较全部历史，没有新增事实选 repeat，有新增事实选 update 并填写新增信息。任一步无法可靠判断或无法唯一匹配时选 uncertain。正式 system 提示词保存在 configs/round2_ai_config.yaml，关系选择和新增信息填写融入这两个步骤，保留 `# ***标题***`、固定输出结构和四种 JSON 示例，user 继续为 `{{task.text}}`。
 
 update 的 new_information 是供第三轮独立理解本次变化的说明，不能只写“获批”“金额提高”等短摘要。应交代事项主体及对象、此前已知状态或数值、本次新增或修正的内容、变化后的状态和直接相关条件；多项新增事实分别写清，不为缩短文字而遗漏。仅带入理解本次变化必需的旧事实，不复制完整历史，也不把旧事实重新当作本次新增。
 

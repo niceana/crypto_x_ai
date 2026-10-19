@@ -358,7 +358,9 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         self.assertEqual(calls, [["plan", "peer", "execute"]])
         self.assertEqual((summary.http_attempts_started, summary.new_completed), (1, 4))
         self.assertEqual(len(seen), 1)
-        self.assertEqual([item["history"] for item in seen[0]["candidates"]], [["plan"]])
+        self.assertEqual([item["history"] for item in seen[0]["candidates"]], [
+            [{"published_at": "2021-01-01 12:00:00", "event": "plan"}]])
+        self.assertEqual(seen[0]["current"], {"published_at": "2021-01-02 12:00:00", "event": "execute"})
         self.assertNotIn('"embedding"', json.dumps(seen))
         self.assertEqual(list(backend.updates[0].columns), ["embedding"])
         with patch("round2.runner.load_embedding_config", side_effect=AssertionError("完成后不加载 Embedding")):
@@ -399,7 +401,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["progress", "current"]])
         candidate = seen[0]["candidates"][0]
-        self.assertEqual(candidate, {"candidate_id": "E1", "history": ["progress"]})
+        self.assertEqual(candidate, {"candidate_id": "E1", "history": [
+            {"published_at": str(update[0]), "event": "progress"}]})
         self.assertEqual(summary.new_completed, 1)
         self.assertEqual(frame.loc[current, "round3_status"], "1")
         self.assertEqual(frame.loc[root, "embedding"], "")
@@ -422,7 +425,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                 lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
         self.assertEqual(calls, [["boundary", "current"]])
         self.assertEqual(result.new_completed, 1)
-        self.assertEqual(seen[0]["candidates"][0]["history"], ["boundary"])
+        self.assertEqual(seen[0]["candidates"][0]["history"], [{"published_at": str(begin), "event": "boundary"}])
+        self.assertEqual(seen[0]["current"], {"published_at": str(current), "event": "current"})
         self.assertEqual(frame.iloc[0]["embedding"], "")
 
     def test_vector_write_retries_do_not_repeat_embedding_request(self):
