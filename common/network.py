@@ -298,16 +298,20 @@ class NetworkWorker:
                             if waiting is not None:
                                 self.gate.pause(waiting)
                         else:
-                            self.logger.warning("业务输出无效，准备重试：任务=%r，尝试=%d/%d",
-                                           job.key, count, self.config.run.max_attempts)
+                            self.logger.warning("业务输出无效，准备重试：任务=%r，尝试=%d/%d，原因=%s",
+                                           job.key, count, self.config.run.max_attempts, parsed.error_message)
                     # 退避可能较长，等待前释放完整响应，仅保留必要解析字段。
                     del response
                 if parsed.success or not retry:
                     if parsed.success:
                         self.logger.debug("单任务请求成功：任务=%r，实际尝试=%d", job.key, count)
                     else:
-                        self.logger.warning("单任务请求最终失败：任务=%r，HTTP状态=%s，实际尝试=%d",
-                                       job.key, parsed.http_status, count)
+                        # 2xx 下的响应与正文校验失败提供具体原因；HTTP 或传输错误
+                        # 仍沿用原日志口径，外部接口和网络异常说明保存在任务表。
+                        detail = ("，原因=" + parsed.error_message
+                                  if parsed.http_status is not None and 200 <= parsed.http_status < 300 else "")
+                        self.logger.warning("单任务请求最终失败：任务=%r，HTTP状态=%s，实际尝试=%d%s",
+                                       job.key, parsed.http_status, count, detail)
                     return CompletionMessage(job.key, parsed, count, value=value)
                 if self.stopped.is_set():
                     raise asyncio.CancelledError()

@@ -180,6 +180,28 @@ class StoreTests(Fixture, unittest.TestCase):
         self.assertEqual((summary.new_failed, summary.pending, summary.processing), (0, 0, 0))
         pd.testing.assert_frame_equal(store.df.iloc[2:], frame.iloc[2:])
 
+    def test_event_recovery_logs_confirmed_counts_for_selected_stage_and_scope(self):
+        for stage, label in (("round2", "round2事件去重归组"), ("round3", "round3事件影响分析")):
+            with self.subTest(stage=stage):
+                backend, settings = self.backend(6)
+                frame = backend.tables["result"]
+                frame[stage + "_status"] = ["9", "-1", "0", "1", "9", "-1"]
+                frame["error_message"] = "preserve error"
+                frame["round3_ai_response"] = "preserve response"
+                before = frame.copy(deep=True)
+                store = EventRecordStore(backend, settings, self.config().run, "2021-01-01", "2021-01-06")
+                keys = list(frame.index[:4])
+                with self.assertLogs("common.store", level="INFO") as logs:
+                    store.recover(stage, keys)
+                    store.recover(stage, keys)
+                self.assertIn(label + "当前分段状态恢复完成", logs.output[0])
+                self.assertIn("起点=2021-01-01，终点=2021-01-06", logs.output[0])
+                self.assertIn("遗留处理中=1，历史失败=1，恢复数=2，待处理数=3", logs.output[0])
+                self.assertIn("遗留处理中=0，历史失败=0，恢复数=0，待处理数=3", logs.output[1])
+                self.assertEqual(list(frame[stage + "_status"]), ["0", "0", "0", "1", "9", "-1"])
+                pd.testing.assert_frame_equal(frame.drop(columns=stage + "_status"),
+                                              before.drop(columns=stage + "_status"))
+
     def test_event_recovery_batches_stop_after_failed_batch_without_clearing_other_values(self):
         for stage in ("round2", "round3"):
             with self.subTest(stage=stage):
@@ -197,8 +219,10 @@ class StoreTests(Fixture, unittest.TestCase):
                         raise RuntimeError("batch not written")
                     backend.apply(path, batch)
                 backend.update_hook = update
-                with self.assertRaises(BatchPersistenceError):
-                    store.recover(stage, list(frame.index))
+                with self.assertLogs("common.store", level="INFO") as logs:
+                    with self.assertRaises(BatchPersistenceError):
+                        store.recover(stage, list(frame.index))
+                self.assertFalse(any("状态恢复完成" in line for line in logs.output))
                 self.assertEqual([len(batch) for batch in backend.updates], [2, 2, 2])
                 self.assertEqual(list(frame[stage + "_status"]), ["0", "0", "9", "-1", "1"])
                 pd.testing.assert_frame_equal(frame.drop(columns=stage + "_status"),

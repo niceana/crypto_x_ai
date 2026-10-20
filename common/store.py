@@ -352,7 +352,14 @@ class EventRecordStore(TableStore):
 
     def recover(self, stage, keys):
         """只分批恢复当前阶段 9/-1，不质检或修复历史结果。"""
-        self.reset_status(stage, keys)
+        statuses = self._statuses(stage, keys)
+        processing = int(statuses.eq("9").sum())
+        failed = int(statuses.eq("-1").sum())
+        restored = self.reset_status(stage, keys)
+        pending = int(self._statuses(stage, keys).eq("0").sum())
+        label = {"round2": "round2事件去重归组", "round3": "round3事件影响分析"}[stage]
+        self.logger.info("%s当前分段状态恢复完成：起点=%s，终点=%s，遗留处理中=%d，历史失败=%d，恢复数=%d，待处理数=%d",
+                         label, self.start_time, self.end_time, processing, failed, restored, pending)
 
     def claim(self, keys, stage, digest):
         self.claim_stage(keys, stage, digest)

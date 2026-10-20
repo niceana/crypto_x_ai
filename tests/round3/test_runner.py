@@ -21,6 +21,47 @@ from tests.event_support import EventFixture, new_result, impact_result
 
 
 class ImpactRunnerTests(EventFixture, unittest.TestCase):
+    def test_startup_logs_recovery_and_pending_counts_before_ai(self):
+        backend = self.backend([("2021-01-01", "event {}".format(i), ["ETH"], "a") for i in range(4)])
+        self.relate(backend)
+        frame = backend.tables["result"]
+        frame.loc[:, "round3_status"] = ["-1", "9", "0", "1"]
+        frame.loc[:, "error_message"] = "preserved error"
+        seen = []
+        with self.assertLogs(level="INFO") as logs:
+            summary = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
+                                 network_factory=self.factory(lambda request: seen.append(request)
+                                                              or success(json.dumps(impact_result()))))
+        output = [record.getMessage() for record in logs.records]
+        startup = next(i for i, line in enumerate(output) if "启动准备：" in line)
+        restored = next(i for i, line in enumerate(output) if "状态恢复完成" in line)
+        ready = next(i for i, line in enumerate(output) if "启动准备完成" in line)
+        network = next(i for i, line in enumerate(output) if "网络线程已就绪" in line)
+        self.assertLess(startup, restored)
+        self.assertLess(restored, ready)
+        self.assertLess(ready, network)
+        self.assertIn("历史失败=1，恢复数=2，待处理数=3", output[restored])
+        self.assertIn("任务数=4，已有完成=1，待处理数=3，失败数=0，处理中数=0", output[ready])
+        self.assertEqual((summary.new_completed, len(seen)), (3, 3))
+
+    def test_completed_and_empty_scopes_log_zero_pending_without_ai(self):
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                backend = self.backend([("2021-01-01", "event", ["ETH"], "a")])
+                if completed:
+                    self.relate(backend)
+                    backend.tables["result"].loc[:, "round3_status"] = "1"
+                    settings = self.relation_settings(backend)
+                else:
+                    settings = self.settings(start_time="2021-02-01", end_time="2021-02-01")
+                with self.assertLogs("round3.runner", level="INFO") as logs:
+                    summary = run_impact(backend, settings, network_factory=lambda config: self.fail("不应调用 AI"))
+                count = int(completed)
+                output = "\n".join(logs.output)
+                self.assertIn("任务数={}，已有完成={}，待处理数=0".format(count, count), output)
+                self.assertIn("本范围无需调用 AI", output)
+                self.assertEqual(summary.http_attempts_started, 0)
+
     def test_impact_requires_explicit_valid_scope_before_any_read(self):
         backend = self.backend([("2025-01-01", "current", ["ETH"], "a")])
         for values in ({}, {"start_time": "2025-01-01"},
@@ -249,19 +290,51 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         pd.testing.assert_frame_equal(backend.tables["first"], source_before)
 
     def test_impact_validates_each_response_once_and_retries_invalid_output(self):
+        for invalid in ({}, dict(impact_result(), direction="看涨")):
+            with self.subTest(invalid=invalid):
+                backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
+                self.relate(backend)
+                calls = []
+                def handler(request):
+                    calls.append(request)
+                    return success(json.dumps(invalid if len(calls) == 1 else impact_result()))
+                with patch("common.validation.validate_impact_output", wraps=validate_impact_output) as validate, \
+                        self.assertLogs("common.network", level="WARNING") as logs:
+                    result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), validator=validate,
+                                        network_factory=self.factory(handler))
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(validate.call_count, 2)
+                self.assertEqual(request_text(calls[0]), request_text(calls[1]))
+                self.assertEqual(result.http_attempts_started, 2)
+                self.assertEqual(result.new_completed, 1)
+                retry = next(line for line in logs.output if "业务输出无效，准备重试" in line)
+                self.assertIn("原因=", retry)
+                self.assertIn("direction" if invalid else "五个经济影响字段", retry)
+
+    def test_invalid_impact_enum_exhausts_budget_and_preserves_final_response(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         self.relate(backend)
+        self.document["run"]["max_attempts"] = 2
+        raw = json.dumps(dict(impact_result(), execution_stage="已发生"), ensure_ascii=False)
         calls = []
         def handler(request):
             calls.append(request)
-            return success("{}" if len(calls) == 1 else json.dumps(impact_result()))
-        with patch("common.validation.validate_impact_output", wraps=validate_impact_output) as validate:
-            result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), validator=validate,
+            return success(raw, usage={"total_tokens": len(calls)})
+        with self.assertLogs("common.network", level="WARNING") as logs:
+            result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
                                 network_factory=self.factory(handler))
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(validate.call_count, 2)
-        self.assertEqual(result.http_attempts_started, 2)
-        self.assertEqual(result.new_completed, 1)
+        self.assertEqual((result.failed, result.new_completed, result.http_attempts_started), (1, 0, 2))
+        row = backend.tables["result"].iloc[0]
+        self.assertEqual((row["round2_status"], row["round3_status"]), ("1", "-1"))
+        self.assertIn("execution_stage", row["error_message"])
+        self.assertIn("已完成", row["error_message"])
+        saved = json.loads(row["round3_ai_response"])
+        self.assertEqual(saved["ai_response_content"], raw)
+        self.assertEqual(saved["attempts"], 2)
+        self.assertEqual(saved["usage"], {"total_tokens": 2})
+        final = next(line for line in logs.output if "单任务请求最终失败" in line)
+        self.assertIn("原因=第三轮 execution_stage 枚举不合法", final)
+        self.assertNotIn("测试中的机制说明", "\n".join(logs.output))
 
     def test_interrupted_third_claim_preserves_second_and_resumes(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])

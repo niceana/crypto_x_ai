@@ -106,7 +106,7 @@ round3事件影响分析 → 本范围第二轮完成检查 → 事件输入 →
 - `common.config.load_job_config`、`load_event_config`、`load_ai_config` 分别加载任务、事件及 AI 配置；不会因为共用模块而提前读取 AI 配置。
 - `common.config.load_embedding_config` 加载向量服务及阈值配置；`round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings)` 读取原键、event 和表内向量，按批生成缺失或标识不匹配的向量，调用 `EventRecordStore.save_embeddings` 只更新 embedding 列。保存完成后才认领关联，评分对象接收 current/searchable 并返回 RetrievalSelection。生成向量不代表关联完成，业务阶段只做内存比较，round3事件影响分析不修改或发送向量。
 - `common.event_context.build_relation_input(current, candidates)` 返回 `(text, candidate_event_ids)`：text 为 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。candidate_event_ids 为本次短编号到真实 event_id 的映射；起点或最早可用披露与全部 update 按原顺序提供，同一披露不重复发送。`build_impact_input(store, key)` 组织 asset、event 两个必填字段，仅在有内容时附带 new_information；`common.ai_protocol.render_payload` 只把文本填入请求模板。
-- `common.validation.validate_extraction_output`、`validate_relation_output`、`validate_impact_output` 分别检查三轮输出；`validate_relation_output(content, candidate_event_ids)` 校验 AI 的 matched_candidate_id，再返回带真实 matched_event_id 的内部结果，保存和数据库结构不变。每个 RequestJob 独立持有输入及映射，所有请求重试复用；round3事件影响分析保留五字段非空文本检查及 validator 注入接口。
+- `common.validation.validate_extraction_output`、`validate_relation_output`、`validate_impact_output` 分别检查三轮输出；`validate_relation_output(content, candidate_event_ids)` 校验 AI 的 matched_candidate_id，再返回带真实 matched_event_id 的内部结果，保存和数据库结构不变。每个 RequestJob 独立持有输入及映射，所有请求重试复用；round3事件影响分析检查五字段非空文本及前四字段严格枚举，保留 validator 注入接口。
 
 第二轮 update 的 new_information 承担第三轮所需的事实对照：结合唯一匹配组历史写清此前已知状态或数值，再依据当前 event 写出本次变化、当前状态和关键条件。只带入解释变化必需的旧事实，不将旧事实重新当作新增；未知旧值或本次未披露的执行情况明确说明，不补造。第三轮只接收 asset、event、new_information，因此第二轮不能只留下“获批”“额度提高”等短摘要。输出仍为原三字段和字符串，数据库不变；格式校验不能替代真实样本的语义质量验收，已完成结果不自动重算。详细规则及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
 
@@ -136,4 +136,4 @@ round2事件去重归组同刻记录不互用本时刻结果；普通最终失�
 - [真实接入和规模验证待办](docs/IMPLEMENTATION_ISSUES.md)
 - [研究总计划](docs/plans/项目总计划书.md)、[三轮业务计划](docs/plans/第一轮+第二轮+第三轮计划.md)
 
-全表按列摘要读取使用用户确认的 `cli.read(..., start_time='', end_time='', columns=[hash_column])`，返回 DataFrame，空日期表示全表；读取失败时停止，不回退整表读取。纯向量评分器及第二、三轮正式提示词已配置。第三轮 system 位于 configs/round3_ai_config.yaml，规定本次事件或新增事实的五字段定性判断及枚举取值，包含三个固定 JSON 示例；代码仍仅校验五字段非空字符串。真实 AI/Embedding 接口、模型、认证和第一轮正式提示词仍待配置或接入，召回、归组及经济评分质量须用真实样本验证。调整某轮提示词会改变该轮 config_hash，已有不同摘要继续按原规则停止，不自动覆盖旧结果或重算。
+全表按列摘要读取使用用户确认的 `cli.read(..., start_time='', end_time='', columns=[hash_column])`，返回 DataFrame，空日期表示全表；读取失败时停止，不回退整表读取。纯向量评分器及第二、三轮正式提示词已配置。第三轮 system 位于 configs/round3_ai_config.yaml，规定当前完整事件的五字段定性判断及枚举取值，使用 execution_stage 表示执行阶段、persistence 表示影响持续时间；代码已校验五字段非空字符串及前四字段严格枚举，无效输出使用原请求预算重试。真实 AI/Embedding 接口、模型、认证和第一轮正式提示词仍待配置或接入，召回、归组及经济评分质量须用真实样本验证。调整某轮提示词会改变该轮 config_hash，已有不同摘要继续按原规则停止，不自动覆盖旧结果或重算。

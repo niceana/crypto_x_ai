@@ -1,4 +1,4 @@
-"""round3事件影响分析独立分析和并发调度；评分口径由待配置提示词与校验接口提供。"""
+"""round3事件影响分析独立分析和并发调度；按正式提示词校验五字段与枚举。"""
 
 import logging
 from collections import deque
@@ -68,8 +68,13 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
     if start > end:
         raise ValueError("start_time 不能晚于 end_time")
     ranges = tuple(month_ranges(start, end))
+    logger.info("round3事件影响分析启动准备：起点=%s，终点=%s，分段数=%d；先检查整个范围的第二轮状态，再恢复第三轮状态",
+                settings.start_time, settings.end_time, len(ranges))
     summary, needs_ai = _prepare_impact(cli, settings, ai_config.run if ai_config else None, ranges)
+    logger.info("round3事件影响分析启动准备完成：任务数=%d，已有完成=%d，待处理数=%d，失败数=%d，处理中数=%d",
+                summary.total, summary.already_completed, summary.pending, summary.failed, summary.processing)
     if not needs_ai:
+        logger.info("round3事件影响分析本范围无需调用 AI，返回当前任务统计")
         return summary
     config = ai_config or load_ai_config(settings.round3_ai_config_path)
     require_prompts(config)

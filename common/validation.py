@@ -25,7 +25,16 @@ RESULT_COLUMNS = ["event_id", "event", "asset", "source_post_id", "event_relatio
 HASH_COLUMNS = ["round2_config_hash", "round3_config_hash"]
 
 
-IMPACT_FIELDS = ["direction", "materiality", "certainty", "persistence", "materiality_reason"]
+IMPACT_FIELDS = ["direction", "materiality", "execution_stage", "persistence", "materiality_reason"]
+
+
+# 与 configs/round3_ai_config.yaml 的“输出要求”保持一致。
+IMPACT_ENUMS = {
+    "direction": ("利好", "利空", "中性", "不确定"),
+    "materiality": ("高", "中", "低", "不确定"),
+    "execution_stage": ("未开始", "执行中", "已完成", "不确定"),
+    "persistence": ("短期", "中期", "长期", "不确定"),
+}
 
 
 INPUT_COLUMNS = ["event", "asset", "source_post_id"]
@@ -195,14 +204,21 @@ def validate_relation_output(content, candidate_event_ids):
 
 
 def validate_impact_output(content):
-    """先校验五字段结构和文本类型；具体评分枚举可通过调用接口替换校验。"""
+    """按第三轮提示词校验五字段、非空文本和四项枚举，不改写原回答。"""
     try:
         value = parse_strict_json(content) if isinstance(content, str) else content
-        if not isinstance(value, dict) or set(value) != set(IMPACT_FIELDS):
-            raise ValueError("第三轮须恰好返回五个经济影响字段")
+        if not isinstance(value, dict):
+            raise ValueError("第三轮须恰好返回五个经济影响字段，JSON 根值须为对象；实际类型={}".format(type(value).__name__))
+        if set(value) != set(IMPACT_FIELDS):
+            missing = [name for name in IMPACT_FIELDS if name not in value]
+            extra = [name for name in value if name not in IMPACT_FIELDS]
+            raise ValueError("第三轮须恰好返回五个经济影响字段；缺少={}；多出={}".format(missing, extra))
         if any(not isinstance(value[name], str) or not value[name].strip() for name in IMPACT_FIELDS):
             raise ValueError("第三轮经济影响字段须为非空字符串")
+        for name, choices in IMPACT_ENUMS.items():
+            if value[name] not in choices:
+                raise ValueError("第三轮 {} 枚举不合法，只能选择：{}".format(name, "、".join(choices)))
         json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
         return dict(value)
-    except (ValueError, TypeError, UnicodeError) as exc:
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
         raise OutputValidationError(str(exc)) from exc

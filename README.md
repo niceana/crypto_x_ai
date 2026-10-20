@@ -65,7 +65,7 @@ python -X utf8 -m entrypoints.run_round3
 
 `main.py` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 job_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
 
-当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第二、三轮 system 均已配置正式提示词。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词应按 asset、event 及可选的 new_information 分析本次事件或信息增量。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
+当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第二、三轮 system 均已配置正式提示词。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词始终分析当前完整 event，new_information 仅辅助理解事件进展和新旧变化。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
 
 round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时round1事件提取结果保留，重新运行同范围可跳过成功帖 AI 并补导。没有成功帖时不创建事件去重分析表。
 
@@ -103,7 +103,7 @@ history_lookback_years: 5
 
 每条披露按自身发布时间 t 检索 `[t-5年, t)`，包含下界、排除同刻与未来。普通历史不读取 5 年下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID 和窗口内进展；内部 first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。第二轮 AI 只接收 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 来自对应 df 的 date 索引值，以字符串保留完整精度和时区；不发送真实 event_id、资产、披露标识、增量、次数或截断标记。窗口内起点或最早可用披露与全部 update 的完整 event 按顺序保留。AI 返回 matched_candidate_id，程序校验并映射回真实 event_id 后保存；每个请求独立使用 E1、E2 等编号，重试沿用原输入和映射，数据库结构不变。第三轮不接收组历史，仅使用本条记录的事件输入。输入例子及边界见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
 
-第三轮先按配置范围读任务，无任务或全部完成时直接返回。检查整个范围的第二轮状态和本条基本关联后，恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new 分析整个 event，update 以第二轮提炼的新增事实为重点，repeat 跳过。第三轮不读组历史、原帖或元数据，不再要求历史窗口内有披露或回查组起点。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+第三轮先按配置范围读任务，无任务或全部完成时直接返回。检查整个范围的第二轮状态和本条基本关联后，恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new/update 均分析当前完整 event，new_information 辅助理解进展，repeat 跳过。第三轮不读组历史、原帖或元数据，不再要求历史窗口内有披露或回查组起点。新回答须为恰好五字段的合法 JSON，五字段均为非空字符串，前四字段严格使用正式提示词规定的枚举；不合规则按原请求预算重试，耗尽后标记本条失败。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
 
 按事件组最高余弦分数筛选，只将分数大于等于 similarity_threshold 的最多 10 组交round2事件去重归组；无历史或所有组都低于阈值时直接 new，继续round3事件影响分析。默认阈值 0.50 是待真实样本标定的试运行起点，可在 Embedding 配置调整：
 
@@ -113,9 +113,9 @@ similarity_threshold: 0.50
 
 调高阈值会增加直接判新，调低会增加round2事件去重归组调用；更改只影响待处理记录，不自动重算已完成关联。Embedding 或向量保存失败停止本轮；存储重试不重复请求向量。自定义检索可用 retriever 的 `模块:函数` 覆盖，应用也可直接注入函数。完整格式与失败规则见 [表内向量与阈值方案](docs/plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
-第二轮正式提示词位于 `configs/round2_ai_config.yaml`，关系选择和新增信息填写融入“判断同一具体事项”“识别新增事实”两个步骤，保留 `# ***标题***` 和四种关系的固定 JSON 输出示例，user 为 `{{task.text}}`；第三轮正式提示词已写入 `configs/round3_ai_config.yaml`，按本次事件或增量分析五个经济字段；两轮真实接口、模型仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。调整任一轮提示词会改变该轮 config_hash；已有不同摘要仍按原规则停止，不自动覆盖或重算历史结果。
+第二轮正式提示词位于 `configs/round2_ai_config.yaml`，关系选择和新增信息填写融入“判断同一具体事项”“识别新增事实”两个步骤，保留 `# ***标题***` 和四种关系的固定 JSON 输出示例，user 为 `{{task.text}}`；第三轮正式提示词已写入 `configs/round3_ai_config.yaml`，按当前完整事件分析五个经济字段；两轮真实接口、模型仍待配置。三轮共有的全表按列摘要读取 `common.store.read_stage_hashes` 使用 `cli.read(path, start_time='', end_time='', columns=[hash_column])`，从返回的 DataFrame 中取摘要列原值；首次认领前核对一次，跨月复用，读取失败时停止。调整任一轮提示词会改变该轮 config_hash；已有不同摘要仍按原规则停止，不自动覆盖或重算历史结果。
 
-update 的 new_information 须独立说明此前已知状态、本次变化及当前状态和条件，不能只写“获批”“金额提高”。旧状态引用唯一匹配组历史，新事实引用当前 event；未知部分说明未披露，不补造，累计总值与本次新增量分清。第三轮不读取历史，依赖这段对照判断本次变化的影响。完整要求及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)；程序的非空字符串校验不能代替真实样本的语义质量验证。
+update 的 new_information 须独立说明此前已知状态、本次变化及当前状态和条件，不能只写“获批”“金额提高”。旧状态引用唯一匹配组历史，新事实引用当前 event；未知部分说明未披露，不补造，累计总值与本次新增量分清。第三轮不读取历史，用这段对照辅助理解当前事件的进展。完整要求及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)；程序的非空字符串校验不能代替真实样本的语义质量验证。
 
 ## 只读观察已完成批次的相似度
 

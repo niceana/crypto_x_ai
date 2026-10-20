@@ -11,7 +11,6 @@ from common.network import NetworkWorker
 from common.config import EventConfig
 from round2.retrieval import RetrievalSelection
 from round2.runner import run_relation
-from common.validation import IMPACT_FIELDS
 from initialization.event_records import expand_first_round
 from tests.support import Fixture, success
 
@@ -131,7 +130,8 @@ def new_result():
 
 
 def impact_result():
-    return dict(zip(IMPACT_FIELDS, ["利好", "中", "已发生", "一次性", "测试中的机制说明"]))
+    return {"direction": "利好", "materiality": "中", "execution_stage": "已完成",
+            "persistence": "长期", "materiality_reason": "测试中的机制说明"}
 
 
 class EventFixture(Fixture):

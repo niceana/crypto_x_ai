@@ -16,6 +16,31 @@ class NetworkTests(Fixture, unittest.TestCase):
 
         return NetworkWorker(self.config(), client_factory=create)
 
+    def test_invalid_envelope_retry_logs_reason_without_response_content(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            response = success("PRIVATE_RESPONSE_CONTENT")
+            if len(calls) == 1:
+                body = response.json()
+                body["choices"][0]["finish_reason"] = "length"
+                return httpx.Response(200, json=body)
+            return response
+        network = self.make_network(handler)
+        try:
+            with self.assertLogs("common.network", level="WARNING") as logs:
+                network.start()
+                network.submit(RequestJob(("2021-01-01", "one"), "private input", lambda content: content))
+                message = network.completions.get(timeout=2)
+            self.assertTrue(message.response.success)
+            self.assertEqual(message.http_attempts_started, 2)
+            output = "\n".join(logs.output)
+            self.assertIn("原因=回答被截断", output)
+            self.assertNotIn("PRIVATE_RESPONSE_CONTENT", output)
+            self.assertNotIn("private input", output)
+        finally:
+            network.shutdown()
+
     def test_fatal_error_closes_without_caller_check_and_keeps_final_results(self):
         for failure_kind in ("http", "code"):
             with self.subTest(failure_kind=failure_kind):

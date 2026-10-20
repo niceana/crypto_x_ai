@@ -55,13 +55,13 @@ round2事件去重归组与round3事件影响分析读取事件去重分析表�
 
 | JSON 键 | 保存内容 |
 | --- | --- |
-| `ai_response_content` | 最后一次响应可安全提取的 AI 正文，保留原文字符串；未取得正文时为 `""`。第三轮正文仍须包含 direction、materiality、certainty、persistence、materiality_reason 五个非空文本字段，校验不因合列而放宽。 |
+| `ai_response_content` | 最后一次响应可安全提取的 AI 正文，保留原文字符串；未取得正文时为 `""`。第三轮正文仍须包含 direction、materiality、execution_stage、persistence、materiality_reason 五个非空文本字段，校验不因合列而放宽。 |
 | `usage` | 最后一次响应的完整 usage 对象；缺失为 `null`，不累计前面重试的用量，也不回退使用更早响应。 |
 | `response_created` | 接口返回的 created 按既有解析规则转换为北京时间文本；缺失为 `""`。 |
 | `attempts` | 本任务本次运行实际发起的 HTTP 请求次数，包含首次请求和重试；存储重试不计入。 |
 | `created` | 每次向数据库提交该批结果前取得的当前北京时间，格式 `YYYY-MM-DD HH:mm:ss`。同批结果共用时间，存储重试时重新取时，保存成功那次提交前的值；这不是数据库服务器返回的事务提交时间。 |
 
-例如第三轮正文为 `{"direction":"利好","materiality":"中","certainty":"已发生","persistence":"一次性","materiality_reason":"减少流通供给"}`，实际仍原样保存在 round3_ai_response 的 ai_response_content 字符串内。后续研究先解析回答列，再解析正文 JSON，即可展开五个影响字段。
+例如第三轮正文为 `{"direction":"利好","materiality":"中","execution_stage":"已完成","persistence":"长期","materiality_reason":"减少流通供给"}`，实际仍原样保存在 round3_ai_response 的 ai_response_content 字符串内。后续研究先解析回答列，再解析正文 JSON，即可展开五个影响字段。
 
 第二轮 AI 正文现为 event_relation、matched_candidate_id、new_information 三字段，matched_candidate_id 使用当前请求内的 E1、E2 等短编号。程序先校验并映射回真实 event_id，数据库 event_id 列继续保存真实组 ID；round2_ai_response.ai_response_content 保留 AI 原始短编号，不改写正文。不新增列、映射表或持久状态，旧回答正文也不迁移；研究时优先使用该行 event_id，不把原始回答中的 E1 当作跨请求可用的组 ID。
 
