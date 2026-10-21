@@ -13,6 +13,7 @@ import pandas as pd
 from common.config import ai_config_hash
 from common.network import BatchRunError
 from common.persistence import BatchPersistenceError
+from common.store import EventRecordStore
 from round2.runner import run_relation
 from round3.runner import run_impact
 from common.validation import HASH_COLUMNS, validate_impact_output
@@ -120,7 +121,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         frame.loc[current, ["event_relation", "event_id", "new_information"]] = ["update", "missing-group", info]
         del backend.tables["first"]
         seen = []
-        summary = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-02", history_lookback_years=1),
+        summary = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-02", history_lookback_months=1),
                              ai_config=self.config(), network_factory=self.factory(
                                  lambda req: seen.append(json.loads(request_text(req))) or success(json.dumps(impact_result()))))
         self.assertEqual(summary.new_completed, 3)
@@ -269,7 +270,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertTrue(backend.tables["result"]["error_message"].eq("").all())
         self.assertTrue(backend.tables["result"]["round2_status"].eq("1").all())
 
-    def test_repeat_stage_complete_without_third_prompt(self):
+    def test_repeat_waits_for_third_stage_and_copies_response_without_extra_ai(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a"), ("2021-01-02", "repeat", ["ETH"], "a")])
         def handler(request):
             body = json.loads(request_text(request))
@@ -277,12 +278,16 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
                 return success(json.dumps(new_result()))
             return success(json.dumps({"event_relation": "repeat", "matched_candidate_id": body["candidates"][0]["candidate_id"], "new_information": None}))
         self.relate(backend, handler)
+        self.assertEqual(backend.tables["result"].iloc[1]["round3_status"], "0")
         source_before = backend.tables["first"].copy(deep=True)
         result = run_impact(backend, self.relation_settings(backend), ai_config=self.config(), network_factory=self.factory(lambda req: success(json.dumps(impact_result()))))
         self.assertEqual(result.http_attempts_started, 1)
-        self.assertEqual(backend.tables["result"].iloc[1]["round3_ai_response"], "")
+        self.assertEqual(result.new_completed, 2)
+        self.assertEqual(backend.tables["result"].iloc[1]["round3_ai_response"],
+                         backend.tables["result"].iloc[0]["round3_ai_response"])
         self.assertTrue(backend.tables["result"].iloc[0]["round3_config_hash"])
-        self.assertEqual(backend.tables["result"].iloc[1]["round3_config_hash"], "")
+        self.assertEqual(backend.tables["result"].iloc[1]["round3_config_hash"],
+                         backend.tables["result"].iloc[0]["round3_config_hash"])
         repeat_scope = self.settings(start_time="2021-01-02", end_time="2021-01-02")
         backend.reads.clear()
         self.assertEqual(run_impact(backend, repeat_scope).already_completed, 1)
@@ -708,3 +713,216 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
                          ("result", "2021-01-31", "2021-01-31"))
         self.assertTrue(backend.tables["result"].index.equals(index))
         self.assertEqual(backend.tables["result"].index[0][0].nanosecond, 789)
+
+
+_REPEAT_RESPONSE_COLUMNS = ["asset", "event_id", "round2_status", "round3_status",
+                            "round3_ai_response", "round3_config_hash"]
+
+
+def _saved_impact_response(reason="已有分析"):
+    return json.dumps({"ai_response_content": json.dumps(dict(impact_result(), materiality_reason=reason), ensure_ascii=False),
+                       "usage": {"total_tokens": 57}, "response_created": "2025-01-01 08:00:00",
+                       "attempts": 2, "created": "2025-01-01 08:00:01"}, ensure_ascii=False)
+
+
+class RepeatImpactTests(EventFixture, unittest.TestCase):
+    def prepare(self, posts, repeats=("repeat",)):
+        backend = self.backend(posts)
+        frame = backend.tables["result"]
+        frame["round2_status"] = "1"
+        frame["event_relation"] = "update"
+        frame["event_id"] = frame["asset"].map(lambda asset: "group:" + asset)
+        frame.loc[frame["event"].isin(repeats), "event_relation"] = "repeat"
+        return backend
+
+    def complete(self, backend, event, raw=None, **changes):
+        frame = backend.tables["result"]
+        key = frame.index[frame["event"].eq(event)][0]
+        values = {"round3_status": "1", "round3_ai_response": _saved_impact_response(event) if raw is None else raw,
+                  "round3_config_hash": ai_config_hash(self.config())}
+        values.update(changes)
+        for column, value in values.items():
+            frame.at[key, column] = value
+        return key
+
+    def run_repeats(self, backend, start, end=None, **kwargs):
+        return run_impact(backend, self.settings(start_time=start, end_time=end or start),
+                          network_factory=lambda config: self.fail("repeat 不能请求模型"), **kwargs)
+
+    def test_second_round_repeat_preserves_all_third_round_fields(self):
+        for status in ("0", "1", "9", "-1"):
+            with self.subTest(status=status):
+                backend = self.prepare([("2025-01-02", "repeat", ["ETH"], "a")])
+                key = self.complete(backend, "repeat", round3_status=status)
+                before = backend.tables["result"].loc[key, ["round3_status", "round3_ai_response", "round3_config_hash"]].copy()
+                store = EventRecordStore(backend, self.settings())
+                store.save_relation(key, {"event_relation": "repeat", "matched_event_id": "group:ETH", "new_information": None})
+                pd.testing.assert_series_equal(backend.tables["result"].loc[key, before.index], before)
+                self.assertFalse(set(before.index) & set(backend.updates[-1].columns))
+
+    def test_repeat_only_copies_exact_response_outside_three_months_without_ai_config(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-10-21", "repeat", ["ETH"], "a")])
+        source = self.complete(backend, "source")
+        before = backend.tables["result"].loc[source].copy()
+        with patch("round3.runner.load_ai_config", side_effect=AssertionError("继承不需要 AI 配置")):
+            result = self.run_repeats(backend, "2025-10-21")
+        row = backend.tables["result"].iloc[-1]
+        self.assertEqual((result.new_completed, result.http_attempts_started, row["round3_status"]), (1, 0, "1"))
+        self.assertEqual(row["round3_ai_response"], before["round3_ai_response"])
+        self.assertEqual(row["round3_config_hash"], before["round3_config_hash"])
+        pd.testing.assert_series_equal(backend.tables["result"].loc[source], before)
+        self.assertTrue(backend.column_reads)
+        self.assertTrue(all(columns == _REPEAT_RESPONSE_COLUMNS for _, _, _, columns in backend.column_reads))
+        self.assertTrue(all(start and end for _, start, end in backend.reads))
+
+    def test_latest_valid_response_skips_bad_failed_unfinished_other_groups_same_time_and_future(self):
+        backend = self.prepare([
+            ("2025-01-01", "old", ["ETH"], "a"),
+            ("2025-01-02", "latest-valid", ["ETH"], "a"),
+            ("2025-01-03", "invalid", ["ETH"], "a"),
+            ("2025-01-03 01:00:00", "failed", ["ETH"], "a"),
+            ("2025-01-03 02:00:00", "unfinished-round2", ["ETH"], "a"),
+            ("2025-01-04", "other-asset", ["BTC"], "a"),
+            ("2025-01-04 01:00:00", "other-group", ["ETH"], "a"),
+            ("2025-01-05 12:00:00", "same-time", ["ETH"], "a"),
+            ("2025-01-05 12:00:00", "repeat", ["ETH"], "a"),
+            ("2025-01-06", "future", ["ETH"], "a"),
+        ])
+        for event in ("old", "latest-valid", "same-time", "future"):
+            self.complete(backend, event)
+        self.complete(backend, "other-asset", event_id="group:ETH")
+        self.complete(backend, "invalid", raw='{"ai_response_content":"{}"}')
+        self.complete(backend, "failed", round3_status="-1")
+        self.complete(backend, "unfinished-round2", round2_status="0")
+        self.complete(backend, "other-group", event_id="another-group")
+        result = self.run_repeats(backend, "2025-01-05")
+        row = backend.tables["result"].loc[backend.tables["result"]["event"].eq("repeat")].iloc[0]
+        self.assertEqual(result.new_completed, 1)
+        self.assertEqual(row["round3_ai_response"], _saved_impact_response("latest-valid"))
+
+    def test_history_reads_stop_after_finding_recent_valid_sources(self):
+        backend = self.prepare([("2010-01-01", "very-old", ["ETH"], "a"),
+                                ("2025-04-30", "source", ["ETH"], "a"),
+                                ("2025-05-01", "repeat", ["ETH"], "a")])
+        self.complete(backend, "very-old")
+        self.complete(backend, "source")
+        self.assertEqual(self.run_repeats(backend, "2025-05-01").new_completed, 1)
+        self.assertEqual([(start, end) for _, start, end, _ in backend.column_reads],
+                         [("2025-04-01", "2025-04-30")])
+
+    def test_no_valid_source_marks_failure_then_can_resume_after_source_is_ready(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-01-02", "repeat", ["ETH"], "a")])
+        result = self.run_repeats(backend, "2025-01-02")
+        row = backend.tables["result"].iloc[-1]
+        self.assertEqual((result.failed, row["round3_status"], row["round3_ai_response"]), (1, "-1", ""))
+        self.assertIn("严格早于", row["error_message"])
+        self.complete(backend, "source")
+        again = self.run_repeats(backend, "2025-01-02")
+        self.assertEqual((again.new_completed, again.failed, again.http_attempts_started), (1, 0, 0))
+        self.assertEqual(backend.tables["result"].iloc[-1]["error_message"], "")
+
+    def test_same_time_and_future_sources_cannot_satisfy_repeat(self):
+        for source_time in ("2025-01-02 12:00:00", "2025-01-02 12:00:01"):
+            with self.subTest(source_time=source_time):
+                backend = self.prepare([(source_time, "source", ["ETH"], "a"),
+                                        ("2025-01-02 12:00:00", "repeat", ["ETH"], "a")])
+                self.complete(backend, "source")
+                self.assertEqual(self.run_repeats(backend, "2025-01-02").failed, 1)
+
+    def test_same_time_repeats_share_prior_source_even_with_single_row_storage_batches(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-01-02", "r1", ["ETH"], "a"),
+                                ("2025-01-02", "r2", ["ETH"], "a")], repeats=("r1", "r2"))
+        self.complete(backend, "source")
+        self.document["run"]["batch_size"] = 1
+        result = self.run_repeats(backend, "2025-01-02", ai_config=self.config())
+        self.assertEqual((result.new_completed, result.failed), (2, 0))
+        self.assertEqual(list(backend.tables["result"].iloc[1:]["round3_ai_response"]), [_saved_impact_response("source")] * 2)
+
+    def test_completed_repeat_is_an_eligible_source_and_ties_use_largest_record_id(self):
+        backend = self.prepare([("2025-01-01", "one", ["ETH"], "a"),
+                                ("2025-01-01", "two", ["ETH"], "a"),
+                                ("2025-01-02", "repeat", ["ETH"], "a")], repeats=("two", "repeat"))
+        self.complete(backend, "one")
+        self.complete(backend, "two")
+        self.assertEqual(self.run_repeats(backend, "2025-01-02").new_completed, 1)
+        self.assertEqual(backend.tables["result"].iloc[-1]["round3_ai_response"], _saved_impact_response("two"))
+
+    def test_monthly_ai_results_are_saved_before_repeats_and_future_analysis_is_excluded(self):
+        backend = self.prepare([("2025-01-31 12:00:00", "before", ["ETH"], "a"),
+                                ("2025-01-31 13:00:00", "r1", ["ETH"], "a"),
+                                ("2025-01-31 14:00:00", "after", ["ETH"], "a"),
+                                ("2025-02-01 00:00:00", "r2", ["ETH"], "a")], repeats=("r1", "r2"))
+        calls = []
+        def handler(request):
+            event = json.loads(request_text(request))["event"]
+            calls.append(event)
+            return success(json.dumps(dict(impact_result(), materiality_reason=event)))
+        result = run_impact(backend, self.settings(start_time="2025-01-31", end_time="2025-02-01"),
+                            ai_config=self.config(), network_factory=self.factory(handler))
+        frame = backend.tables["result"].set_index("event")
+        self.assertEqual((result.new_completed, result.http_attempts_started), (4, 2))
+        self.assertCountEqual(calls, ["before", "after"])
+        self.assertEqual(frame.at["r1", "round3_ai_response"], frame.at["before", "round3_ai_response"])
+        self.assertEqual(frame.at["r2", "round3_ai_response"], frame.at["after", "round3_ai_response"])
+
+    def test_failed_ai_source_is_not_copied_to_a_later_repeat(self):
+        backend = self.prepare([("2025-01-01", "failed", ["ETH"], "a"),
+                                ("2025-01-02", "repeat", ["ETH"], "a")])
+        self.document["run"]["max_attempts"] = 1
+        result = run_impact(backend, self.settings(start_time="2025-01-01", end_time="2025-01-02"),
+                            ai_config=self.config(), network_factory=self.factory(lambda req: success("{}")))
+        self.assertEqual((result.failed, result.http_attempts_started), (2, 1))
+        self.assertTrue(backend.tables["result"]["round3_status"].eq("-1").all())
+
+    def test_storage_retries_copy_exact_source_without_changing_usage_attempts_or_created(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-01-02", "repeat", ["ETH"], "a")])
+        self.complete(backend, "source")
+        writes = []
+        def hook(path, frame):
+            writes.append(frame.copy(deep=True))
+            if len(writes) == 1:
+                raise RuntimeError("本批未写入")
+            backend.apply(path, frame)
+        backend.update_hook = hook
+        result = self.run_repeats(backend, "2025-01-02", ai_config=self.config())
+        self.assertEqual((result.new_completed, result.http_attempts_started, len(writes)), (1, 0, 2))
+        self.assertEqual([frame.iloc[0]["round3_ai_response"] for frame in writes], [_saved_impact_response("source")] * 2)
+
+    def test_storage_exhaustion_leaves_repeat_pending_and_stops_next_month(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-01-31", "r1", ["ETH"], "a"),
+                                ("2025-02-01", "r2", ["ETH"], "a")], repeats=("r1", "r2"))
+        self.complete(backend, "source")
+        def fail(path, frame):
+            raise RuntimeError("本批未写入")
+        backend.update_hook = fail
+        with self.assertRaises(BatchPersistenceError):
+            self.run_repeats(backend, "2025-01-31", "2025-02-01", ai_config=self.config())
+        self.assertTrue(backend.tables["result"].iloc[1:]["round3_status"].eq("0").all())
+
+    def test_history_read_failure_is_not_treated_as_empty_history(self):
+        backend = self.prepare([("2025-01-01", "source", ["ETH"], "a"),
+                                ("2025-01-02", "repeat", ["ETH"], "a")])
+        self.complete(backend, "source")
+        read = backend.read
+        def fail(path, start_time=None, end_time=None, columns=None):
+            if columns == _REPEAT_RESPONSE_COLUMNS:
+                raise RuntimeError("历史读取失败")
+            return read(path, start_time, end_time, columns)
+        with patch.object(backend, "read", side_effect=fail), self.assertRaisesRegex(RuntimeError, "历史读取失败"):
+            self.run_repeats(backend, "2025-01-02")
+        self.assertFalse(backend.updates)
+
+    def test_strict_time_boundary_preserves_timezone_and_nanoseconds(self):
+        current = pd.Timestamp("2025-01-02 12:00:00.123456789", tz="Asia/Shanghai")
+        backend = self.prepare([(current - pd.Timedelta(1, "ns"), "source", ["ETH"], "a"),
+                                (current, "repeat", ["ETH"], "a")])
+        self.complete(backend, "source")
+        before = backend.tables["result"].index.copy()
+        self.assertEqual(self.run_repeats(backend, "2025-01-02").new_completed, 1)
+        self.assertTrue(backend.tables["result"].index.equals(before))
+        self.assertEqual(backend.tables["result"].iloc[-1]["round3_ai_response"], _saved_impact_response("source"))

@@ -20,7 +20,7 @@ class RuntimeTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.configs = self.root / "configs"
         self.configs.mkdir()
-        self.path = self.configs / "event_config.yaml"
+        self.path = self.configs / "event_processing_config.yaml"
         self.document = {
             "first_round_task_path": "first", "result_path": "result",
             "round2_ai_config_path": "round2.yaml", "round3_ai_config_path": "round3.yaml",

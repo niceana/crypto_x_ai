@@ -36,9 +36,9 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
     def test_scoped_reads_limit_history_and_leave_outside_task_states_unchanged(self):
         backend = self.backend([
             ("2010-01-01", "very-old-gap", ["ETH"], "a"),
-            ("2020-10-01 11:59:59.999999999", "outside", ["ETH"], "a"),
-            ("2020-10-01 12:00:00", "boundary", ["ETH"], "a"),
-            ("2023-01-01", "history", ["ETH"], "a"),
+            ("2025-07-01 11:59:59.999999999", "outside", ["ETH"], "a"),
+            ("2025-07-01 12:00:00", "boundary", ["ETH"], "a"),
+            ("2025-08-01", "history", ["ETH"], "a"),
             ("2025-10-01 12:00:00", "current", ["ETH"], "a"),
             ("2026-01-01", "other-completed", ["BTC"], "a"),
             ("2026-01-01", "later-pending", ["ETH"], "a"),
@@ -57,7 +57,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                                             or success(json.dumps(new_result()))))
         self.assertEqual((summary.total, summary.new_completed), (1, 1))
         self.assertEqual(backend.reads, [("result", "2025-10-01", "2025-10-01"),
-                                       ("result", "2020-10-01", "2025-09-30")])
+                                       ("result", "2025-07-01", "2025-09-30")])
         self.assertIn(("result", "2025-10-02", "2026-01-01", ["asset", "round2_status"]), backend.column_reads)
         self.assertEqual([group["history"] for group in seen[0]["candidates"]],
                          [[{"published_at": str(keys[name][0]), "event": name}] for name in ("boundary", "history")])
@@ -88,7 +88,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
     def test_history_read_failure_stops_without_full_table_fallback_or_claim(self):
         backend = self.backend([("2021-01-01", "current", ["ETH"], "a")])
         def fail_history(path, start, end):
-            if start == "2016-01-01":
+            if start == "2020-10-01":
                 raise RuntimeError("history read failed")
         backend.read_hook = fail_history
         with self.assertRaisesRegex(RuntimeError, "history read failed"):
@@ -122,7 +122,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
 
     def test_repeat_only_truncated_group_preserves_comparable_fact_and_group_id(self):
         backend = self.backend([("2010-01-01", "unread-origin", ["ETH"], "a"),
-                                ("2024-01-01", "recent-repeat-fact", ["ETH"], "a"),
+                                ("2024-12-01", "recent-repeat-fact", ["ETH"], "a"),
                                 ("2025-01-01", "current", ["ETH"], "a")])
         frame = backend.tables["result"]
         root, repeat, current = frame.index
@@ -136,14 +136,14 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                               network_factory=self.factory(relation))
         group = seen[0]["candidates"][0]
         self.assertEqual(group, {"candidate_id": "E1", "history": [
-            {"published_at": "2024-01-01 00:00:00", "event": "recent-repeat-fact"}]})
+            {"published_at": "2024-12-01 00:00:00", "event": "recent-repeat-fact"}]})
         self.assertEqual(result.new_completed, 1)
         self.assertEqual(frame.at[current, "event_id"], root[1])
-        self.assertEqual(frame.at[current, "round3_status"], "1")
+        self.assertEqual(frame.at[current, "round3_status"], "0")
         self.assertEqual(frame.at[root, "round2_status"], "0")
 
     def test_multiyear_run_uses_each_disclosure_time_for_history_window(self):
-        backend = self.backend([("2018-01-01", "history", ["ETH"], "a"),
+        backend = self.backend([("2019-11-01", "history", ["ETH"], "a"),
                                 ("2020-01-01", "early", ["ETH"], "a"),
                                 ("2026-01-01", "late", ["ETH"], "a")])
         frame = backend.tables["result"]
@@ -180,7 +180,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(seen[0]["candidates"], [{"candidate_id": "E1", "history": [
             {"published_at": "2021-01-01 00:00:00", "event": "origin"}]}])
         self.assertEqual(backend.reads, [("result", "2021-01-02", "2021-01-02"),
-                                       ("result", "2016-01-02", "2021-01-01")])
+                                       ("result", "2020-10-02", "2021-01-01")])
         self.assertEqual(seen[0]["current"], {"published_at": "2021-01-02 00:00:00", "event": "update"})
 
     def test_unconfigured_retrieval_and_prompts_do_not_claim(self):
@@ -219,7 +219,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual(execute["candidates"][0]["history"], [
             {"published_at": "2021-01-01 00:00:00", "event": "plan"},
             {"published_at": "2021-01-02 00:00:00", "event": "approve"}])
-        self.assertEqual(backend.tables["result"].iloc[-1]["round3_status"], "1")
+        self.assertEqual(backend.tables["result"].iloc[-1]["round3_status"], "0")
         self.assertTrue(all(value == threading.get_ident() for value in backend.threads))
         previous = len(seen)
         again = run_relation(backend, self.relation_settings(backend))

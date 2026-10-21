@@ -14,8 +14,8 @@ class EventHistory:
     groups 保存已载入的组事实，启用 truncate_group_history 时只输出窗口内事实
     并标记截断。加入索引前要求保存已确认，返回记录均为副本，评分函数不能改内部历史。
     """
-    def __init__(self, frame=None, history_lookback_years=5, truncate_group_history=False):
-        self.history_lookback_years = history_lookback_years
+    def __init__(self, frame=None, history_lookback_months=3, truncate_group_history=False):
+        self.history_lookback_months = history_lookback_months
         self.truncate_group_history = truncate_group_history
         self.records = defaultdict(list)
         self.groups = defaultdict(list)
@@ -71,9 +71,9 @@ class EventHistory:
         return stamp, key[1], record
 
     def get_searchable_records(self, asset, current_time):
-        """按配置日历年数二分定位同币历史窗口，只复制左闭右开区间内的事实。"""
+        """按配置日历月数二分定位同币历史窗口，只复制左闭右开区间内的事实。"""
         stamp = published_time(current_time)
-        begin = history_window_start(stamp, self.history_lookback_years)
+        begin = history_window_start(stamp, self.history_lookback_months)
         records = self.records[asset]
         # 仅用时间前缀查边界：包括下界全部同刻记录，排除上界全部同刻记录。
         left = bisect_left(records, (begin,))
@@ -83,7 +83,7 @@ class EventHistory:
     def build_group_history(self, asset, event_id, current_time):
         """按当前披露时刻组织组事实；启用截断时缺起点仍保留窗口内历史。"""
         stamp = published_time(current_time)
-        begin = history_window_start(stamp, self.history_lookback_years) if self.truncate_group_history else None
+        begin = history_window_start(stamp, self.history_lookback_months) if self.truncate_group_history else None
         values = sorted(((time, record) for time, record in self.groups[(asset, event_id)]
                          if time < stamp and (begin is None or time >= begin)),
                         key=lambda item: (item[0], item[1]["record_id"]))

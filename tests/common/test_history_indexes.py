@@ -26,52 +26,74 @@ def completed_records(posts):
 
 
 class HistoryRangeTests(unittest.TestCase):
-    def test_read_bounds_accept_unsorted_iterator_and_calendar_years(self):
+    def test_read_bounds_accept_unsorted_iterator_and_calendar_months(self):
         times = [pd.Timestamp("2026-01-01 00:00:00", tz="Asia/Shanghai"),
-                 pd.Timestamp("2024-02-29 12:00:00.123456789", tz="Asia/Shanghai")]
+                 pd.Timestamp("2024-05-31 12:00:00.123456789", tz="Asia/Shanghai")]
         before = list(times)
-        self.assertEqual(history_read_bounds(iter(times), "2024-03-01", 5),
-                         (date(2019, 2, 28), date(2024, 2, 29)))
-        self.assertEqual(history_read_bounds(iter(times), "2024-03-01", 2),
-                         (date(2022, 2, 28), date(2024, 2, 29)))
+        self.assertEqual(history_read_bounds(iter(times), "2024-06-01", 3),
+                         (date(2024, 2, 29), date(2024, 5, 31)))
+        self.assertEqual(history_read_bounds(iter(times), "2024-06-01", 15),
+                         (date(2023, 2, 28), date(2024, 5, 31)))
         self.assertEqual(times, before)
 
     def test_read_bounds_skip_empty_or_already_covered_dates_and_keep_one_day(self):
         for times, scope, expected in (
             ([], "2025-01-01", None),
-            (["2025-01-01 12:00:00"], "2020-01-01", None),
-            (["2025-01-01 12:00:00"], "2019-01-01", None),
-            (["2025-01-01 12:00:00"], "2020-01-02", (date(2020, 1, 1), date(2020, 1, 1))),
+            (["2025-01-01 12:00:00"], "2024-10-01", None),
+            (["2025-01-01 12:00:00"], "2024-01-01", None),
+            (["2025-01-01 12:00:00"], "2024-10-02", (date(2024, 10, 1), date(2024, 10, 1))),
         ):
             with self.subTest(times=times, scope=scope):
-                self.assertEqual(history_read_bounds(iter(times), scope, 5), expected)
+                self.assertEqual(history_read_bounds(iter(times), scope, 3), expected)
 
     def test_needed_history_keeps_precise_left_closed_right_open_window(self):
-        current = pd.Timestamp("2024-02-29 12:00:00.123456789", tz="Asia/Shanghai")
-        begin = pd.Timestamp("2019-02-28 12:00:00.123456789", tz="Asia/Shanghai")
+        current = pd.Timestamp("2024-05-31 12:00:00.123456789", tz="Asia/Shanghai")
+        begin = pd.Timestamp("2024-02-29 12:00:00.123456789", tz="Asia/Shanghai")
         for stamp, expected in ((begin - pd.Timedelta(1, "ns"), False), (begin, True),
                                 (current - pd.Timedelta(1, "ns"), True), (current, False),
                                 (current + pd.Timedelta(1, "ns"), False)):
             with self.subTest(stamp=stamp):
-                self.assertEqual(is_history_needed(stamp, (current,), 5), expected)
-        self.assertFalse(is_history_needed(begin, (), 5))
+                self.assertEqual(is_history_needed(stamp, (current,), 3), expected)
+        self.assertFalse(is_history_needed(begin, (), 3))
         self.assertFalse(is_history_needed(begin, (current,), 2))
 
     def test_needed_history_handles_later_tasks_and_duplicate_times_without_mutating(self):
         history = pd.Timestamp("2025-01-01 00:00:00")
-        times = [history, history, pd.Timestamp("2026-01-01 00:00:00")]
+        times = [history, history, pd.Timestamp("2025-02-01 00:00:00")]
         before = list(times)
-        self.assertTrue(is_history_needed(history, times, 5))
-        self.assertFalse(is_history_needed(history, times[:2], 5))
-        self.assertFalse(is_history_needed(pd.Timestamp("2010-01-01"), times, 5))
+        self.assertTrue(is_history_needed(history, times, 3))
+        self.assertFalse(is_history_needed(history, times[:2], 3))
+        self.assertFalse(is_history_needed(pd.Timestamp("2010-01-01"), times, 3))
         self.assertEqual(times, before)
 
-    def test_existing_cross_leap_day_limitation_is_preserved(self):
-        history = pd.Timestamp("2019-02-28 12:00:00")
-        times = [pd.Timestamp("2024-02-28 23:00:00"), pd.Timestamp("2024-02-29 01:00:00")]
-        # 用户确认本次只抽取。单独查询第二个窗口可纳入历史，既有多时点算法仍会漏掉。
-        self.assertTrue(is_history_needed(history, times[1:], 5))
-        self.assertFalse(is_history_needed(history, times, 5))
+    def test_needed_history_checks_later_clamped_month_end_windows(self):
+        history = pd.Timestamp("2024-02-29 12:00:00")
+        times = [pd.Timestamp("2024-05-29 23:00:00"), pd.Timestamp("2024-05-30 01:00:00")]
+        # 第一个窗口不包含该历史，第二天截断至同一个月末后可以纳入。
+        self.assertTrue(is_history_needed(history, times[1:], 3))
+        self.assertFalse(is_history_needed(history, times[:1], 3))
+        self.assertTrue(is_history_needed(history, times, 3))
+
+    def test_needed_history_skips_same_day_tasks_and_checks_following_days(self):
+        history = pd.Timestamp("2025-02-28 12:00:00.123456789", tz="Asia/Shanghai")
+        times = [pd.Timestamp(value, tz="Asia/Shanghai") for value in (
+            "2025-05-28 23:00:00", "2025-05-28 23:59:00", "2025-05-29 22:00:00",
+            "2025-05-30 12:00:00.123456789", "2025-05-31 01:00:00")]
+        self.assertFalse(is_history_needed(history, times[:3], 3))
+        self.assertTrue(is_history_needed(history, times[:4], 3))
+        self.assertFalse(is_history_needed(history - pd.Timedelta(days=1), times, 3))
+
+    def test_preflight_checks_history_needed_only_by_later_month_end_task(self):
+        frame = completed_records([
+            ("2024-02-29 12:00:00", "gap", "ETH"),
+            ("2024-05-29 23:00:00", "first", "ETH"),
+            ("2024-05-30 01:00:00", "second", "ETH"),
+        ])
+        gap, first, second = frame.index
+        frame["round2_status"] = "0"
+        validate_relation_history(SimpleNamespace(df=frame), [first])
+        with self.assertRaisesRegex(ValueError, gap[1]):
+            validate_relation_history(SimpleNamespace(df=frame), [first, second])
 
 
 class HistoryIndexTests(unittest.TestCase):
@@ -120,7 +142,7 @@ class HistoryIndexTests(unittest.TestCase):
 
     def test_window_preserves_precise_boundaries_assets_statuses_and_tie_order(self):
         current = pd.Timestamp("2025-10-01 12:00:00.123456789", tz="Asia/Shanghai")
-        begin = pd.Timestamp("2020-10-01 12:00:00.123456789", tz="Asia/Shanghai")
+        begin = pd.Timestamp("2025-07-01 12:00:00.123456789", tz="Asia/Shanghai")
         frame = completed_records([
             (begin - pd.Timedelta(nanoseconds=1), "outside", "ETH"),
             (begin, "boundary-a", "ETH"),
@@ -215,7 +237,7 @@ class HistoryIndexTests(unittest.TestCase):
         for problem in ("old-gap", "invalid-origin", "backfill"):
             with self.subTest(problem=problem):
                 frame = completed_records([
-                    ("2024-01-01", "old", "ETH"),
+                    ("2025-08-01", "old", "ETH"),
                     ("2025-10-01", "current", "ETH"),
                     ("2025-10-02", "later", "ETH"),
                 ])
@@ -231,18 +253,22 @@ class HistoryIndexTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, reason):
                     validate_relation_history(SimpleNamespace(df=frame), [current])
 
-    def test_calendar_year_start_keeps_leap_day_rules_timezone_and_nanoseconds(self):
-        for current, expected in (
-            ("2024-02-29 12:00:00.123456789", "2019-02-28 12:00:00.123456789"),
-            ("2025-03-01 12:00:00.123456789", "2020-03-01 12:00:00.123456789"),
+    def test_calendar_month_start_keeps_month_end_timezone_and_nanoseconds(self):
+        for current, months, expected in (
+            ("2024-05-31 12:00:00.123456789", 3, "2024-02-29 12:00:00.123456789"),
+            ("2025-05-31 12:00:00.123456789", 3, "2025-02-28 12:00:00.123456789"),
+            ("2025-01-31 12:00:00.123456789", 3, "2024-10-31 12:00:00.123456789"),
+            ("2025-03-31 12:00:00.123456789", 1, "2025-02-28 12:00:00.123456789"),
+            ("2025-05-31 12:00:00.123456789", 15, "2024-02-29 12:00:00.123456789"),
+            ("2024-02-29 12:00:00.123456789", 60, "2019-02-28 12:00:00.123456789"),
         ):
             with self.subTest(current=current):
                 stamp = pd.Timestamp(current, tz="Asia/Shanghai")
-                self.assertEqual(history_window_start(stamp, 5), pd.Timestamp(expected, tz="Asia/Shanghai"))
+                self.assertEqual(history_window_start(stamp, months), pd.Timestamp(expected, tz="Asia/Shanghai"))
 
-    def test_preflight_ignores_gaps_before_five_year_boundary_but_includes_boundary(self):
+    def test_preflight_ignores_gaps_before_three_month_boundary_but_includes_boundary(self):
         current = pd.Timestamp("2025-10-01 12:00:00.123456789", tz="Asia/Shanghai")
-        begin = pd.Timestamp("2020-10-01 12:00:00.123456789", tz="Asia/Shanghai")
+        begin = pd.Timestamp("2025-07-01 12:00:00.123456789", tz="Asia/Shanghai")
         frame = completed_records([
             (begin - pd.Timedelta(nanoseconds=1), "old-gap", "ETH"),
             (begin, "boundary-gap", "ETH"),
@@ -255,10 +281,10 @@ class HistoryIndexTests(unittest.TestCase):
         frame.at[boundary, "round2_status"] = "1"
         validate_relation_history(SimpleNamespace(df=frame), [key])
 
-    def test_preflight_does_not_verify_origins_outside_five_years(self):
+    def test_preflight_does_not_verify_origins_outside_three_months(self):
         frame = completed_records([
             ("2010-01-01", "origin", "ETH"),
-            ("2024-01-01", "update", "ETH"),
+            ("2024-12-01", "update", "ETH"),
             ("2025-01-01", "current", "ETH"),
         ])
         root, update, current = frame.index
@@ -269,17 +295,17 @@ class HistoryIndexTests(unittest.TestCase):
         validate_relation_history(SimpleNamespace(df=frame), [current])
         validate_relation_history(SimpleNamespace(df=frame.drop(index=root)), [current])
 
-    def test_history_window_uses_each_query_time_and_configured_years(self):
+    def test_history_window_uses_each_query_time_and_configured_months(self):
         frame = completed_records([
-            ("2010-01-01", "early-history", "ETH"),
-            ("2020-01-01", "recent-history", "ETH"),
+            ("2010-11-01", "early-history", "ETH"),
+            ("2020-11-01", "recent-history", "ETH"),
         ])
         history = EventHistory(frame)
         self.assertEqual([record["event"] for record in history.get_searchable_records(
             "ETH", "2011-01-01 00:00:00")], ["early-history"])
         self.assertEqual([record["event"] for record in history.get_searchable_records(
             "ETH", "2021-01-01 00:00:00")], ["recent-history"])
-        shorter = EventHistory(frame, history_lookback_years=1)
+        shorter = EventHistory(frame, history_lookback_months=1)
         self.assertEqual(shorter.get_searchable_records("ETH", "2021-01-02 00:00:00"), ())
 
     def test_position_lookup_keeps_origin_validation(self):

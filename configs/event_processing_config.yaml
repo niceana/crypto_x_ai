@@ -1,19 +1,58 @@
-# round2事件去重归组、round3事件影响分析及事件导入的共用配置。
-# first_round_task_path 是 round1帖子事件提取表，与 job_config.yaml 的 task_path 对应。
+# 事件处理配置：事件导入、round2事件去重归组、round3事件影响分析及小时权重处理。
+# first_round_task_path 是 round1帖子事件提取表，与 post_extraction_config.yaml 的 task_path 对应。
 # result_path 是两轮共用的事件去重分析表；本次保留现有配置键和实际路径值。
 # 以下路径占位文本也保持原样，填写时按上述表名区分来源和目标。
 first_round_task_path: "填写第一轮任务表路径"
 result_path: "填写统一结果表路径"
+# 小时权重表的基础路径；运行前填写，各组合追加参数后缀，后续按日期索引更新并追加。
+weight_path: ""
+# 每个有效参数组合生成独立表；persistence 暂不计分，也不参与组合展开。
+# 小时计算完成后，写库前最终时间索引整体加 8 小时；源表读取日期不变。
+# 公式：direction × (B × materiality) × (C × execution_stage) × (D × event_relation)。
+# 每个枚举各自的候选数组独立展开；先用 --dry-run 预览表名及组合数。
+weight_grid:
+  coefficients:
+    B: [1]
+    C: [1]
+    D: [1]
+  mappings:
+    direction:
+      利好: [1]
+      利空: [-1]
+      中性: [0]
+      不确定: [0]
+      其他: [0]
+    materiality:
+      高: [3]
+      中: [2]
+      低: [1]
+      不确定: [0]
+    execution_stage:
+      未开始: [1]
+      执行中: [2]
+      已完成: [3]
+      不确定: [0]
+    event_relation:
+      new: [2]
+      update: [1.5]
+      repeat: [0.5]
+    persistence:
+      短期: [1]
+      中期: [100]
+      长期: [10000]
+      不确定: [0]
+  table_name_template: "{weight_path}__B{B}_C{C}_D{D}__{param_id}"
+  max_combinations: 1000
 round2_ai_config_path: "round2_ai_config.yaml"
 round3_ai_config_path: "round3_ai_config.yaml"
-# 第二、三轮必须填写本次要处理的起止日期（YYYY-MM-DD，含首尾日），未设置会停止。
+# 第二、三轮和权重入口必须填写本次读取的起止日期（YYYY-MM-DD，含首尾日），未设置会停止。
 # 仅独立导入保留两端为空时的原有全范围规则。
 start_time: null
 end_time: null
-# 仅第二轮前史校验与候选检索使用此期限；第三轮不读取历史。
-# 按披露时刻向前推日历年，包含下界、排除当前时刻。
+# 仅第二轮前史校验、候选检索及向量准备使用此期限；第三轮 repeat 响应继承不使用此期限。
+# 按披露时刻向前推日历月，目标月没有对应日期时取月末；包含下界、排除当前时刻。
 # 不再回查窗口外的组起点和组内进展；缺少组起点时标记历史截断，已完成结果不自动重算。
-history_lookback_years: 5
+history_lookback_months: 3
 # 本项只控制独立导入入口；main.py 使用内存导入，不依赖此模式。
 initialize_mode: auto
 # 来源：用户提供的 TradeCoins 50 名单，生成于 2026-09-18。

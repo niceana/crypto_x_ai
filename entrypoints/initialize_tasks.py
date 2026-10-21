@@ -23,7 +23,7 @@ def initialize_existing_posts(cli, settings):
 def main():
     """读取任务配置，创建一次客户端，返回既有初始化函数的统计。"""
     project_root = Path(__file__).resolve().parent.parent
-    settings = load_job_config(project_root / "configs" / "job_config.yaml", ("source_path", "task_path"))
+    settings = load_job_config(project_root / "configs" / "post_extraction_config.yaml", ("source_path", "task_path"))
     if settings["source_path"] == settings["task_path"]:
         raise ValueError("源帖子路径与任务表路径必须不同")
     if "logging" in settings and not isinstance(settings["logging"], dict):

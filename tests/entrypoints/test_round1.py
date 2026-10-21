@@ -54,7 +54,7 @@ class EntryPointTests(Fixture, unittest.TestCase):
         ai_path = self.root / "configs" / "round1_ai_config.yaml"
         self.path.rename(ai_path)
         self.path = ai_path
-        self.job_path = self.root / "configs" / "job_config.yaml"
+        self.job_path = self.root / "configs" / "post_extraction_config.yaml"
         self.settings = {
             "source_path": "source-must-not-be-read",
             "task_path": "existing-task-table",
@@ -64,7 +64,7 @@ class EntryPointTests(Fixture, unittest.TestCase):
             "logging": {"level": "CRITICAL"},
         }
         self.write_job(self.settings)
-        self.event_path = self.root / "configs" / "event_config.yaml"
+        self.event_path = self.root / "configs" / "event_processing_config.yaml"
         self.event_settings = {
             "first_round_task_path": "ignored-source-path",
             "result_path": "event-result-table",

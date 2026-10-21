@@ -380,8 +380,9 @@ class EventRecordStore(TableStore):
                   "event_id": key[1] if relation == "new" else result["matched_event_id"],
                   "new_information": result["new_information"] or "",
                   "round2_ai_response": _event_response_json(response, attempts),
-                  "round2_status": "1", "error_message": "",
-                  "round3_status": "1" if relation == "repeat" else "0"}
+                  "round2_status": "1", "error_message": ""}
+        if relation != "repeat":
+            values["round3_status"] = "0"
         self.update_stage_columns([key], values, "round2", prepare_write=_stamp_event_responses)
 
     def save_embeddings(self, values):
@@ -403,27 +404,39 @@ class EventRecordStore(TableStore):
             rows.append(row)
         self.update_stage_columns([key for key, _, _ in items], rows, "round3", prepare_write=_stamp_event_responses)
 
+    def save_repeat_impact_batch(self, items):
+        """原样复制有效历史响应及其摘要；不刷新源响应元数据，不伪造 AI 请求。"""
+        rows = []
+        for key, response, digest in items:
+            rows.append({"round3_ai_response": response or "",
+                         "round3_config_hash": digest,
+                         "round3_status": "1" if response is not None else "-1",
+                         "error_message": "" if response is not None else
+                         "repeat 找不到同币种、同事件组中严格早于当前披露的有效第三轮响应"})
+        self.update_stage_columns([key for key, _, _ in items], rows, "round3")
 
-def validate_relation_history(store, keys, history_lookback_years=5, later_records=None):
-    """用内存位置索引检查指定年数内的同币前史，保留更晚完成冲突检查。
+
+def validate_relation_history(store, keys, history_lookback_months=3, later_records=None):
+    """用内存位置索引检查指定月数内的同币前史，保留更晚完成冲突检查。
 
     ID 字典和按币分组只保存原行位置；不复制完整表，不增加数据库查询。
     窗口内较早记录须全部完成；窗口外组起点不再核实，输入另行标记截断。
     later_records 仅含处理范围之后的资产与状态，用于保留补录冲突检查。
     """
-    earliest = {}
+    earliest, begins = {}, {}
     for key in keys:
         if store.df.at[key, "round2_status"] != "1":
             asset = store.df.at[key, "asset"]
             stamp = published_time(key[0])
+            begin = history_window_start(stamp, history_lookback_months)
+            if asset not in begins or begin < begins[asset]:
+                begins[asset] = begin
             if asset not in earliest or stamp < earliest[asset][0]:
                 earliest[asset] = stamp, key
     if not earliest:
         return
     record_positions = {}
     rows_by_asset = {asset: [] for asset in earliest}
-    begins = {asset: history_window_start(stamp, history_lookback_years)
-              for asset, (stamp, _) in earliest.items()}
     for frame in (store.df, later_records):
         if frame is None:
             continue

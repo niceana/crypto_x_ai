@@ -52,7 +52,7 @@ class Tables:
             return self.metadata[path]
         if path not in self.tables:
             raise DataNotFound("missing table: {}".format(path))
-        stamps = [pd.Timestamp(key[0]) for key in self.tables[path].index]
+        stamps = [pd.Timestamp(when) for when in self.tables[path].index.get_level_values(0)]
         return {"meta": {"start_time": min(stamps).isoformat() if stamps else None,
                          "end_time": max(stamps).isoformat() if stamps else None}}
 
@@ -69,7 +69,8 @@ class Tables:
         frame = self.tables[path]
         if start_time not in (None, ""):
             start, end = date.fromisoformat(start_time), date.fromisoformat(end_time)
-            frame = frame.loc[[start <= pd.Timestamp(key[0]).date() <= end for key in frame.index]]
+            frame = frame.loc[[start <= pd.Timestamp(when).date() <= end
+                               for when in frame.index.get_level_values(0)]]
         if columns is not None:
             frame = frame[columns]
         return frame.copy(deep=True)

@@ -34,7 +34,7 @@ common 包含基础能力及共用业务约定，只依赖本目录、标准库�
 
 ## 2. 配置、业务输入与请求构造
 
-common.config 按配置类别提供加载入口：load_job_config 读取round1事件提取任务 YAML 并检查调用方指定的必填字段；load_event_config 读取事件任务配置；load_ai_config 读取 AI 配置、加载同目录可选 .env，并检查模板及参数。向量配置另由下文的 load_embedding_config 加载。各入口原有的日志、路径冲突等检查继续留在调用方，顺序不变。初始化不加载 AI 配置；第二轮全部完成或无待处理任务时直接返回，第三轮只在需要分析 new/update 时加载 AI 配置。第一轮仍在读取任务表前加载并校验其 AI 配置，即使范围内任务全部成功也需要配置可加载。
+common.config 按配置类别提供加载入口：load_job_config 读取帖子提取任务配置 post_extraction_config.yaml 并检查调用方指定的必填字段；load_event_config 读取事件处理配置 event_processing_config.yaml；load_ai_config 读取 AI 配置、加载同目录可选 .env，并检查模板及参数。向量配置另由下文的 load_embedding_config 加载。各入口原有的日志、路径冲突等检查继续留在调用方，顺序不变。初始化不加载 AI 配置；第二轮全部完成或无待处理任务时直接返回，第三轮只在需要分析 new/update 时加载 AI 配置。第一轮仍在读取任务表前加载并校验其 AI 配置，即使范围内任务全部成功也需要配置可加载。
 
 配置仍位于 configs，相对 AI 配置按任务配置所在目录解析，绝对路径继续支持；环境变量优先于 .env。ai_config_hash 仍只基于原始提示词及 api.payload，URL、认证、并发和重试参数不参与摘要。
 
@@ -42,13 +42,13 @@ common.config 按配置类别提供加载入口：load_job_config 读取round1�
 
 common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.published_at、current.event 和各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event；每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。round1事件提取仍直接使用原帖正文。
 
-EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_years 定位左闭右开窗口，默认 5 个日历年。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
+EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_months 定位左闭右开窗口，默认 3 个日历月。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
 
-common.time_rules.history_read_bounds(current_times, scope_start, years) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, years) 使用已有窗口算法筛选历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责；既有闰日边界限制保留。
+common.time_rules.history_read_bounds(current_times, scope_start, months) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, months) 筛选落在任一待处理窗口内的历史。月末截断时继续检查后续日期的窗口，避免只看第一个未来任务而漏掉历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责。
 
-第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历年边界，table_date_bounds 供第二轮解析元数据。
+第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历月边界，table_date_bounds 供第二轮解析元数据。
 
-第三轮也必须配置日期。round3.runner._prepare_impact 逐月读取本范围任务，检查全部第二轮状态、本条基本关联和跨月 record_id 唯一性，不保留事件事实副本；无记录或全部完成时直接返回。整个范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮不读取原帖、历史或元数据，build_impact_input 只使用当前任务行；并发、批量保存和停止恢复沿用共用执行器。
+第三轮也必须配置日期。round3.runner._prepare_impact 逐月读取本范围任务，检查全部第二轮状态、本条基本关联和跨月 record_id 唯一性，不保留事件事实副本；无记录或全部完成时直接返回。整个范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮 build_impact_input 只使用当前任务行，不读取原帖。repeat 逻辑直接位于 round3.runner：_load_repeat_sources 为待处理 repeat 按月从近到远读取必要历史响应列与元数据，找到全部组的最近有效来源后停止；_remember_impact_response 校验来源，并用字典为每组保留一条有效响应；_complete_repeat_impacts 在本月 new/update 结果保存后按披露时间处理 repeat，排除同刻和未来，复制后才标记完成；并发、批量保存和停止恢复沿用共用执行器。
 
 common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮按配置日期读取任务和必要历史，窗口筛选及按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 

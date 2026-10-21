@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | round1事件提取 | 从每条帖子提取事件事实和代币 | round1帖子事件提取表，一帖一行 |
 | round2事件去重归组 | 判断 new/update/repeat，将同一事件的披露归组 | 事件去重分析表，一条事件 × 一个代币一行 |
-| round3事件影响分析 | 分析 new/update 的经济影响；repeat 沿用既有跳过规则 | 与 round2 共用事件去重分析表 |
+| round3事件影响分析 | 分析 new/update 的经济影响；repeat 复制同组严格此前的最近有效响应 | 与 round2 共用事件去重分析表 |
 
 “去重归组”保留每条披露记录，通过关联类型和事件组表达重复或新增信息，不删除重复披露行。本文档及运行日志采用上述名称；配置键、代码符号、表字段和实际数据系统路径保持不变。两张表的配置对应关系见 [运行说明](README.md)。历史改造记录保留当时称呼，现行命名以本节为准。
 
@@ -32,7 +32,7 @@
 
 ## 模块职责与依赖
 
-第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 5 个日历年的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_years，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 事件列表，每条包含 published_at、event。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
+第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 3 个日历月的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_months，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 事件列表，每条包含 published_at、event。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
 
 | 目录或文件 | 职责 | 主要依赖 |
 | --- | --- | --- |
@@ -55,19 +55,19 @@
 
 目录之间直接导入，例如 `from round1.runner import run_extraction`。`common` 包含基础能力及共用业务约定，不导入初始化、轮次或入口；三个轮次不互相导入。round1事件提取与round3事件影响分析共用分段执行器，round2事件去重归组保留按币和时间推进的独立调度。两种业务 Store 在同一模块内继承 TableStore，round2事件去重归组与round3事件影响分析继续写同一张事件去重分析表。
 
-第二轮使用 common.time_rules.history_read_bounds 计算所需历史范围，复用 is_history_needed 判断窗口资格，并用 common.store.read_event_history 读取和检查历史。第三轮不调用这些历史接口，仅分月读取本次范围的事件任务，并保留全范围前提检查、状态恢复、并发和保存。第二轮既有闰日窗口算法及其限制见 [实现问题](docs/IMPLEMENTATION_ISSUES.md)。
+第二轮使用 common.time_rules.history_read_bounds 计算所需历史范围，复用 is_history_needed 判断窗口资格，并用 common.store.read_event_history 读取和检查历史。第三轮不调用这些历史接口，仅分月读取本次范围的事件任务，并保留全范围前提检查、状态恢复、并发和保存。2026-10-21 改为月份窗口，并修正月末截断时后续窗口可能遗漏历史的边界，见 [实现问题](docs/IMPLEMENTATION_ISSUES.md)。
 
 ## 配置与运行环境
 
-非敏感配置集中在 `configs/`。`job_config.yaml` 指定源帖子、round1帖子事件提取表、处理范围、round1事件提取 AI 配置和日志；`event_config.yaml` 指定事件去重分析表、日期范围、映射、检索及两份 AI 配置路径。三份 AI 配置分别为 `round1_ai_config.yaml`、`round2_ai_config.yaml`、`round3_ai_config.yaml`；`embedding_config.yaml` 独立提供向量服务、批量及相似度阈值参数。各接口参数独立，不增加配置继承。
+非敏感配置集中在 `configs/`。`post_extraction_config.yaml` 用于帖子提取任务，指定源帖子、round1帖子事件提取表、处理范围、round1事件提取 AI 配置和日志；`event_processing_config.yaml` 共用于事件导入、第二三轮和小时权重处理，指定来源表、事件去重分析表、权重表、日期范围、映射、检索、两份 AI 配置路径和日志。三份 AI 配置分别为 `round1_ai_config.yaml`、`round2_ai_config.yaml`、`round3_ai_config.yaml`；`embedding_config.yaml` 独立提供向量服务、批量及相似度阈值参数。各接口参数独立，不增加配置继承。
 
-第二、三轮必须在 event_config.yaml 设置 start_time/end_time，两端包含全天，仅处理该范围内的任务。history_lookback_years 默认 5，须为正整数，仅供第二轮按披露时间回看历史；闰日回推平年取 2 月 28 日，保留时区和纳秒。第三轮不读取历史或原帖。缺失范围时不读数据库，也不默认处理全表；仅独立导入继续允许日期为空。
+第二、三轮必须在 event_processing_config.yaml 设置 start_time/end_time，两端包含全天，仅处理该范围内的任务。history_lookback_months 默认 3，须为正整数，仅供第二轮按披露时间回看历史；目标月没有对应日期时取该月末日，保留时区和纳秒。第三轮 AI 输入不含历史或原帖；repeat 另行读取必要的历史响应列用于复制。缺失范围时不读数据库，也不默认处理全表；仅独立导入继续允许日期为空。
 
-第三轮先逐月检查整个配置范围内的第二轮完成状态和本条基本关联，再恢复遗留第三轮状态，按月并发分析待处理 new/update。输入必含 asset、event；new_information 有内容才发送，空值或纯空白时省略该字段。第三轮不读取原帖、组历史或表元数据，不核实组起点；保留跨月 record_id 唯一性检查和首次认领前全表配置摘要单列核对。输出、保存和停止恢复规则见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+第三轮先逐月检查整个配置范围内的第二轮完成状态和本条基本关联，再恢复遗留第三轮状态，按月并发分析待处理 new/update。输入必含 asset、event；new_information 有内容才发送，空值或纯空白时省略该字段。第三轮不读取原帖，不核实组起点；仅在有待处理 repeat 时读取历史响应列与表元数据，继承不受第二轮月份窗口限制；保留跨月 record_id 唯一性检查和首次认领前全表配置摘要单列核对。输出、保存和停止恢复规则见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
 
 所有 YAML 配置统一使用现有的安全重复键检查加载器。字典键须为字符串，同一个字典内同名键重复时直接报错，即使两次的值相同也不允许；不同字典可以使用相同键名。例如账号映射中两次填写 BitcoinMagazine 会停止加载，不会用后一个代币覆盖前一个；任务或事件配置错误会在创建数据客户端前停止。
 
-2026-10-16 已按用户提供的 TradeCoins 50 名单（生成于 2026-09-18）填入 `event_config.yaml` 的 `user_name_to_tickers`：原 `screen_name` 作为用户名，原 `ticker` 转为单元素列表，共 50 组，保留大小写及原名单迁移备注。映射沿用现有规则，仅在导入事件的 tickers 为空时按原帖 user_name 精确匹配；实际源帖的用户名仍待核对。
+2026-10-16 已按用户提供的 TradeCoins 50 名单（生成于 2026-09-18）填入 `event_processing_config.yaml` 的 `user_name_to_tickers`：原 `screen_name` 作为用户名，原 `ticker` 转为单元素列表，共 50 组，保留大小写及原名单迁移备注。映射沿用现有规则，仅在导入事件的 tickers 为空时按原帖 user_name 精确匹配；实际源帖的用户名仍待核对。
 
 入口按自身文件位置定位项目根目录，读取 `configs`，不依赖当前工作目录。任务配置中的相对 AI 配置路径按 `configs` 目录解析；绝对路径继续支持。数据系统路径原样交给客户端。认证信息来自进程环境或与 AI 配置同目录的 `.env`，进程环境优先；默认即 `configs/.env`，示例在 `configs/.env.example`。
 
@@ -124,7 +124,7 @@ round1帖子事件提取表按原 `(date, id)` 定位，事件去重分析表按
 
 客户端 write、update_by_column、update_by_index 正常返回即本次整批写入，抛异常即本次未写入；存储整批重试与 AI 请求预算独立。运行结果仅按原索引更新目标列，数据库写入成功后才同步内存；预算耗尽停止，不在收尾额外开启保存预算。
 
-round2事件去重归组同刻记录不互用本时刻结果；普通最终失败暂停同币后续关联，其他币继续。合法 uncertain 的业务关系保存为 new，AI 原文保留；repeat 同时完成round3事件影响分析状态且第三轮回答列留空。round3事件影响分析失败只影响本条，不重做round2事件去重归组。具体边界和例子由以下规则文档维护。
+round2事件去重归组同刻记录不互用本时刻结果；普通最终失败暂停同币后续关联，其他币继续。合法 uncertain 的业务关系保存为 new，AI 原文保留；repeat 保存关联时不写第三轮状态，等待第三轮复制同币同组严格此前最近一条有效响应并标记完成。round3事件影响分析失败只影响本条，不重做round2事件去重归组。具体边界和例子由以下规则文档维护。
 
 ## 文档与验证入口
 

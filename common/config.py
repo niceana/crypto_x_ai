@@ -251,7 +251,9 @@ class EventConfig:
     initialize_mode: str = "create"
     logging: dict = None
     embedding_config_path: str = ""
-    history_lookback_years: int = 5
+    history_lookback_months: int = 3
+    weight_path: str = ""
+    weight_grid: dict = None
 
 
 def load_event_config(path):
@@ -268,6 +270,10 @@ def load_event_config(path):
             raise ValueError("{} 必须为非空字符串".format(name))
     if document["first_round_task_path"] == document["result_path"]:
         raise ValueError("第一轮表与结果表路径必须不同")
+    if not isinstance(document.get("weight_path", ""), str):
+        raise ValueError("weight_path 必须为字符串，可留空供权重入口运行前填写")
+    if "weight_grid" in document and not isinstance(document["weight_grid"], dict):
+        raise ValueError("weight_grid 必须为字典")
     start, end = document.get("start_time"), document.get("end_time")
     if (start is None) != (end is None):
         raise ValueError("起止日期必须同时设置")
@@ -290,9 +296,9 @@ def load_event_config(path):
         raise ValueError("retriever 必须为字符串")
     if not isinstance(document.get("embedding_config_path", ""), str):
         raise ValueError("embedding_config_path 必须为字符串")
-    years = document.get("history_lookback_years", 5)
-    if type(years) is not int or years <= 0:
-        raise ValueError("history_lookback_years 必须为正整数日历年数")
+    months = document.get("history_lookback_months", 3)
+    if type(months) is not int or months <= 0:
+        raise ValueError("history_lookback_months 必须为正整数日历月数")
     if document.get("initialize_mode", "create") not in ("auto", "create", "resume"):
         raise ValueError("initialize_mode 只能为 auto、create 或 resume")
     if not isinstance(document.get("logging", {}), dict):

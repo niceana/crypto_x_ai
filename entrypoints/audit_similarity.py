@@ -15,7 +15,7 @@ from round2.similarity_audit import export_similarity_audit
 def main(argv=None, cli=None):
     root = Path(__file__).absolute().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(root / "configs" / "event_config.yaml"), help="事件配置路径")
+    parser.add_argument("--config", default=str(root / "configs" / "event_processing_config.yaml"), help="事件配置路径")
     parser.add_argument("--start-time", help="本次批次起始日期，YYYY-MM-DD，需与 --end-time 同时指定")
     parser.add_argument("--end-time", help="本次批次结束日期，包含当天")
     parser.add_argument("--output-dir", help="新的本地输出目录，默认 reports/similarity_audit_北京时间")

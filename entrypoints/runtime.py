@@ -8,7 +8,7 @@ from common.config import load_event_config
 
 def run_entrypoint(operation):
     project_root = Path(__file__).absolute().parent.parent
-    settings = load_event_config(project_root / "configs" / "event_config.yaml")
+    settings = load_event_config(project_root / "configs" / "event_processing_config.yaml")
     defaults = {"level": "INFO", "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"}
     logging.basicConfig(**(settings.logging or defaults))
     logging.getLogger("httpx").setLevel(logging.WARNING)

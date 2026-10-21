@@ -82,6 +82,8 @@ class SimilarityAuditTests(unittest.TestCase):
         self.assertEqual(len(client.reads), 2)
         self.assertEqual(client.reads[0][1:3], ("2021-01-03", "2021-01-03"))
         self.assertEqual(client.reads[1][2], "2021-01-02")
+        self.assertEqual(manifest["history_lookback_months"], 3)
+        self.assertNotIn("history_lookback_years", manifest)
         self.assertTrue(all(call[3] == READ_COLUMNS for call in client.reads))
         self.assertEqual((manifest["events"], manifest["candidate_rows"]), (2, 4))
         current = self.csv(output, "events.csv")[0]
@@ -147,13 +149,13 @@ class SimilarityAuditTests(unittest.TestCase):
         self.assertTrue(all(row["candidate_groups_sent"] == "10" and row["stored_matches_excluded"] == "1"
                             for row in self.csv(output, "thresholds.csv")))
 
-    def test_calendar_year_window_includes_lower_bound_and_excludes_same_time(self):
-        self.settings = replace(self.settings, start_time="2024-02-29", end_time="2024-02-29")
+    def test_calendar_month_window_includes_lower_bound_and_excludes_same_time(self):
+        self.settings = replace(self.settings, start_time="2024-05-31", end_time="2024-05-31")
         frame = records(
-            ("2019-02-28 11:59:59", "too_old", [1, 0], "too_old", "new", "ETH"),
-            ("2019-02-28 12:00:00", "lower", [1, 0], "lower", "new", "ETH"),
-            ("2024-02-29 12:00:00", "now", [1, 0], "lower", "repeat", "ETH"),
-            ("2024-02-29 12:00:00", "same", [1, 0], "same", "new", "ETH"),
+            ("2024-02-29 11:59:59", "too_old", [1, 0], "too_old", "new", "ETH"),
+            ("2024-02-29 12:00:00", "lower", [1, 0], "lower", "new", "ETH"),
+            ("2024-05-31 12:00:00", "now", [1, 0], "lower", "repeat", "ETH"),
+            ("2024-05-31 12:00:00", "same", [1, 0], "same", "new", "ETH"),
         )
         _, output, _ = self.export(frame)
         self.assertEqual({pair["candidate_event_id"] for pair in self.csv(output, "candidates.csv")}, {"lower"})

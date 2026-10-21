@@ -43,7 +43,7 @@ class InitializationEntryPointTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / "entrypoints").mkdir()
         (self.root / "configs").mkdir()
-        self.job_path = self.root / "configs" / "job_config.yaml"
+        self.job_path = self.root / "configs" / "post_extraction_config.yaml"
         self.settings = {
             "source_path": "all-posts",
             "task_path": "new-task-table",

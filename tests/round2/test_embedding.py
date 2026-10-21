@@ -280,7 +280,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
 
     def test_time_window_includes_lower_boundary_excludes_peers_future_and_other_assets(self):
         current = pd.Timestamp("2021-01-02 12:00:00")
-        begin = pd.Timestamp("2016-01-02 12:00:00")
+        begin = pd.Timestamp("2020-10-02 12:00:00")
         backend = self.backend([(str(begin - pd.Timedelta(seconds=1)), "outside", ["ETH"], "a"),
                                 (str(begin), "boundary", ["ETH"], "a"), (str(current), "peer", ["ETH"], "a"),
                                 (str(current + pd.Timedelta(seconds=1)), "future", ["ETH"], "a"),
@@ -381,9 +381,9 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         self.assertTrue(backend.tables["result"]["round2_status"].eq("0").all())
         self.assertTrue(all(client.is_closed for client in clients))
 
-    def test_runner_encodes_years_old_update_and_does_not_read_old_origin(self):
+    def test_runner_encodes_recent_update_and_does_not_read_old_origin(self):
         backend = self.backend([("2010-01-01", "origin", ["ETH"], "a"),
-                                ("2018-01-01", "progress", ["ETH"], "a"),
+                                ("2020-12-01", "progress", ["ETH"], "a"),
                                 ("2021-01-02", "current", ["ETH"], "a")])
         frame = backend.tables["result"]
         root, update, current = frame.index
@@ -404,12 +404,12 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         self.assertEqual(candidate, {"candidate_id": "E1", "history": [
             {"published_at": str(update[0]), "event": "progress"}]})
         self.assertEqual(summary.new_completed, 1)
-        self.assertEqual(frame.loc[current, "round3_status"], "1")
+        self.assertEqual(frame.loc[current, "round3_status"], "0")
         self.assertEqual(frame.loc[root, "embedding"], "")
 
-    def test_runner_prepares_vectors_at_exact_leap_year_boundary(self):
-        current = pd.Timestamp("2024-02-29 12:00:00.123456789")
-        begin = pd.Timestamp("2019-02-28 12:00:00.123456789")
+    def test_runner_prepares_vectors_at_exact_calendar_month_boundary(self):
+        current = pd.Timestamp("2024-05-31 12:00:00.123456789")
+        begin = pd.Timestamp("2024-02-29 12:00:00.123456789")
         backend = self.backend([(str(begin - pd.Timedelta(nanoseconds=1)), "outside", ["ETH"], "a"),
                                 (str(begin), "boundary", ["ETH"], "a"),
                                 (str(current), "current", ["ETH"], "a")])
@@ -418,7 +418,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             frame.loc[key, ["event_id", "event_relation", "round2_status"]] = [key[1], "new", "1"]
         calls, seen = [], []
         handler = self.vector_handler({"boundary": [1, 0], "current": [1, 0]}, calls)
-        settings = self.settings(start_time="2024-02-29", end_time="2024-02-29", embedding_config_path="unused")
+        settings = self.settings(start_time="2024-05-31", end_time="2024-05-31", embedding_config_path="unused")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
                 patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
             result = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(
@@ -428,6 +428,26 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         self.assertEqual(seen[0]["candidates"][0]["history"], [{"published_at": str(begin), "event": "boundary"}])
         self.assertEqual(seen[0]["current"], {"published_at": str(current), "event": "current"})
         self.assertEqual(frame.iloc[0]["embedding"], "")
+
+    def test_runner_prepares_history_needed_only_by_later_month_end_window(self):
+        backend = self.backend([("2024-02-29 12:00:00", "history", ["ETH"], "a"),
+                                ("2024-05-29 23:00:00", "first", ["ETH"], "a"),
+                                ("2024-05-30 01:00:00", "second", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        root = frame.index[0]
+        frame.loc[root, ["event_id", "event_relation", "round2_status"]] = [root[1], "new", "1"]
+        calls, seen = [], []
+        handler = self.vector_handler({"history": [1, 0], "first": [0, 1], "second": [1, 0]}, calls)
+        settings = self.settings(start_time="2024-05-29", end_time="2024-05-30", embedding_config_path="unused")
+        with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
+                patch("round2.embedding._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
+            result = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(
+                lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
+        self.assertEqual(calls, [["history", "first", "second"]])
+        self.assertEqual((result.new_completed, result.http_attempts_started), (2, 1))
+        self.assertEqual(seen[0]["current"]["event"], "second")
+        self.assertEqual(seen[0]["candidates"], [{"candidate_id": "E1", "history": [
+            {"published_at": str(root[0]), "event": "history"}]}])
 
     def test_vector_write_retries_do_not_repeat_embedding_request(self):
         for fail_all in (False, True):

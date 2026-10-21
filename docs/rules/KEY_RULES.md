@@ -4,7 +4,7 @@
 
 2026-10-15 用户确认的 [存储精简方案](../history/STORAGE_SIMPLIFICATION_PLAN.md) 已实施：正常返回即整批写入，异常即未写入，保存失败整批重试、预算耗尽停止。本文正文描述当前行为；后面的接口修正、损坏数据恢复和旧测试场景作为历史记录保留。
 
-2026-10-15 主入口新增自动衔接：main.py 启动前同时校验 configs/event_config.yaml，复用一个 cli 运行round1事件提取，正常结束后自动导入实际处理范围内 status="1" 的帖子；普通失败帖子补跑成功后再导入。没有成功帖跳过导入，round1事件提取异常或中断不开始导入。导入失败不回滚已保存的round1事件提取结果；再次执行同一范围的 main.py，成功帖子跳过 AI，导入模块去重补齐任务。目标读取明确为 DataNotFound 时才 register/write，已有目标仅追加新索引。round2事件去重归组与round3事件影响分析仍分别启动，不增加round1事件提取字段。完整规则见 [事件导入](EVENT_RULES.md#3-初始化与续建)。
+2026-10-15 主入口新增自动衔接：main.py 启动前同时校验 configs/event_processing_config.yaml，复用一个 cli 运行round1事件提取，正常结束后自动导入实际处理范围内 status="1" 的帖子；普通失败帖子补跑成功后再导入。没有成功帖跳过导入，round1事件提取异常或中断不开始导入。导入失败不回滚已保存的round1事件提取结果；再次执行同一范围的 main.py，成功帖子跳过 AI，导入模块去重补齐任务。目标读取明确为 DataNotFound 时才 register/write，已有目标仅追加新索引。round2事件去重归组与round3事件影响分析仍分别启动，不增加round1事件提取字段。完整规则见 [事件导入](EVENT_RULES.md#3-初始化与续建)。
 
 以下round1事件提取日期、分段、网络和保存规则继续适用于 run_extraction。可选 on_successful_posts(new_posts, previous_posts) 回调在本月结果全部保存、结束检查通过后交出副本：new_posts 是本次调用 AI 后成功保存的帖子；previous_posts 是本月读取round1帖子事件提取表时已经 status="1"、本次跳过 AI 的帖子。两份数据只含原 date/id 及 text、user_name、status、ai_response_content，原调用方式和返回统计兼容。
 
@@ -58,7 +58,7 @@ round1事件提取不另设 active_keys 集合，也不维护成功、失败累�
 
 ## 4. AI 输入与配置变化
 
-任务配置与各轮 AI、事件及 Embedding 配置共用安全 YAML 加载器。所有字典键须为字符串，同一个字典内不允许重复键，即使值相同也报错；例如 job_config.yaml 两次设置 task_path，或 logging 下两次设置 level，都会在配置加载时停止。不同字典可使用相同键名。任务和事件配置在创建数据客户端前读取，重复键不会触发任务读写。
+任务配置与各轮 AI、事件及 Embedding 配置共用安全 YAML 加载器。所有字典键须为字符串，同一个字典内不允许重复键，即使值相同也报错；例如 post_extraction_config.yaml 两次设置 task_path，或 logging 下两次设置 level，都会在配置加载时停止。不同字典可使用相同键名。任务和事件配置在创建数据客户端前读取，重复键不会触发任务读写。
 
 AI 消息只包含配置中的提示词和单帖 `text`，不发送任务键、用户名、状态或旧结果。提示词支持 `{{task.text}}`；请求体还支持 `{{prompts.system}}`、`{{prompts.user}}`。插入的正文不再次当作模板执行，未知变量会报错。
 

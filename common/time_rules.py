@@ -2,7 +2,7 @@
 
 import json
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 
@@ -22,38 +22,48 @@ def published_time(value):
     return stamp
 
 
-def history_window_start(value, years):
-    """从披露时刻回推指定日历年，闰日取平年二月末，保留时区和纳秒。"""
+def history_window_start(value, months):
+    """从披露时刻回推日历月，目标月缺少对应日期时取月末，保留时区和纳秒。"""
     stamp = published_time(value)
-    year = stamp.year - years
-    day = min(stamp.day, monthrange(year, stamp.month)[1])
-    return stamp.replace(year=year, day=day)
+    year, month = divmod(stamp.year * 12 + stamp.month - 1 - months, 12)
+    month += 1
+    day = min(stamp.day, monthrange(year, month)[1])
+    return stamp.replace(year=year, month=month, day=day)
 
 
-def history_read_bounds(current_times, scope_start, years):
+def history_read_bounds(current_times, scope_start, months):
     """计算已读任务范围之前需补读的首尾日期，无需补读时返回 None。
 
     current_times 由各轮按自己的业务规则选定，可以是一次性迭代器。取这些
-    时刻回推日历年后的最早日期，下界包含当天，上界为 scope_start 的前一天。
+    时刻回推日历月后的最早日期，下界包含当天，上界为 scope_start 的前一天。
     此函数不读取数据；下界当天的精确时刻仍由后续内存窗口判断。
     """
-    begin = min((history_window_start(stamp, years).date() for stamp in current_times), default=None)
+    begin = min((history_window_start(stamp, months).date() for stamp in current_times), default=None)
     if begin is None:
         return None
     end = date.fromisoformat(scope_start) - timedelta(days=1)
     return (begin, end) if begin <= end else None
 
 
-def is_history_needed(history_time, current_times, years):
-    """沿用现有算法判断历史是否需要为待处理时点准备，输入时刻须已升序排列。
+def is_history_needed(history_time, current_times, months):
+    """判断历史是否落在任一待处理窗口中，输入时刻须已升序排列。
 
     current_times 是本币或本组的 pd.Timestamp 序列，允许重复，不在本函数中
-    排序或修改。二分选出第一个严格晚于历史的时点，再比较该时点的回看下界；
-    组与状态由调用方筛选。跨闰日时其他窗口可能有更早下界，这一已有限制保留。
+    排序或修改。先二分选出第一个严格晚于历史的时点；月末截断可能使随后
+    几天的下界时分秒更早，因此逐日检查这些边界，不逐条扫描同日任务。
+    下界日期严格晚于历史日期后即可停止；组与状态由调用方筛选。
     """
     stamp = published_time(history_time)
     position = bisect_right(current_times, stamp)
-    return position < len(current_times) and stamp >= history_window_start(current_times[position], years)
+    while position < len(current_times):
+        current = current_times[position]
+        begin = history_window_start(current, months)
+        if stamp >= begin:
+            return True
+        if begin.date() > stamp.date():
+            return False
+        position = bisect_left(current_times, current.normalize() + pd.DateOffset(days=1))
+    return False
 
 
 def table_date_bounds(document):

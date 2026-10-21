@@ -25,9 +25,8 @@ logger = logging.getLogger(__name__)
 def _load_relation_history(store, pending_keys):
     """按日期补入必要前史，范围之后仅读取补录检查所需的两列。"""
     settings = store.settings
-    # 第二轮继续以原有的最早待处理时刻作为补读基准。
-    earliest = min(published_time(key[0]) for key in pending_keys)
-    bounds = history_read_bounds((earliest,), settings.start_time, settings.history_lookback_years)
+    bounds = history_read_bounds((key[0] for key in pending_keys), settings.start_time,
+                                 settings.history_lookback_months)
     if bounds is not None:
         begin, history_end = bounds
         store.load_relation_history(begin.isoformat(), history_end.isoformat())
@@ -62,7 +61,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     if not pending_keys:
         return summarize(store, keys, "round2", store.count_completed("round2", keys))
     later_records = _load_relation_history(store, pending_keys)
-    validate_relation_history(store, keys, settings.history_lookback_years, later_records)
+    validate_relation_history(store, keys, settings.history_lookback_months, later_records)
     del later_records
     embedding = None
     if retriever is not None:
@@ -77,7 +76,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     store.config = config
     digest = store.check_config("round2")
     already = store.count_completed("round2", keys)
-    history = EventHistory(store.df, settings.history_lookback_years, truncate_group_history=True)
+    history = EventHistory(store.df, settings.history_lookback_months, truncate_group_history=True)
     grouped = defaultdict(lambda: defaultdict(list))
     for key in pending_keys:
         grouped[store.df.loc[key, "asset"]][published_time(key[0])].append(key)
@@ -87,7 +86,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         for key, row in store.df.iterrows():
             if row["round2_status"] != "1" or row["asset"] not in times:
                 continue
-            if is_history_needed(key[0], times[row["asset"]], settings.history_lookback_years):
+            if is_history_needed(key[0], times[row["asset"]], settings.history_lookback_months):
                 embedding_keys.add(key)
         # 编码固定事实可以提前批处理；实际候选仍由 history 严格按披露时点筛选。
         # 向量按批写入事件去重分析表后才开始认领，避免同步请求阻塞关联结果的保存。

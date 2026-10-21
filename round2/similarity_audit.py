@@ -63,7 +63,7 @@ def _read_batch(cli, settings):
         raise ValueError("本批第二轮尚未全部完成，不能作为已完成批次复算：{}".format(unfinished.index[0][1]))
     keys = sorted(current.index, key=lambda key: (published_time(key[0]), key[1]))
     bounds = history_read_bounds((key[0] for key in keys), settings.start_time,
-                                 settings.history_lookback_years)
+                                 settings.history_lookback_months)
     if bounds is None:
         return current, keys
     begin, end = bounds
@@ -143,8 +143,8 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
     sweep = sorted({_threshold(value) for value in thresholds} | {threshold})
     if type(top_k) is not int or top_k <= 0:
         raise ValueError("top_k 必须为正整数")
-    if type(settings.history_lookback_years) is not int or settings.history_lookback_years <= 0:
-        raise ValueError("history_lookback_years 必须为正整数")
+    if type(settings.history_lookback_months) is not int or settings.history_lookback_months <= 0:
+        raise ValueError("history_lookback_months 必须为正整数")
     output = Path(output_dir).absolute()
     if output.exists():
         raise ValueError("输出目录已存在，请指定新目录，避免覆盖观察结果：{}".format(output))
@@ -164,7 +164,7 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
     for entries in unfinished.values():
         entries.sort()
     # 不把最终表内的未来记录带入当前时点；EventHistory 每次查询都排除同刻和未来。
-    history = EventHistory(frame, settings.history_lookback_years)
+    history = EventHistory(frame, settings.history_lookback_months)
     embeddings = dict(zip(frame.index.get_level_values("record_id"), frame["embedding"]))
     vectors = _SavedVectors()
     totals = {value: dict.fromkeys(THRESHOLD_COLUMNS[1:], 0) for value in sweep}
@@ -177,7 +177,7 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
             row = frame.loc[key]
             current = {"date": str(key[0]), "record_id": key[1], "asset": row["asset"], "event": row["event"]}
             bad = unfinished[row["asset"]]
-            begin = history_window_start(key[0], settings.history_lookback_years)
+            begin = history_window_start(key[0], settings.history_lookback_months)
             left, right = bisect_left(bad, (begin,)), bisect_left(bad, (published_time(key[0]),))
             if left < right:
                 raise ValueError("所需同币前史尚未完成，无法重建本批候选：{} / {}".format(row["asset"], bad[left][1]))
@@ -233,7 +233,7 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
     manifest = {
         "completed": True, "result_path": settings.result_path,
         "start_time": settings.start_time, "end_time": settings.end_time,
-        "history_lookback_years": settings.history_lookback_years,
+        "history_lookback_months": settings.history_lookback_months,
         "threshold": threshold, "thresholds": sweep, "top_k": top_k,
         "events": len(keys), "candidate_rows": pair_count,
         "embedding_identity": (dict(zip(("model", "model_version", "config_hash"), vectors.identity))

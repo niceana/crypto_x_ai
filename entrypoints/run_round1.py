@@ -20,7 +20,7 @@ def main():
     导入失败保留round1事件提取已保存结果，再运行同一范围时跳过成功帖 AI 并补导。
     """
     project_root = Path(__file__).resolve().parent.parent
-    settings = load_job_config(project_root / "configs" / "job_config.yaml", ("task_path", "ai_config_path"))
+    settings = load_job_config(project_root / "configs" / "post_extraction_config.yaml", ("task_path", "ai_config_path"))
     if "logging" in settings and not isinstance(settings["logging"], dict):
         raise ValueError("任务配置的 logging 必须为字典")
 
@@ -34,7 +34,7 @@ def main():
 
     # 后续任务沿用round1事件提取的实际来源和范围，不要求两份配置手工同步日期。
     event_settings = replace(
-        load_event_config(project_root / "configs" / "event_config.yaml"),
+        load_event_config(project_root / "configs" / "event_processing_config.yaml"),
         first_round_task_path=settings["task_path"],
         start_time=settings.get("start_time"), end_time=settings.get("end_time"),
     )
