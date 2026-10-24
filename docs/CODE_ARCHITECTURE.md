@@ -6,7 +6,6 @@
 
 ```text
 项目根目录/
-├─ main.py                       round1事件提取及自动导入启动入口
 ├─ configs/                      两份任务配置、三份 AI 配置、Embedding 配置及 .env.example
 ├─ common/                       9 个功能模块，另有 __init__.py
 │  ├─ config.py                  配置加载、对象、模板检查和摘要
@@ -23,7 +22,7 @@
 │  ├─ first_round_answers.py     历史第一轮回答解析及正文引号兼容
 │  └─ event_records.py           事件展开、自动导入和独立续建
 ├─ round1/runner.py              round1事件提取执行和成功帖回调
-├─ round2/                       round2事件去重归组：调度、候选校验及向量检索
+├─ round2/                       round2事件去重归组：runner 调度、preparation 异步准备及向量检索
 ├─ round3/runner.py              round3事件影响分析前提检查、事件输入和执行
 ├─ entrypoints/                  五种独立任务入口及 runtime.py
 ├─ tests/                        common、initialization、各轮及 entrypoints
@@ -40,15 +39,15 @@ common.config 按配置类别提供加载入口：load_job_config 读取帖子�
 
 四类配置加载入口统一使用 common.config 已有的 _UniqueLoader，沿用安全 YAML 解析和字符串键要求；每个字典独立检查重复键，根层及嵌套层重复均抛 ConfigError，不静默覆盖，不新增加载封装或配置项。任务和事件配置在创建数据客户端前完成检查。
 
-common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.published_at、current.event 和各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event；每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。round1事件提取仍直接使用原帖正文。
+common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.published_at、current.event 和各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event；每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。第一轮使用 build_extraction_input 组织 user_name、text 及可选 account_tickers；账号背景在启动时固定，空币种事件在导入时跳过，不再兜底。
 
 EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_months 定位左闭右开窗口，默认 3 个日历月。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
 
 common.time_rules.history_read_bounds(current_times, scope_start, months) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, months) 筛选落在任一待处理窗口内的历史。月末截断时继续检查后续日期的窗口，避免只看第一个未来任务而漏掉历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责。
 
-第二轮必须配置 start_time/end_time，EventRecordStore 先按日期读取本次任务；有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历月边界，table_date_bounds 供第二轮解析元数据。
+第二轮必须配置 start_time/end_time。第二、三轮共用 round2_asset_list_path，各自在 runner 中用 json.loads(cli.read_object(path).decode('utf-8'))['InstrumentList'] 读取名单，以第一个点前的币名标准化、去重；每轮启动读取一次，不另设公共读取模块或名单内容校验。第二轮 EventRecordStore 按日期读取本次任务，再于恢复状态前筛选名单内的任务键，统计、向量和调度均限定这些资产，EventHistory 只登记本次待处理资产。未配置或空路径时处理全资产。名单筛选不影响导入及权重入口；全表配置摘要核对保留。有待处理任务时，load_relation_history 按日期补入所需较早历史并重建原行位置。round2.runner._load_relation_history 通过 read_meta 获取表尾日期，范围之后只按日期读取 asset、round2_status 两列，供补录冲突检查，不参与候选。common.time_rules.history_window_start 统一日历月边界，table_date_bounds 供第二轮解析元数据。
 
-第三轮也必须配置日期。round3.runner._prepare_impact 逐月读取本范围任务，检查全部第二轮状态、本条基本关联和跨月 record_id 唯一性，不保留事件事实副本；无记录或全部完成时直接返回。整个范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮 build_impact_input 只使用当前任务行，不读取原帖。repeat 逻辑直接位于 round3.runner：_load_repeat_sources 为待处理 repeat 按月从近到远读取必要历史响应列与元数据，找到全部组的最近有效来源后停止；_remember_impact_response 校验来源，并用字典为每组保留一条有效响应；_complete_repeat_impacts 在本月 new/update 结果保存后按披露时间处理 repeat，排除同刻和未来，复制后才标记完成；并发、批量保存和停止恢复沿用共用执行器。
+第三轮也必须配置日期。启动时读取同一目标资产名单，round3.runner._load_impact_store 在前置检查、状态恢复及实际执行各阶段逐月读取任务后先按 asset 筛选工作表；开启 round3_skip_incomplete_round2 时，再排除第二轮状态为 0/9/-1 的记录并重建 positions。该开关对象默认 false，当前事件 YAML 设为 true。_prepare_impact 对保留记录检查第二轮状态、本条基本关联和跨月 record_id 唯一性；标记成功但关联非法或状态未知仍停止。无可处理记录或可处理部分第三轮全部完成时直接返回。整个可处理范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。AI 请求、repeat 继承和状态统计均限定保留记录，跳过行不更新；StageSummary.skipped_round2 按月单列累计，正常的 total 等字段仅包含可处理记录。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮 build_impact_input 只使用当前任务行，不读取原帖。repeat 逻辑直接位于 round3.runner：_load_repeat_sources 为待处理 repeat 按月从近到远读取必要历史响应列与元数据，找到全部组的最近有效来源后停止；_remember_impact_response 校验来源，并用字典为每组保留一条有效响应；_complete_repeat_impacts 在本月 new/update 结果保存后按披露时间处理 repeat，排除同刻和未来，复制后才标记完成；并发、批量保存和停止恢复沿用共用执行器。
 
 common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮按配置日期读取任务和必要历史，窗口筛选及按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
 
@@ -60,7 +59,7 @@ common.validation 的 POST_RESULT_COLUMNS 和 TASK_COLUMNS 定义round1帖子事
 
 common.validation 集中 parse_strict_json 和三轮独立校验：
 
-- validate_extraction_output 检查 events/event/tickers，供round1事件提取请求及事件导入共用；空事件和空代币数组在格式层面合法。导入另对空 tickers 查账号映射，无映射时停止本次全部导入，尚未写入事件表；缺少 tickers 字段则不通过格式校验。
+- validate_extraction_output 检查 events/event/tickers，供round1事件提取请求及事件导入共用；空事件和空代币数组在格式层面合法。导入跳过空 tickers 事件，不按账号补全、不影响其他合法事件；缺少 tickers 字段则不通过格式校验。
 - validate_relation_output(content, candidate_event_ids) 检查 event_relation、matched_candidate_id、new_information 三字段、关系枚举及本次短编号，再返回带真实 matched_event_id 的内部结果。runner 将映射固定在各自 RequestJob 的回调中，同一任务重试复用输入和映射，并发不共享；Store 和数据库列保持不变，原始 AI 正文仍保留短编号。
 - validate_impact_output 保留五字段非空字符串检查，round3事件影响分析仍支持注入 validator；具体评分枚举没有新增。
 
@@ -84,25 +83,27 @@ write_columns 的可选 prepare_write 回调只用于两轮回答保存，在每
 
 ## 5. 执行和业务差异
 
-common.network.NetworkWorker 只处理 RequestJob，在网络线程内完成该作业的请求尝试并返回 CompletionMessage。任务键只用于关联答复，业务校验回调使用同一请求预算。数据操作仍在调用线程。
+三轮共用网络将 HTTP 429 纳入原任务的 run.max_attempts（含首次），与网络故障、5xx 和无效输出共用预算。429 在预算内按指数随机退避重试，_RequestGate 暂停全部后续起发；有效 Retry-After 与本地退避取较长等待，缺少或非法时也使用本地退避暂停。原请求输入和候选映射复用，等待可被停止中断；最终仍为 429 时保存失败并停止整轮。Embedding 的串行批次同样在原独立预算内重试 429。
+
+common.network.NetworkWorker 处理 RequestJob，在网络线程内完成该作业的请求尝试并返回 CompletionMessage。每次 HTTP 尝试通过 asyncio.Semaphore 限制并发，请求返回或抛错后释放，响应校验和退避在名额外执行；起发限速及全局暂停仍由 _RequestGate 负责。第一、三轮继续通过 submit 提交，完成队列容量为 concurrency。第二轮在启动前通过 bind_ready_queue 接入就绪队列与取走通知，使用无容量背压的共用结果队列；_pump_ready 先获取起发名额再取出请求，把预留名额交给首次尝试，重试重新获取名额。取走即唤醒准备线程，notify_ready 则在新请求准备完成时唤醒网络循环。RequestJob 可携带准备好的 body 字节，第二轮直接发送并在重试时复用，第一、三轮仍在网络作业内渲染。数据操作仍在调用线程。
 
 round1事件提取与round3事件影响分析使用 common.execution.run_segments 和 SegmentCoordinator，共用分段加载、网络名额、结果缓冲、批量保存和停止收尾。各轮提供任务选择、输入、校验及汇总。
 
-round2事件去重归组保留独立调度：同币按发布时间推进，同一时点共享此前历史，当前时点全部保存后才加入历史；普通最终失败暂停该币，其他币继续。
+round2事件去重归组保留独立调度：runner 轮流登记各币当前时点并批量认领，交给 preparation.RelationPreparer 的常驻生产线程。准备线程独占 EventHistory，通过 Condition 和按币轮转的候选队列持续补足最多 ready_request_buffer_size（默认 20）条完整就绪请求；队列取走后立即补货。自动判新、构造失败和 HTTP 答复进入同一完成队列，主线程按队列快照取出当前已有结果，通过 EventRecordStore.save_relation_batch 一次保存；仅一条时立即单条提交，不等待未来结果或定时器，不按结果积压限制 HTTP。混合批中的 repeat 和失败保留原第三轮状态，保存失败保留当前整批原消息。删除未落库总窗口、逐条提交的执行器及第二个完成队列。准备线程不接触 cli 或 DataFrame，只接收固定 current 字典和已保存字段副本。同币当前时点全部保存后，先登记历史更新，再共同认领已解锁任务并提交下一时点输入；历史更新优先执行，同刻仍共享此前历史。普通最终失败暂停该币，其他币继续。
 
-两种初始化保留不同流程。post_tasks 对完整源帖一次建表，不重试、不读 AI 配置；event_records 负责事件展开、映射和去重，并保留自动导入及独立 auto/create/resume 的不同检查。主入口自动导入不重读round1事件提取，只在存在读取时已成功帖时读一次已有事件去重分析表去重。
+两种初始化保留不同流程。post_tasks 对完整源帖一次建表，不重试、不读 AI 配置；event_records 负责事件展开、映射和去重。内存自动导入与独立导入均自动判断建表或追加，保留各自的数据读取和核对规则，不再配置导入模式。第一轮自动导入不重读round1事件提取，只在存在读取时已成功帖时读一次已有事件去重分析表去重。
 
 ## 6. 入口、测试与后续接入
 
-根目录 main.py 保留可调用的 main，并转调 entrypoints.run_round1.execute_round1。根入口和模块入口共用round1事件提取退出处理，保留调用脚本的日志来源、标准异常栈及退出码 0、1、130。其他入口为 entrypoints.initialize_tasks、entrypoints.import_events、entrypoints.run_round2 和 entrypoints.run_round3。
+第一轮统一运行 `python -m entrypoints.run_round1`，该入口完成事件提取及成功帖自动导入，execute_round1 负责标准异常栈及退出码 0、1、130。重复的根目录启动脚本已移除。其他入口为 entrypoints.initialize_tasks、entrypoints.import_events、entrypoints.run_round2 和 entrypoints.run_round3。独立导入自动判断建表或追加，不再提供导入模式开关。
 
-entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客户端接入及退出处理。round1事件提取初始化保留具体错误提示，round1事件提取处理保留原异常处理流程。日志来源随迁移后的模块名称更新，正文、提示词和认证仍不主动写入日志。
+entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客户端接入及退出处理。round1事件提取初始化保留具体错误提示，round1事件提取处理保留原异常处理流程。日志来源随迁移后的模块名称更新；ReadTimeout 按用户要求直接复用 RequestJob.text 中已组装的完整业务输入写入 WARNING 日志，不反解析 HTTP 请求体，最终读取超时还以 user= 追加到 error_message，不在 Store 再截断。普通错误仍由响应解析层限制为 512 字符，system、认证及完整响应不主动写入日志。
 
 测试与源码职责对应，事件配置、三轮输出和公共 Store 测试统一归入 tests/common；各轮执行、初始化和入口测试仍独立。基础夹具位于 tests/support.py，事件模拟表及 EventFixture 位于 tests/event_support.py。
 
 本次公共模块归并完整保留当前 255 项测试及原断言，包含已确认的表内向量与阈值规则。迁移后 54 个源码及测试模块对照实际工作区语法树，处理代码和数据字面值一致，9 份配置文件指纹保持原样；验证结果见 [公共模块收拢记录](history/COMMON_MODULE_CONSOLIDATION.md)。此前符号变化见 [命名统一记录](history/NAMING_CONSISTENCY.md)，目录迁移背景保留在 [合并记录](history/COMMON_DIRECTORY_MERGE.md)。
 
-按列摘要 CLI 已按用户确认的调用方式接入，第二轮事件文本输入及第二、三轮正式提示词已配置；第三轮字段口径和取值见 configs/round3_ai_config.yaml，代码仍仅校验五字段非空字符串。真实 AI/Embedding 服务及第一轮正式提示词仍待接入，检索召回、归组及经济评分质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
+按列摘要 CLI 已按用户确认的调用方式接入，第二轮事件文本输入及第二、三轮正式提示词已配置；第三轮字段口径和取值见 configs/round3_ai_config.yaml，代码仍仅校验五字段非空字符串。真实 AI/Embedding 服务仍待接入，第一轮已配置事件提取与账号背景基础提示词，检索召回、归组及经济评分质量仍待真实样本验证，详见 [待办](IMPLEMENTATION_ISSUES.md)。历史方案保留于 history，现行结构和规则以本文件及规则文档为准。
 
 上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当时完整 267 项模拟测试通过；内存索引优化新增 7 项，当时完整 274 项测试通过，覆盖时间边界、按币隔离、乱序载入与加入、返回副本、完整组前史及起点合法性。事件去重分析表仍为 14 个普通列，向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
 

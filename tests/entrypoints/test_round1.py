@@ -1,7 +1,6 @@
 import importlib.util
 import logging
 import os
-import runpy
 import subprocess
 import sys
 import types
@@ -71,7 +70,7 @@ class EntryPointTests(Fixture, unittest.TestCase):
             "round2_ai_config_path": "round2_ai_config.yaml",
             "round3_ai_config_path": "round3_ai_config.yaml",
             "start_time": "1990-01-01", "end_time": "1990-01-02",
-            "initialize_mode": "create", "user_name_to_tickers": {},
+            "user_name_to_tickers": {},
         }
         self.event_path.write_text(yaml.safe_dump(self.event_settings), encoding="utf-8")
         self.module, self.get_client = load_entrypoint()
@@ -118,8 +117,8 @@ class EntryPointTests(Fixture, unittest.TestCase):
     def test_import_does_not_create_client(self):
         self.get_client.assert_not_called()
 
-    def test_root_launcher_preserves_calls_error_logs_and_exit_codes(self):
-        """运行真实根入口，检查转调后没有丢失执行、异常日志或中断退出。"""
+    def test_round1_launcher_preserves_calls_error_logs_and_exit_codes(self):
+        """直接使用第一轮入口，保留执行次数、异常日志和中断退出码。"""
         for mode, error, expected_code in (
             ("normal", None, 0),
             ("failure", RuntimeError("模拟第一轮失败"), 1),
@@ -128,23 +127,21 @@ class EntryPointTests(Fixture, unittest.TestCase):
             with self.subTest(mode=mode):
                 self.get_client.reset_mock()
                 self.import_events.reset_mock()
-                with patch.dict(sys.modules, {"entrypoints.run_round1": self.module}), \
-                        patch.object(self.module, "run_extraction", return_value=ExtractionSummary(),
+                with patch.object(self.module, "run_extraction", return_value=ExtractionSummary(),
                                      side_effect=error) as worker:
                     if expected_code == 0:
-                        namespace = runpy.run_path(str(PROJECT_ROOT / "main.py"), run_name="__main__")
-                        self.assertIs(namespace["main"], self.module.main)
+                        self.assertIsNone(self.module.execute_round1())
                     elif expected_code == 1:
-                        with self.assertLogs("__main__", level="ERROR") as captured:
+                        with self.assertLogs(self.module.__name__, level="ERROR") as captured:
                             with self.assertRaises(SystemExit) as caught:
-                                runpy.run_path(str(PROJECT_ROOT / "main.py"), run_name="__main__")
+                                self.module.execute_round1()
                         self.assertEqual(caught.exception.code, expected_code)
                         self.assertIn("round1事件提取未完成", captured.output[0])
                         self.assertIn("模拟第一轮失败", captured.output[0])
                         self.assertIsNotNone(captured.records[0].exc_info)
                     else:
                         with self.assertRaises(SystemExit) as caught:
-                            runpy.run_path(str(PROJECT_ROOT / "main.py"), run_name="__main__")
+                            self.module.execute_round1()
                         self.assertEqual(caught.exception.code, expected_code)
                 self.get_client.assert_called_once_with()
                 worker.assert_called_once()
@@ -169,6 +166,7 @@ class EntryPointTests(Fixture, unittest.TestCase):
             "start_time": self.settings["start_time"],
             "end_time": self.settings["end_time"],
             "on_successful_posts": run.call_args.kwargs["on_successful_posts"],
+            "user_name_to_tickers": self.event_settings["user_name_to_tickers"],
         })
         self.assertTrue(callable(run.call_args.kwargs["on_successful_posts"]))
         self.import_events.assert_called_once()
@@ -178,7 +176,6 @@ class EntryPointTests(Fixture, unittest.TestCase):
         self.assertEqual((import_settings.start_time, import_settings.end_time),
                          (self.settings["start_time"], self.settings["end_time"]))
         self.assertEqual(import_settings.result_path, self.event_settings["result_path"])
-        self.assertEqual(import_settings.initialize_mode, self.event_settings["initialize_mode"])
         self.assertEqual(self.import_events.call_args.kwargs, {"new_posts": None, "previous_posts": None})
 
     def test_absolute_ai_path_is_supported(self):
@@ -446,7 +443,8 @@ def import_events(*args, **kwargs):
         raise RuntimeError('自动导入执行失败')
     return 1
 initialization.event_records.import_event_records_from_posts = import_events
-def run(client, task_path, config_path, start_time=None, end_time=None, *, on_successful_posts=None):
+def run(client, task_path, config_path, start_time=None, end_time=None, *, on_successful_posts=None,
+        user_name_to_tickers=None):
     if mode == 'worker_error':
         raise RuntimeError('worker 执行失败')
     if mode == 'validation_error':

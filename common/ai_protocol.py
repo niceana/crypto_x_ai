@@ -32,7 +32,7 @@ def _render(value, variables):
 def render_payload(config: AIConfig, text: str) -> Dict[str, Any]:
     """根据任务输入文本 text 返回独立请求对象，不修改固定配置快照。
 
-    任务键和 user_name 不参与请求构造。模板只替换一次；结果无法编码为
+    任务键不参与请求构造；账号背景由业务层组织在 text 中。模板只替换一次；结果无法编码为
     标准 UTF-8 JSON 时抛 TaskRenderError，由运行模块作为该任务最终失败处理。
     """
     if not isinstance(text, str):
@@ -69,9 +69,12 @@ def _reason(value):
     return value if len(value) <= 512 else value[:511] + "…"
 
 
-def request_failure(error_message: str) -> ParsedResponse:
-    """封装未取得 HTTP 响应的失败，结果字段保持为空。"""
-    return ParsedResponse(False, None, error_message=_reason(error_message))
+def request_failure(error_message: str, *, user_content: Optional[str] = None) -> ParsedResponse:
+    """封装无响应的失败；ReadTimeout 可追加完整 user，不截断排查输入。"""
+    reason = _reason(error_message)
+    if user_content is not None:
+        reason += "\nuser=" + user_content.encode("utf-8", errors="replace").decode("utf-8")
+    return ParsedResponse(False, None, error_message=reason)
 
 
 def _reject_constant(value):

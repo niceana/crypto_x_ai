@@ -9,7 +9,7 @@ import pandas as pd
 
 from common.config import ai_config_hash, EventConfig
 from common.persistence import BatchPersistenceError, TaskValidationError
-from common.ai_protocol import parse_response
+from common.ai_protocol import parse_response, request_failure
 from round1.runner import ExtractionSummary
 from common.store import PostTaskStore, EventRecordStore, read_event_history
 from initialization.event_records import expand_first_round, import_event_records_from_table
@@ -24,7 +24,7 @@ class HistoryReadTests(unittest.TestCase):
         return expand_first_round(source_posts([
             ("2025-01-02T12:00:00.123456789+08:00", "later", ["ETH"], "a"),
             ("2025-01-01T00:00:00+08:00", "earlier", ["ETH"], "a"),
-        ]), {})
+        ]))
 
     def test_full_history_read_preserves_values_original_index_and_query_arguments(self):
         frame = self.frame()
@@ -270,6 +270,52 @@ class StoreTests(Fixture, unittest.TestCase):
             store.recover(stage, list(frame.index))
             self.assertEqual(store.summarize(stage)["total"], 1)
             self.assertEqual(store.summarize(stage)["pending"], 0)
+        self.assertFalse(backend.updates)
+        pd.testing.assert_frame_equal(store.df, before)
+
+    def test_relation_batch_saves_mixed_results_once_and_preserves_untouched_fields(self):
+        for preserved_status in ("1", None, pd.NA):
+            with self.subTest(status=type(preserved_status).__name__):
+                backend, settings = self.backend(3)
+                frame = backend.tables["result"]
+                first, repeat, failed = frame.index
+                frame.loc[:, "round3_status"] = "1"
+                frame.at[repeat, "round3_status"] = preserved_status
+                frame.at[failed, "round3_status"] = preserved_status
+                before = frame.copy(deep=True)
+                store = EventRecordStore(backend, settings)
+                response = parse_response(200, success(json.dumps(new_result())).text)
+                store.save_relation_batch([
+                    (first, {"event_relation": "new", "matched_event_id": None, "new_information": None}, None, 0),
+                    (repeat, {"event_relation": "repeat", "matched_event_id": first[1], "new_information": None}, response, 2),
+                    (failed, None, request_failure("本条请求失败"), 3),
+                ])
+                self.assertEqual(len(backend.updates), 1)
+                self.assertEqual(len(backend.updates[0]), 3)
+                self.assertEqual(list(frame["round2_status"]), ["1", "1", "-1"])
+                self.assertEqual(list(frame["event_relation"]), ["new", "repeat", ""])
+                self.assertEqual(frame.at[first, "round3_status"], "0")
+                pd.testing.assert_series_equal(frame.loc[[repeat, failed], "round3_status"],
+                                               before.loc[[repeat, failed], "round3_status"])
+                self.assertEqual(frame.at[first, "round2_ai_response"], "")
+                answers = [json.loads(frame.at[key, "round2_ai_response"]) for key in (repeat, failed)]
+                self.assertEqual([answer["attempts"] for answer in answers], [2, 3])
+                self.assertEqual(answers[0]["created"], answers[1]["created"])
+                self.assertEqual(frame.at[failed, "error_message"], "本条请求失败")
+                pd.testing.assert_frame_equal(store.df, frame)
+                columns = ["event_id", "event_relation", "new_information", "round2_ai_response",
+                           "round2_status", "round3_status", "error_message"]
+                pd.testing.assert_frame_equal(frame.drop(columns=columns), before.drop(columns=columns))
+
+    def test_relation_batch_rejects_explicit_nonstring_before_writing_any_row(self):
+        backend, settings = self.backend(2)
+        before = backend.tables["result"].copy(deep=True)
+        store = EventRecordStore(backend, settings)
+        items = [(key, {"event_relation": "new", "matched_event_id": None,
+                        "new_information": None if index == 0 else 7}, None, 0)
+                 for index, key in enumerate(store.df.index)]
+        with self.assertRaisesRegex(ValueError, "字段=new_information，实际类型=int"):
+            store.save_relation_batch(items)
         self.assertFalse(backend.updates)
         pd.testing.assert_frame_equal(store.df, before)
 

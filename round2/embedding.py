@@ -93,7 +93,7 @@ class EmbeddingRetriever:
         return result
 
     def _request(self, client, texts):
-        """传输、5xx 和无效输出共用本批预算，复用 AI 网络的退避规则。"""
+        """传输、429、5xx 和无效输出共用本批预算，复用 AI 网络的退避规则。"""
         for attempt in range(1, self.config.max_attempts + 1):
             retry_after = 0
             try:
@@ -115,10 +115,13 @@ class EmbeddingRetriever:
                         if attempt == self.config.max_attempts:
                             raise
                         logger.warning("Embedding 输出无效，使用本批剩余预算重试：原因=%s", exc)
-                elif not 500 <= response.status_code <= 599 or attempt == self.config.max_attempts:
+                elif ((response.status_code != 429 and not 500 <= response.status_code <= 599)
+                      or attempt == self.config.max_attempts):
                     raise EmbeddingError("Embedding HTTP {}，停止本轮".format(response.status_code))
                 else:
                     retry_after = parse_retry_after(response.headers.get("Retry-After")) or 0
+                    logger.warning("Embedding HTTP %d，使用本批剩余预算重试：尝试=%d/%d",
+                                   response.status_code, attempt, self.config.max_attempts)
             # 批次串行准备，无需聊天并发的全局暂停门；两种等待从本次失败同时计时。
             delay = max(retry_backoff(self.config, attempt), retry_after)
             logger.warning("round2事件去重归组 Embedding 批次准备重试：尝试=%d/%d，等待=%.3f秒",

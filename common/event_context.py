@@ -1,10 +1,39 @@
-"""维护第二轮事件历史索引，组织第二轮候选输入和第三轮本条事件输入。"""
+"""组织三轮业务输入、第一轮账号背景与第二轮事件历史索引。"""
 
 import json
 from bisect import bisect_left
 from collections import defaultdict
 
 from common.time_rules import history_window_start, published_time
+
+
+def prepare_account_tickers(mapping):
+    """固定本轮账号背景；用户名忽略大小写，币种去空白、转大写并去重。"""
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, dict):
+        raise ValueError("user_name_to_tickers 必须为字典")
+    result = {}
+    for user_name, tickers in mapping.items():
+        if not isinstance(user_name, str) or not user_name.strip() or not isinstance(tickers, list) or not tickers:
+            raise ValueError("账号背景必须为非空用户名到非空代币列表")
+        account = user_name.casefold()
+        if account in result:
+            raise ValueError("账号背景包含忽略大小写后的重复用户名：{}".format(user_name))
+        if any(not isinstance(ticker, str) or not ticker.strip() for ticker in tickers):
+            raise ValueError("账号背景代币必须为非空字符串")
+        result[account] = list(dict.fromkeys(ticker.strip().upper() for ticker in tickers))
+    return result
+
+
+def build_extraction_input(row, account_tickers):
+    """第一轮依次发送账号、可选关联币种及正文，将账号背景放在一起。"""
+    current = {"user_name": row["user_name"]}
+    tickers = account_tickers.get(row["user_name"].casefold())
+    if tickers:
+        current["account_tickers"] = tickers
+    current["text"] = row["text"]
+    return json.dumps(current, ensure_ascii=False, allow_nan=False)
 
 
 class EventHistory:

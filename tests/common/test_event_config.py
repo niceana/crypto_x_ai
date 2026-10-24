@@ -42,19 +42,30 @@ class EventConfigTests(EventFixture, unittest.TestCase):
         document = {"first_round_task_path": "first", "result_path": "result",
                     "round2_ai_config_path": "round2.yaml", "round3_ai_config_path": "round3.yaml",
                     "start_time": "2018-01-01", "end_time": "2018-01-01",
-                    "initialize_mode": "resume", "user_name_to_tickers": {"a": ["ETH"]}}
+                    "user_name_to_tickers": {"a": ["ETH"]}}
         path = self.path.parent / "event_processing_config.yaml"
         path.write_text(json.dumps(document), encoding="utf-8")
         settings = load_event_config(path)
         self.assertEqual(settings.result_path, "result")
         self.assertEqual(settings.round2_ai_config_path, str(path.parent / "round2.yaml"))
         self.assertEqual(settings.user_name_to_tickers, {"a": ["ETH"]})
-        self.assertEqual(settings.initialize_mode, "resume")
         self.assertEqual(settings.history_lookback_months, 3)
         document.pop("end_time")
         path.write_text(json.dumps(document), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "同时设置"):
             load_event_config(path)
+
+    def test_removed_initialize_mode_is_rejected_instead_of_silently_ignored(self):
+        document = {"first_round_task_path": "first", "result_path": "result",
+                    "round2_ai_config_path": "round2.yaml", "round3_ai_config_path": "round3.yaml"}
+        path = self.path.parent / "event_processing_config.yaml"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        self.assertFalse(hasattr(load_event_config(path), "initialize_mode"))
+        for mode in ("auto", "create", "resume"):
+            with self.subTest(mode=mode):
+                path.write_text(json.dumps(dict(document, initialize_mode=mode)), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "未知字段.*initialize_mode"):
+                    load_event_config(path)
 
     def test_history_lookback_months_requires_positive_integer(self):
         document = {"first_round_task_path": "first", "result_path": "result",
@@ -91,6 +102,32 @@ class EventConfigTests(EventFixture, unittest.TestCase):
         path.write_text(json.dumps(dict(document, weight_path=None)), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "weight_path"):
             load_event_config(path)
+
+    def test_round2_asset_list_path_preserves_database_path(self):
+        document = {"first_round_task_path": "first", "result_path": "result",
+                    "round2_ai_config_path": "round2.yaml", "round3_ai_config_path": "round3.yaml"}
+        path = self.path.parent / "event_processing_config.yaml"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        self.assertEqual(load_event_config(path).round2_asset_list_path, "")
+        for value in ("", "crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json"):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(dict(document, round2_asset_list_path=value)), encoding="utf-8")
+                self.assertEqual(load_event_config(path).round2_asset_list_path, value)
+
+    def test_round3_skip_incomplete_round2_requires_boolean_and_defaults_to_strict(self):
+        document = {"first_round_task_path": "first", "result_path": "result",
+                    "round2_ai_config_path": "round2.yaml", "round3_ai_config_path": "round3.yaml"}
+        path = self.path.parent / "event_processing_config.yaml"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        self.assertFalse(load_event_config(path).round3_skip_incomplete_round2)
+        for value in (True, False):
+            path.write_text(json.dumps(dict(document, round3_skip_incomplete_round2=value)), encoding="utf-8")
+            self.assertIs(load_event_config(path).round3_skip_incomplete_round2, value)
+        for value in ("true", "false", 1, 0, None):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(dict(document, round3_skip_incomplete_round2=value)), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "round3_skip_incomplete_round2"):
+                    load_event_config(path)
 
     def test_weight_grid_is_optional_and_preserves_candidate_arrays(self):
         document = {"first_round_task_path": "first", "result_path": "result",

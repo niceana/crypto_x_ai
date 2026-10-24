@@ -18,7 +18,7 @@ from common.persistence import BatchPersistenceError, TaskValidationError
 from common.network import BatchRunError, CompletionMessage
 from round1.runner import run_extraction, _month_ranges, _NetworkWorker, _retry_after
 from common.config import ai_config_hash
-from common.ai_protocol import parse_response
+from common.ai_protocol import parse_response, render_payload
 from common.execution import SegmentCoordinator as _MonthCoordinator
 from common.store import PostTaskStore
 from tests.support import (
@@ -33,6 +33,61 @@ from tests.support import (
 
 
 class RunnerTests(Fixture, unittest.TestCase):
+    def test_requests_include_account_context_and_allow_coins_outside_account_list(self):
+        frame = tasks(["2021-01-01", "2021-01-02", "2021-01-03"])
+        frame["user_name"] = ["ChAiNlInK", "public-news", "@chainlink"]
+        frame.at[frame.index[0], "text"] = '正文 {{task.text}} 与 "引号"'
+        before = frame.copy(deep=True)
+        mapping = {"chainlink": [" link ", "LINK"]}
+        bodies = []
+        def handler(request):
+            body = json.loads(json.loads(request.content)["messages"][1]["content"])
+            bodies.append(body)
+            return raw_success(json.dumps({"events": [{"event": "其他币种事件", "tickers": ["NEWCOIN"]}]}))
+        class LocalNetwork:
+            """只验证业务输入到请求的组装，响应在内存生成，不启动异步网络。"""
+            def __init__(self, config, **kwargs):
+                self.config = config
+                self.completions = queue.Queue()
+                self.unpublished = []
+                self.failure = None
+                self.http_attempts_started = 0
+
+            def start(self):
+                pass
+
+            def check(self):
+                pass
+
+            def shutdown(self):
+                pass
+
+            def submit(self, job):
+                request = httpx.Request("POST", self.config.api.url,
+                                        json=render_payload(self.config, job.text))
+                response = parse_response(200, handler(request).text)
+                job.validate_output(response.ai_response_content)
+                self.http_attempts_started += 1
+                self.completions.put(CompletionMessage(job.key, response, 1))
+
+        with patch("round1.runner._NetworkWorker", LocalNetwork):
+            summary = self.worker(FakeCli(frame), handler, user_name_to_tickers=mapping)
+        self.assertEqual(summary.new_succeeded, 3)
+        self.assertCountEqual(bodies, [
+            {"user_name": "ChAiNlInK", "account_tickers": ["LINK"], "text": frame.iloc[0]["text"]},
+            {"user_name": "public-news", "text": "post 1"},
+            {"user_name": "@chainlink", "text": "post 2"},
+        ])
+        self.assertEqual(mapping, {"chainlink": [" link ", "LINK"]})
+        pd.testing.assert_frame_equal(frame, before)
+
+    def test_ambiguous_account_mapping_stops_before_reading_or_updating_posts(self):
+        cli = FakeCli(tasks(["2021-01-01"]))
+        with self.assertRaisesRegex(ValueError, "忽略大小写.*重复用户名"):
+            self.worker(cli, lambda req: self.fail("不应请求 AI"),
+                        user_name_to_tickers={"account": ["BTC"], "ACCOUNT": ["ETH"]})
+        self.assertFalse(cli.reads or cli.updates)
+
     def test_successful_post_callback_separates_new_and_previous_committed_posts_without_extra_reads(self):
         frame = tasks(["2021-01-01", "2021-01-02", "2021-01-02", "2021-02-01"])
         frame.loc[frame.index[0], ["status", "config_hash", "ai_response_content"]] = [
@@ -244,7 +299,9 @@ class RunnerTests(Fixture, unittest.TestCase):
             network_threads.add(threading.get_ident())
             payload = json.loads(request.content)
             self.assertEqual(set(payload), {"model", "messages", "stream"})
-            self.assertNotIn("private-user", request.content.decode())
+            business_input = json.loads(payload["messages"][1]["content"])
+            self.assertTrue(business_input["user_name"].startswith("private-user"))
+            self.assertEqual(set(business_input), {"user_name", "text"})
             active += 1
             peak = max(peak, active)
             # 明确等三个请求到齐，避免同步认领耗时超过固定等待而漏测并发。
@@ -444,7 +501,7 @@ class RunnerTests(Fixture, unittest.TestCase):
 
     def test_other_http_errors_stop_without_reading_future_month(self):
         self.document["run"]["concurrency"] = 1
-        for status in (300, 302, 400, 401, 403, 404, 405, 408, 415, 422, 429, 499, 600):
+        for status in (300, 302, 400, 401, 403, 404, 405, 408, 415, 422, 499, 600):
             with self.subTest(status=status):
                 cli = FakeCli(tasks(["2021-01-01", "2021-02-01"]))
                 calls = []
@@ -461,9 +518,9 @@ class RunnerTests(Fixture, unittest.TestCase):
                 self.assertEqual(list(cli.frame["status"]), ["-1", "0"])
                 self.assertNotIn("全部处理完了", self.last_output)
 
-    def test_all_5xx_retry_then_stop_at_shared_budget(self):
+    def test_429_and_all_5xx_retry_then_stop_at_shared_budget(self):
         self.document["run"]["concurrency"] = 1
-        for status in range(500, 600):
+        for status in (429,) + tuple(range(500, 600)):
             with self.subTest(status=status):
                 cli = FakeCli(tasks(["2021-01-01"]))
                 calls = []
@@ -477,6 +534,25 @@ class RunnerTests(Fixture, unittest.TestCase):
                 self.assertEqual(len(calls), 3)
                 self.assertEqual(cli.frame.iloc[0]["status"], "-1")
                 self.assertEqual(cli.frame.iloc[0]["error_message"], "HTTP {}".format(status))
+
+    def test_429_recovers_in_same_run_and_continues_next_month(self):
+        self.document["run"]["concurrency"] = 1
+        cli = FakeCli(tasks(["2021-01-01", "2021-02-01"]))
+        calls, statuses = [], []
+
+        def handler(request):
+            calls.append(request.content)
+            statuses.append(cli.frame.iloc[0]["status"])
+            if len(calls) == 1:
+                return httpx.Response(429)
+            return success()
+
+        summary = self.worker(cli, handler, "2021-01-01", "2021-02-01")
+        self.assertEqual((summary.new_succeeded, summary.new_failed, summary.http_attempts_started), (2, 0, 3))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(statuses[:2], ["9", "9"])
+        self.assertEqual(list(cli.frame["status"]), ["1", "1"])
+        self.assertIn("接口返回 429 限流，准备重试", self.last_output)
 
     def test_first_round_allows_empty_lists_and_preserves_raw_content(self):
         cli = FakeCli(tasks(["2021-01-01", "2021-01-02", "2021-01-03"]))
@@ -834,8 +910,8 @@ class RunnerTests(Fixture, unittest.TestCase):
 
         self.assertEqual(asyncio.run(caller()).new_succeeded, 1)
 
-    def test_chinese_logs_trace_retries_and_storage_without_sensitive_values(self):
-        """跨线程记录重试、保存与完成，同时避免外部异常原文泄露输入。"""
+    def test_chinese_logs_include_timeout_user_without_other_sensitive_values(self):
+        """ReadTimeout 按要求记录 user，其余异常和配置内容仍不输出。"""
         secrets = ["TEXT_SECRET", "PROMPT_SECRET", "API_KEY_SECRET", "URL_SECRET",
                    "RESPONSE_SECRET", "STORAGE_SECRET", "USER_SECRET"]
         frame = tasks(["2021-01-01"])
@@ -870,7 +946,10 @@ class RunnerTests(Fixture, unittest.TestCase):
         self.assertIn("整批重试", self.last_output)
         self.assertIn("已确认最终结果 1 条", self.last_output)
         self.assertIn("任务全部处理完了", self.last_output)
-        for secret in secrets:
+        self.assertIn(secrets[0], self.last_output)
+        self.assertIn('"text": "TEXT_SECRET"', self.last_output)
+        self.assertIn('"user_name": "USER_SECRET"', self.last_output)
+        for secret in secrets[1:-1]:
             self.assertNotIn(secret, self.last_output)
         self.assertEqual({record.name for record in self.log_records},
                          {"common.config", "common.ai_protocol", "common.store", "round1.runner"})

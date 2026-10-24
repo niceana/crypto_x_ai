@@ -14,7 +14,7 @@ import pandas as pd
 from common.config import ai_config_hash
 from common.network import BatchRunError, CompletionMessage, NetworkWorker
 from common.persistence import BatchPersistenceError
-from common.ai_protocol import parse_response
+from common.ai_protocol import parse_response, request_failure
 from initialization.event_records import import_event_records_from_table
 from round2.retrieval import RetrievalNotConfigured, RetrievalSelection
 from round2.runner import run_relation
@@ -312,6 +312,47 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.relate(backend, handler)
         self.assertEqual(maximum[0], 2)
 
+    def test_other_asset_http_continues_during_save_and_same_asset_waits_for_commit(self):
+        self.document["run"]["concurrency"] = 1
+        backend = self.backend([("2021-01-01", "aaa-one", ["AAA"], "a"),
+                                ("2021-01-02", "aaa-two", ["AAA"], "a"),
+                                ("2021-01-01", "bbb-one", ["BBB"], "a"),
+                                ("2021-01-01", "ccc-one", ["CCC"], "a")])
+        keys = {row["event"]: key for key, row in backend.tables["result"].iterrows()}
+        saving, other_finished = threading.Event(), threading.Event()
+        requested, histories = [], {}
+
+        async def handler(request):
+            event = json.loads(request_text(request))["current"]["event"]
+            requested.append(event)
+            if event == "bbb-one":
+                while not saving.is_set():
+                    await asyncio.sleep(0.001)
+                other_finished.set()
+            return success(json.dumps(new_result()))
+
+        def retrieve(current, searchable):
+            histories[current["event"]] = [record["event"] for record in searchable]
+            return choose(current, searchable)
+
+        def update(path, frame):
+            if "event_relation" in frame.columns and frame.index[0] == keys["aaa-one"]:
+                saving.set()
+                # 调用线程仍被写库占用时，网络线程必须完成另一个币的请求。
+                self.assertTrue(other_finished.wait(3))
+                self.assertNotIn("aaa-two", requested)
+                self.assertNotIn("aaa-two", histories)
+                self.assertEqual(backend.tables["result"].at[keys["aaa-one"], "round2_status"], "9")
+                self.assertEqual(backend.tables["result"].at[keys["aaa-two"], "round2_status"], "0")
+            backend.apply(path, frame)
+
+        backend.update_hook = update
+        summary = self.relate(backend, handler, retriever=retrieve)
+        self.assertEqual((summary.new_completed, summary.http_attempts_started), (4, 4))
+        self.assertEqual(histories["aaa-two"], ["aaa-one"])
+        self.assertLess(requested.index("ccc-one"), requested.index("aaa-two"))
+        self.assertTrue(all(value == threading.get_ident() for value in backend.threads))
+
     def test_relation_failure_blocks_only_that_asset_and_resumes(self):
         backend = self.backend([("2021-01-01", "bad", ["ETH"], "a"),
                                 ("2021-01-02", "later", ["ETH"], "a"),
@@ -330,6 +371,78 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         result = self.relate(backend)
         self.assertEqual(result.new_completed, 2)
         self.assertTrue(backend.tables["result"]["error_message"].eq("").all())
+
+    def test_existing_mixed_results_save_together_before_unlocking_next_time(self):
+        backend = self.backend([("2021-01-01", "aaa-one", ["AAA"], "a"),
+                                ("2021-01-01", "aaa-peer", ["AAA"], "a"),
+                                ("2021-01-01", "bbb-auto", ["BBB"], "a"),
+                                ("2021-01-01", "ccc-bad", ["CCC"], "a"),
+                                ("2021-01-02", "aaa-next", ["AAA"], "a"),
+                                ("2021-01-02", "bbb-next", ["BBB"], "a"),
+                                ("2021-01-02", "ccc-next", ["CCC"], "a")])
+        keys = {row["event"]: key for key, row in backend.tables["result"].iterrows()}
+        network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+                                  http_attempts_started=0, start=lambda: None, shutdown=lambda: None)
+        first_ready = threading.Event()
+        claims, saves, histories = [], [], {}
+
+        def submit(job):
+            network.http_attempts_started += 1
+            event = json.loads(job.text)["current"]["event"]
+            if event == "ccc-bad":
+                message = CompletionMessage(job.key, request_failure("普通失败"), 1)
+            else:
+                content = json.dumps(new_result())
+                message = CompletionMessage(job.key, parse_response(200, success(content).text), 1,
+                                            value=job.validate_output(content))
+            network.completions.put_nowait(message)
+            if network.http_attempts_started == 3:
+                first_ready.set()
+
+        def check():
+            if claims and not saves:
+                # 让这批结果在一次调度前全部可见，不依赖线程执行先后。
+                self.assertTrue(first_ready.wait(3))
+
+        def retrieve(current, searchable):
+            histories[current["event"]] = {record["event"] for record in searchable}
+            if current["event"] == "bbb-auto":
+                return RetrievalSelection((), True, "无历史")
+            return choose(current, searchable)
+
+        def update(path, frame):
+            if "event_relation" in frame.columns:
+                if not saves:
+                    self.assertEqual(set(frame.index), {keys[name] for name in (
+                        "aaa-one", "aaa-peer", "bbb-auto", "ccc-bad")})
+                    for event in ("aaa-next", "bbb-next", "ccc-next"):
+                        self.assertNotIn(event, histories)
+                        self.assertEqual(backend.tables["result"].at[keys[event], "round2_status"], "0")
+                saves.append(frame.copy(deep=True))
+            elif "round2_config_hash" in frame.columns:
+                claims.append(frame.copy(deep=True))
+            backend.apply(path, frame)
+
+        network.submit, network.check = submit, check
+        self.add_memory_ready_queue(network)
+        backend.update_hook = update
+        with self.assertLogs("round2.runner", level="INFO") as captured:
+            summary = run_relation(backend, self.relation_settings(backend), ai_config=self.config(),
+                                   retriever=retrieve, network_factory=lambda config: network)
+        self.assertEqual((summary.new_completed, summary.failed, summary.http_attempts_started), (5, 1, 5))
+        self.assertEqual(summary.blocked_assets, ("CCC",))
+        self.assertEqual([len(frame) for frame in claims], [4, 2])
+        self.assertEqual(len(saves[0]), 4)
+        self.assertEqual(sum(len(frame) for frame in saves), 6)
+        self.assertEqual(histories["aaa-one"], set())
+        self.assertEqual(histories["aaa-peer"], set())
+        self.assertEqual(histories["aaa-next"], {"aaa-one", "aaa-peer"})
+        self.assertEqual(histories["bbb-next"], {"bbb-auto"})
+        self.assertNotIn("ccc-next", histories)
+        self.assertEqual(backend.tables["result"].at[keys["ccc-next"], "round2_status"], "0")
+        self.assertTrue(all(value == threading.get_ident() for value in backend.threads))
+        self.assertTrue(any("结果保存平均批量=" in line and "认领写库平均每批耗时=" in line
+                            for line in captured.output))
 
     def test_mixed_network_and_output_errors_share_three_attempts(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
@@ -389,10 +502,36 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
 
     def test_stop_http_preserves_claims_and_cleans_network_thread(self):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(429, json={"error": "limit"})
+
         with self.assertRaises(BatchRunError):
-            self.relate(backend, lambda request: httpx.Response(429, json={"error": "limit"}))
+            self.relate(backend, handler)
+        self.assertEqual(len(calls), 3)
         self.assertEqual(backend.tables["result"].iloc[0]["round2_status"], "-1")
+        self.assertEqual(json.loads(backend.tables["result"].iloc[0]["round2_ai_response"])["attempts"], 3)
         self.assertFalse(any(thread.name == "ai-batch-network" for thread in threading.enumerate()))
+
+    def test_429_recovers_and_advances_next_time_in_same_run(self):
+        backend = self.backend([("2021-01-01", "one", ["ETH"], "a"),
+                                ("2021-01-02", "two", ["ETH"], "a")])
+        calls = []
+
+        def handler(request):
+            calls.append(request.content)
+            if len(calls) == 1:
+                return httpx.Response(429)
+            return success(json.dumps(new_result()))
+
+        summary = self.relate(backend, handler)
+        self.assertEqual((summary.new_completed, summary.failed, summary.http_attempts_started), (2, 0, 3))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(list(backend.tables["result"]["round2_status"]), ["1", "1"])
+        responses = [json.loads(value) for value in backend.tables["result"]["round2_ai_response"]]
+        self.assertEqual([response["attempts"] for response in responses], [2, 1])
 
     def test_relation_storage_failure_retains_current_and_other_answers_without_more_writes(self):
         for remaining_location in ("queue", "unpublished"):
@@ -402,6 +541,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                         ("2021-01-02", "later", ["ETH"], "a")])
                 network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
                                           http_attempts_started=0, start=lambda: None, check=lambda: None)
+                all_submitted = threading.Event()
                 def submit(job):
                     network.http_attempts_started += 1
                     message = CompletionMessage(job.key, parse_response(200, success(json.dumps(new_result())).text),
@@ -410,16 +550,27 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                         network.unpublished.append(message)
                     else:
                         network.completions.put_nowait(message)
+                    if network.http_attempts_started == 2:
+                        all_submitted.set()
                 def shutdown():
                     network.failure = RuntimeError("close failed too")
                 network.submit, network.shutdown = submit, shutdown
+                self.add_memory_ready_queue(network)
+                claimed = threading.Event()
+                def check():
+                    if claimed.is_set():
+                        self.assertTrue(all_submitted.wait(3))
+                network.check = check
                 error = RuntimeError("result not written")
                 final_calls = []
                 def update(path, frame):
                     if "event_relation" in frame.columns:
+                        self.assertTrue(all_submitted.wait(3))
                         final_calls.append(frame.copy(deep=True))
                         raise error
                     backend.apply(path, frame)
+                    if "round2_config_hash" in frame.columns:
+                        claimed.set()
                 backend.update_hook = update
                 with self.assertRaises(BatchPersistenceError) as caught:
                     run_relation(backend, self.relation_settings(backend), ai_config=self.config(), retriever=choose,
@@ -430,12 +581,13 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(network.http_attempts_started, 2)
                 self.assertEqual(list(backend.tables["result"]["round2_status"]), ["9", "9", "0"])
                 current = caught.exception.unsaved_results
-                self.assertEqual(len(current), 1)
+                self.assertEqual(len(current), 2 if remaining_location == "queue" else 1)
+                self.assertTrue(all(len(frame) == len(current) for frame in final_calls))
                 self.assertEqual(current[0].value,
                                  {"event_relation": "new", "matched_event_id": None, "new_information": None})
                 self.assertEqual(current[0].response.ai_response_content, json.dumps(new_result()))
                 self.assertEqual(caught.exception.completed_results.qsize()
-                                 + len(caught.exception.unpublished_results), 1)
+                                 + len(caught.exception.unpublished_results), 0 if remaining_location == "queue" else 1)
                 self.assertEqual(len(backend.reads), 2)
                 expected_response = json.loads(final_calls[0].iloc[0]["round2_ai_response"])
                 expected_response.pop("created")
@@ -454,6 +606,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                         ("2021-01-01", "two", ["ETH"], "a")])
                 network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
                                           http_attempts_started=0, start=lambda: None, shutdown=lambda: None)
+                all_submitted = threading.Event()
                 stop = BatchRunError("network stopped")
                 def submit(job):
                     network.http_attempts_started += 1
@@ -463,13 +616,17 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                         network.completions.put_nowait(message)
                     else:
                         network.unpublished.append(message)
-                def check():
                     if network.http_attempts_started == 2:
+                        all_submitted.set()
+                def check():
+                    if network.http_attempts_started == 2 and final_calls:
                         raise stop
                 network.submit, network.check = submit, check
+                self.add_memory_ready_queue(network)
                 final_calls = []
                 def update(path, frame):
                     if "event_relation" in frame.columns:
+                        self.assertTrue(all_submitted.wait(3))
                         final_calls.append(frame.copy(deep=True))
                         if fail_save and frame.index[0][1].startswith("101:"):
                             raise RuntimeError("second answer not written")
@@ -627,7 +784,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(summary.new_completed, 0)
                 self.assertEqual(len(backend.updates), previous_updates)
                 pd.testing.assert_frame_equal(backend.tables["result"], before_import)
-                import_event_records_from_table(backend, self.settings(start_time=inserted_day, end_time=inserted_day, initialize_mode="resume"))
+                import_event_records_from_table(backend, self.settings(start_time=inserted_day, end_time=inserted_day, ))
                 baseline = backend.tables["result"].copy(deep=True)
                 if blocked:
                     with self.assertRaisesRegex(ValueError, "疑似历史补录") as caught:

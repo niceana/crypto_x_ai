@@ -110,14 +110,18 @@ class TableStore:
         return statuses if keys is None else statuses.loc[self._index(keys)]
 
     def update_stage_columns(self, keys, values, stage, operation=None, prepare_write=None):
-        """保存本阶段指定列；内存同步失败不重新进入数据库写入重试。"""
+        """保存指定字段；逐行字典中省略的字段沿用原值，不作为新值校验。"""
         if not keys:
             return
         patch = pd.DataFrame(values, index=self._index(keys), dtype=object)
         if not set(patch.columns).issubset(self.stages[stage][2]):
             raise self.error_type("当前阶段不能修改这些字段")
-        for name in patch.columns:
-            for value in patch[name]:
+        row_values = values if isinstance(values, (list, tuple)) else None
+        for column, name in enumerate(patch.columns):
+            for position, value in enumerate(patch[name]):
+                if row_values is not None and name not in row_values[position]:
+                    patch.iat[position, column] = self.df.at[keys[position], name]
+                    continue
                 if not isinstance(value, str):
                     raise self.error_type("最终更新字段必须为字符串：字段={}，实际类型={}".format(
                         name, type(value).__name__))
@@ -234,6 +238,7 @@ class StageSummary:
     processing: int = 0
     http_attempts_started: int = 0
     blocked_assets: tuple = ()
+    skipped_round2: int = 0
 
     def add_month(self, month):
         """round3事件影响分析用已有 processing 计数检查本月结束，再累加标量，不额外读表。"""
@@ -244,6 +249,7 @@ class StageSummary:
         self.failed += month.failed
         self.pending += month.pending
         self.processing += month.processing
+        self.skipped_round2 += month.skipped_round2
         return month.new_completed, month.failed
 
 
@@ -365,25 +371,32 @@ class EventRecordStore(TableStore):
         self.claim_stage(keys, stage, digest)
 
     def save_relation(self, key, result, response=None, attempts=0):
-        """共同保存关联终态和最后一次回答；自动判新不伪造 AI 调用信息。"""
-        if response is not None and not response.success:
-            values = dict.fromkeys(RELATION_COLUMNS, "")
-            values.update(round2_status="-1", error_message=response.error_message[:512],
-                          round2_ai_response=_event_response_json(response, attempts))
-            self.update_stage_columns([key], values, "round2", prepare_write=_stamp_event_responses)
-            return
-        relation = result["event_relation"]
-        if relation == "uncertain":
-            logger.info("round2事件去重归组正常 uncertain 按 new 建档：record_id=%s", key[1])
-            relation = "new"
-        values = {"event_relation": relation,
-                  "event_id": key[1] if relation == "new" else result["matched_event_id"],
-                  "new_information": result["new_information"] or "",
-                  "round2_ai_response": _event_response_json(response, attempts),
-                  "round2_status": "1", "error_message": ""}
-        if relation != "repeat":
-            values["round3_status"] = "0"
-        self.update_stage_columns([key], values, "round2", prepare_write=_stamp_event_responses)
+        self.save_relation_batch([(key, result, response, attempts)])
+
+    def save_relation_batch(self, items):
+        """一次保存已有结果；混合批中的 repeat 和失败保留原第三轮状态。"""
+        rows = []
+        for key, result, response, attempts in items:
+            if response is not None and not response.success:
+                values = dict.fromkeys(RELATION_COLUMNS, "")
+                # 普通原因已由请求层限制长度；ReadTimeout 附带的完整 user 原样保留。
+                values.update(round2_status="-1", error_message=response.error_message,
+                              round2_ai_response=_event_response_json(response, attempts))
+            else:
+                relation = result["event_relation"]
+                if relation == "uncertain":
+                    logger.info("round2事件去重归组正常 uncertain 按 new 建档：record_id=%s", key[1])
+                    relation = "new"
+                values = {"event_relation": relation,
+                          "event_id": key[1] if relation == "new" else result["matched_event_id"],
+                          "new_information": result["new_information"] or "",
+                          "round2_ai_response": _event_response_json(response, attempts),
+                          "round2_status": "1", "error_message": ""}
+                if relation != "repeat":
+                    values["round3_status"] = "0"
+            rows.append(values)
+        self.update_stage_columns([key for key, _, _, _ in items], rows, "round2",
+                                  prepare_write=_stamp_event_responses)
 
     def save_embeddings(self, values):
         """按原索引只保存向量 JSON；存储重试不重新调用 Embedding 接口。"""
@@ -400,7 +413,7 @@ class EventRecordStore(TableStore):
         for key, response, attempts in items:
             row = {"round3_ai_response": _event_response_json(response, attempts),
                    "round3_status": "1" if response.success else "-1",
-                   "error_message": "" if response.success else response.error_message[:512]}
+                   "error_message": "" if response.success else response.error_message}
             rows.append(row)
         self.update_stage_columns([key for key, _, _ in items], rows, "round3", prepare_write=_stamp_event_responses)
 

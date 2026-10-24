@@ -1,0 +1,23 @@
+api:
+  headers: {}
+  payload:
+    messages:
+    - content: '{{prompts.system}}'
+      role: system
+    - content: '{{prompts.user}}'
+      role: user
+    model: test
+    stream: false
+  url: https://mock.invalid/ai
+prompts:
+  system: analyse
+  user: '{{task.text}}'
+run:
+  backoff_base_seconds: 0.001
+  backoff_max_seconds: 0.001
+  batch_size: 200
+  concurrency: 1
+  flush_interval_seconds: 0.01
+  progress_every: 100000
+  result_buffer_size: 200
+  storage_retry_seconds: 0.001

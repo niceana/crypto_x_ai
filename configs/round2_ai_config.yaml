@@ -90,8 +90,13 @@ api:
     temperature: 0
     stream: false
 run:
-  concurrency: 10
-  timeout_seconds: 120
+  # 仅限制同时执行的 HTTP 请求；数据准备、自动判新与写库不占 HTTP 名额。
+  concurrency: 5
+  # HTTP 并发之外，独立储备已经编码好、可直接发送的 AI 请求；取走即补货。
+  ready_request_buffer_size: 20
+  # 每保存确认此数量的结果汇报进度；未达到时每 10 秒在调度循环中汇报一次。
+  progress_every: 100
+  timeout_seconds: 300
   requests_per_second: 0
   max_attempts: 3
   backoff_base_seconds: 1

@@ -21,9 +21,9 @@ class EventStageTests(EventFixture, unittest.TestCase):
     def test_stages_use_imported_tasks_without_rechecking_first_results_or_mapping(self):
         for source_mode in ("invalid_results", "text_only"):
             with self.subTest(source_mode=source_mode):
-                source = source_posts([("2021-01-02", "已导入事件", [], "a"),
+                source = source_posts([("2021-01-02", "已导入事件", ["ETH"], "a"),
                                        ("2021-01-01", "未导入的旧帖", [], "unmapped")])
-                result = expand_first_round(source.iloc[:1], {"a": ["ETH"]})
+                result = expand_first_round(source.iloc[:1])
                 backend = Tables(source, result)
                 source = backend.tables["first"]
                 source.loc[source.index[0], "text"] = "第三轮不应读取这段原帖正文"
@@ -99,7 +99,7 @@ class EventStageTests(EventFixture, unittest.TestCase):
             with self.subTest(stamp=stamp):
                 source = source_posts([("2021-01-01", "one", ["ETH"], "a")])
                 source.index = pd.MultiIndex.from_tuples([(stamp, 123)], names=["date", "id"])
-                result = expand_first_round(source, {})
+                result = expand_first_round(source)
                 backend = Tables(source, result)
                 self.assertEqual(self.relate(backend).new_completed, 1)
                 summary = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),

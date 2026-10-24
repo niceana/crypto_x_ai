@@ -12,8 +12,8 @@ weight_path: ""
 # 每个枚举各自的候选数组独立展开；先用 --dry-run 预览表名及组合数。
 weight_grid:
   coefficients:
-    B: [1]
-    C: [1]
+    B: [2]
+    C: [0.5]
     D: [1]
   mappings:
     direction:
@@ -26,12 +26,12 @@ weight_grid:
       高: [3]
       中: [2]
       低: [1]
-      不确定: [0]
+      不确定: [2]
     execution_stage:
       未开始: [1]
       执行中: [2]
       已完成: [3]
-      不确定: [0]
+      不确定: [2]
     event_relation:
       new: [2]
       update: [1.5]
@@ -45,6 +45,12 @@ weight_grid:
   max_combinations: 1000
 round2_ai_config_path: "round2_ai_config.yaml"
 round3_ai_config_path: "round3_ai_config.yaml"
+# 连跑时第三轮先处理第二轮已成功的记录，跳过第二轮 0/9/-1，保留待后续补跑。
+# false 恢复严格检查：目标范围内第二轮存在任何未完成记录即停止第三轮。
+round3_skip_incomplete_round2: true
+# 第二、三轮每次启动时用 cli.read_object 读取此 JSON，UTF-8 解码，取 InstrumentList 每项第一个点之前的币名并去重。
+# 两轮共用此配置项，仅处理名单内的 asset；留空字符串时处理所有资产。本项不筛选权重入口。
+round2_asset_list_path: "crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json"
 # 第二、三轮和权重入口必须填写本次读取的起止日期（YYYY-MM-DD，含首尾日），未设置会停止。
 # 仅独立导入保留两端为空时的原有全范围规则。
 start_time: null
@@ -53,11 +59,10 @@ end_time: null
 # 按披露时刻向前推日历月，目标月没有对应日期时取月末；包含下界、排除当前时刻。
 # 不再回查窗口外的组起点和组内进展；缺少组起点时标记历史截断，已完成结果不自动重算。
 history_lookback_months: 3
-# 本项只控制独立导入入口；main.py 使用内存导入，不依赖此模式。
-initialize_mode: auto
 # 来源：用户提供的 TradeCoins 50 名单，生成于 2026-09-18。
 # 将原名单 screen_name 作为 user_name，ticker 转为列表。
-# 事件 tickers 为空时，按原帖 user_name 精确匹配，区分大小写。
+# 第一轮按 user_name 忽略大小写匹配，将关联币种作为 account_tickers 背景发送。
+# 不限制 AI 提取其他币种；空 tickers 在导入时跳过，不再按账号兜底。
 user_name_to_tickers:
   BitcoinMagazine: ["BTC"]
   ethereum: ["ETH"]

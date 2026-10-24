@@ -4,12 +4,40 @@ import os
 import unittest
 from unittest.mock import patch
 
-from common.config import ConfigError, ai_config_hash, load_job_config
+from common.config import (
+    ConfigError, ai_config_hash, load_ai_config, load_embedding_config,
+    load_event_config, load_job_config,
+)
 from common.ai_protocol import TaskRenderError, render_payload, parse_response, request_failure
 from tests.support import Fixture, success
 
 
 class ConfigTests(Fixture, unittest.TestCase):
+    def test_duplicate_key_reports_file_key_and_both_lines_without_values(self):
+        cases = (
+            (load_ai_config, "api:\n  headers:\n    Authorization: first-secret\n"
+             "    Authorization: second-secret\n", "Authorization", 3, 4),
+            (load_embedding_config, "api_key: first-secret\napi_key: second-secret\n",
+             "api_key", 1, 2),
+            (load_event_config, "logging:\n  level: first-secret\n  level: second-secret\n",
+             "level", 2, 3),
+            (lambda path: load_job_config(path, ("task_path",)),
+             "task_path: first-secret\ntask_path: second-secret\n", "task_path", 1, 2),
+        )
+        for load, raw, key, first_line, duplicate_line in cases:
+            with self.subTest(key=key):
+                self.path.write_text(raw, encoding="utf-8")
+                with self.assertRaises(ConfigError) as caught:
+                    load(self.path)
+                message = str(caught.exception)
+                self.assertIn("配置存在重复键", message)
+                self.assertIn(str(self.path), message)
+                self.assertIn(repr(key), message)
+                self.assertIn("第 {} 行".format(duplicate_line), message)
+                self.assertIn("首次出现在第 {} 行".format(first_line), message)
+                self.assertNotIn("first-secret", message)
+                self.assertNotIn("second-secret", message)
+
     def test_job_config_rejects_duplicate_root_and_nested_keys(self):
         base = "source_path: source\ntask_path: tasks\nai_config_path: ai.yaml\n"
         cases = ("task_path: other-tasks\n", "task_path: tasks\n",
@@ -40,6 +68,7 @@ class ConfigTests(Fixture, unittest.TestCase):
         self.document["api"]["url"] = "https://another.invalid/ai"
         self.document["api"]["headers"] = {"Authorization": "secret"}
         self.document["run"]["max_attempts"] = 5
+        self.document["run"]["ready_request_buffer_size"] = 40
         self.assertEqual(ai_config_hash(self.config()), baseline)
         self.document["api"]["payload"]["model"] = "another-model"
         self.assertNotEqual(ai_config_hash(self.config()), baseline)
@@ -51,7 +80,8 @@ class ConfigTests(Fixture, unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     self.config()
         self.document["prompts"]["user"] = "{{task.text}}"
-        for name, value in (("concurrency", True), ("max_attempts", 0), ("requests_per_second", -1),
+        for name, value in (("concurrency", True), ("max_attempts", 0),
+                            ("ready_request_buffer_size", 0), ("ready_request_buffer_size", True), ("requests_per_second", -1),
                             ("timeout_seconds", float("inf")), ("obsolete", 1)):
             with self.subTest(name=name):
                 previous = self.document["run"].copy()
@@ -239,6 +269,9 @@ class ResponseTests(unittest.TestCase):
         self.assertFalse(parsed.success)
         self.assertEqual(parsed.ai_response_content, "")
         self.assertEqual(len(request_failure("x" * 600).error_message), 512)
+        user_content = "完整输入" * 200 + "末尾"
+        failure = request_failure("ReadTimeout", user_content=user_content)
+        self.assertEqual(failure.error_message, "ReadTimeout\nuser=" + user_content)
         parsed = self.parse({"error": {"message": "错误", "code": "not-a-retry-rule"}})
         self.assertFalse(parsed.success)
         self.assertEqual(parsed.error_message, "错误")

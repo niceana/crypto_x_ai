@@ -1,6 +1,7 @@
 """验证研究流程的历史边界、任务状态、重试与续跑；不访问真实服务。"""
 
 import json
+import queue
 import threading
 from datetime import date
 
@@ -136,6 +137,29 @@ def impact_result():
 
 
 class EventFixture(Fixture):
+    def add_memory_ready_queue(self, network):
+        """为同步网络替身接入与真实执行器相同的就绪队列接口。"""
+        network.stopped = threading.Event()
+        network.request_stop = lambda reason="": network.stopped.set()
+        network.http_snapshot = lambda: (0, 0, 0.0)
+
+        def bind(requests, on_take):
+            network.ready_requests = requests
+            network.on_take = on_take
+            network.completions = queue.Queue()
+
+        def notify():
+            while not network.stopped.is_set():
+                try:
+                    job = network.ready_requests.get_nowait()
+                except queue.Empty:
+                    return
+                network.on_take()
+                network.submit(job)
+
+        network.bind_ready_queue, network.notify_ready = bind, notify
+        return network
+
     def settings(self, **kwargs):
         kwargs.setdefault("user_name_to_tickers", {})
         return EventConfig("first", "result", str(self.path), str(self.path),
@@ -150,7 +174,7 @@ class EventFixture(Fixture):
 
     def backend(self, posts):
         source = source_posts(posts)
-        result = expand_first_round(source, {})
+        result = expand_first_round(source)
         return Tables(source, result)
 
     def factory(self, handler):

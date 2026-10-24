@@ -183,6 +183,64 @@ class SimilarityAuditTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "尚未.*完成"):
                 self.export(frame, name="unfinished-{}".format(position))
 
+    def test_asset_list_excludes_unprocessed_assets_before_completion_check(self):
+        frame = records(
+            ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
+            ("2021-01-01", "skipped-history", [1, 0], "", "", "ZZZ"),
+            ("2021-01-03", "now", [1, 0], "old", "update", "ETH"),
+            ("2021-01-03", "skipped-current", [1, 0], "", "", "ZZZ"),
+        )
+        frame.loc[frame["asset"] == "ZZZ", ["round2_status", "embedding"]] = ["0", ""]
+        self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
+        document = {"InstrumentList": [" eth.exchange", "ETH.other", "BTC.exchange"]}
+        with patch.object(ReadOnlyClient, "read_object", return_value=json.dumps(document).encode("utf-8"),
+                          create=True) as read:
+            client, output, manifest = self.export(frame)
+        read.assert_called_once_with("asset-list.json")
+        pd.testing.assert_frame_equal(client.frame, frame)
+        self.assertEqual((manifest["events"], manifest["candidate_rows"]), (1, 1))
+        self.assertEqual([row["record_id"] for row in self.csv(output, "events.csv")], ["now"])
+        self.assertEqual(self.csv(output, "events.csv")[0]["history_records"], "1")
+        self.assertEqual([row["best_record_id"] for row in self.csv(output, "candidates.csv")], ["old"])
+        self.assertTrue(all(row["events"] == "1" for row in self.csv(output, "thresholds.csv")))
+
+    def test_asset_list_still_rejects_unfinished_target_current_or_history(self):
+        self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
+        document = {"InstrumentList": ["ETH.exchange"]}
+        for position in (0, 1):
+            with self.subTest(position=position):
+                frame = records(
+                    ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
+                    ("2021-01-03", "now", [1, 0], "old", "update", "ETH"),
+                )
+                frame.iloc[position, frame.columns.get_loc("round2_status")] = "0"
+                with patch.object(ReadOnlyClient, "read_object", return_value=json.dumps(document).encode("utf-8"),
+                                  create=True), self.assertRaisesRegex(ValueError, "尚未.*完成"):
+                    self.export(frame, name="unfinished-target-{}".format(position))
+
+    def test_asset_list_with_no_target_records_exports_empty_without_reading_history(self):
+        frame = records(("2021-01-03", "skipped", [1, 0], "", "", "ZZZ"))
+        frame["round2_status"], frame["embedding"] = "0", ""
+        self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
+        document = {"InstrumentList": ["ETH.exchange"]}
+        with patch.object(ReadOnlyClient, "read_object", return_value=json.dumps(document).encode("utf-8"),
+                          create=True) as read:
+            client, output, manifest = self.export(frame)
+        read.assert_called_once_with("asset-list.json")
+        self.assertEqual(len(client.reads), 1)
+        self.assertEqual((manifest["events"], manifest["candidate_rows"]), (0, 0))
+        self.assertFalse(self.csv(output, "events.csv"))
+        self.assertFalse(self.csv(output, "candidates.csv"))
+        self.assertTrue(all(row["events"] == "0" for row in self.csv(output, "thresholds.csv")))
+
+    def test_asset_list_read_failure_stops_without_exporting_all_assets(self):
+        frame = records(("2021-01-03", "only", [1, 0], "only", "new", "ETH"))
+        self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
+        with patch.object(ReadOnlyClient, "read_object", side_effect=RuntimeError("名单读取失败"), create=True), \
+                self.assertRaisesRegex(RuntimeError, "名单读取失败"):
+            self.export(frame)
+        self.assertFalse((self.root / "report").exists())
+
     def test_empty_batch_outputs_headers_and_zero_counts(self):
         frame = records()
         _, output, manifest = self.export(frame)

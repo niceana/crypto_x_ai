@@ -2,6 +2,16 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python：调试第一轮",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "entrypoints.run_round1",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "pythonArgs": ["-X", "utf8"],
+            "justMyCode": true
+        },
+        {
             "name": "Python：调试当前文件",
             "type": "debugpy",
             "request": "launch",

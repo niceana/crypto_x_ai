@@ -24,6 +24,8 @@
 
 下文命令中的 `python` 均应使用 Python 3.8.5；本机可替换为 `.\.python38\venv\Scripts\python.exe`，不依赖系统 PATH 的默认版本。
 
+三轮 AI 请求遇到 HTTP 429 时会在本次运行中暂停后重试，全部后续起发共同等待本地指数随机退避和有效 `Retry-After` 中的较长时间；缺少有效响应头时使用本地退避。429 与网络故障、5xx、无效输出共用 `run.max_attempts`，默认 3 次且包含首次；最后仍为 429 时保存失败并停止，避免无限重试。第二轮 Embedding 请求也在其独立批次预算内重试 429。持续限流时应降低 `concurrency` 或设置 `requests_per_second`；等待重试不会自动调整并发配置。
+
 | 文件 | 用途 |
 | --- | --- |
 | `configs/post_extraction_config.yaml` | 帖子提取任务：源帖子路径、round1帖子事件提取表、日期范围、round1事件提取 AI 配置和日志 |
@@ -58,14 +60,14 @@ round1事件提取初始化完整读取源帖，校验后注册目标并一次�
 配置好round1事件提取 AI，以及事件配置的 `result_path` 和所需账号映射后，日常依次执行：
 
 ```powershell
-python -X utf8 main.py
+python -X utf8 -m entrypoints.run_round1
 python -X utf8 -m entrypoints.run_round2
 python -X utf8 -m entrypoints.run_round3
 ```
 
-`main.py` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 post_extraction_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
+`entrypoints.run_round1` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 post_extraction_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
 
-当前仓库的表路径仍为占位文本，三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第二、三轮 system 均已配置正式提示词。第一轮仍使用“简要概括”示例提示词，与程序要求的事件 JSON 不一致，实际提取前必须替换。账号映射已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_processing_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词始终分析当前完整 event，new_information 仅辅助理解事件进展和新旧变化。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
+当前三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第一轮已配置事件 JSON 提取及账号背景规则，第二、三轮 system 均已配置正式提示词；提取及经济影响判断的质量仍需真实样本验证。账号背景已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_processing_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词始终分析当前完整 event，new_information 仅辅助理解事件进展和新旧变化。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
 
 round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时round1事件提取结果保留，重新运行同范围可跳过成功帖 AI 并补导。没有成功帖时不创建事件去重分析表。
 
@@ -75,11 +77,11 @@ round1事件提取普通单帖失败不阻止其他成功帖导入；round1事�
 python -X utf8 -m entrypoints.import_events
 ```
 
-独立导入使用 `configs/event_processing_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功；initialize_mode 支持 auto/create/resume，只控制该独立入口。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
+独立导入使用 `configs/event_processing_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功。导入自动判断目标是否存在：仅明确缺表时注册并首次写入；已有目标严格校验后只追加缺失记录，保留已有分析结果。无需配置导入模式。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
 
 已有第一轮回答的 event 正文包含未转义英文双引号时，导入会批量尝试在内存中补转义，再严格校验；第一轮原始回答和状态保留，不调用 AI，也无需新参数或依赖。日志逐条记录修复与失败的帖子 ID，并汇总数量。内容截断、字段缺失或边界不明确的记录集中报错，本批在建表或写入前停止。具体支持范围和例子见 [历史回答引号修复](docs/rules/EVENT_RULES.md#历史回答中未转义引号的批量处理)。
 
-`configs/event_processing_config.yaml` 已包含用户提供的 50 组账号代币映射，保留原名单大小写及迁移备注。原名单 `screen_name` 对应原帖 `user_name`，`ticker` 转为代币列表。空 tickers 使用账号映射，例如：
+`configs/event_processing_config.yaml` 已包含用户提供的 50 组账号关联币种，保留原名单大小写及迁移备注。第一轮随正文发送 `user_name`，按账号忽略大小写匹配后附加可选 `account_tickers`；没有背景时省略该字段。配置例如：
 
 ```yaml
 user_name_to_tickers:
@@ -87,13 +89,37 @@ user_name_to_tickers:
   project_account: ["ETH", "LEND"]
 ```
 
-`tickers: []` 在第一轮属于合法输出，导入时才按原帖 `user_name` 精确查映射；没有映射会报错并停止本次整批导入，其他成功帖的事件本次也不会新增。第一轮已保存结果及成功状态保留，不为无代币事件创建失败行；补齐映射后重跑同一范围的 main.py 可补导。若整个 tickers 字段缺少、为 null 或类型不合法，则第一轮输出校验失败并按请求预算重试。`events: []` 表示没有事件，不查映射。具体例子见 [事件展开规则](docs/rules/EVENT_RULES.md#2-检查round1事件提取并展开记录)。
+账号背景只帮助理解主体及指代，不能补造事实、不限制 AI 识别其他币种；没有背景的账号可能是公共媒体，逐条按正文判断。`tickers: []` 为合法输出，导入时直接跳过该事件，不按账号兜底，也不阻止其他事件导入。原回答和第一轮成功状态保留，不创建第二、三轮任务。缺少 tickers 字段、为 null 或类型不合法仍属输出错误，按请求预算重试。新规则不自动重跑历史成功帖或迁移旧事件行；已有表与新展开结果冲突时仍停止核对。具体例子见 [事件展开规则](docs/rules/EVENT_RULES.md#2-检查round1事件提取并展开记录)。
+
+## 分析资产频数
+
+在可导入 xdata 的 Python 环境中安装 matplotlib 后，可在项目根目录直接执行：
+
+```powershell
+python -X utf8 -m entrypoints.plot_asset_frequency
+```
+
+默认按 event_processing_config.yaml 的 result_path 及可选 start_time/end_time 读取 asset 列；日期留空时读取全表，不检查任务状态。输出到 reports/asset_frequency/，默认仅保存 PNG 和 CSV；`--top-n 100` 调整条形图展示数量，`--output-dir` 指定保存目录，`--show` 额外弹出图形窗口。
+
+将第一轮已导入的第二、三轮共用结果表读取为 `df` 后，在分析环境安装 `matplotlib`，即可使用以下代码。只需 asset 列，不要求第二、三轮运行或成功：
+
+```python
+from postprocessing.asset_frequency import plot_asset_frequency
+
+# 结果表每行计一次，不检查任务状态或事件组。
+frequency, figure = plot_asset_frequency(df, top_n=30, output_dir="reports/asset_records")
+print(frequency.head(100))
+```
+
+每次绘制 Top N 条形图、全部资产排名频数对数图和累计覆盖率曲线，标注覆盖 80%/90%/95% 数据需要的资产数；可选输出目录保存 PNG 与完整 CSV。累计占比的分母为全部有效资产行，不限于 Top N。`asset` 按原值统计，方便发现大小写、空白或别名造成的拆分；不读取状态或 event_id，不按事件组去重。没有出现在 df 中的资产不自动补零。只需统计时使用 `asset_frequency(df)`，不需要绘图库。
 
 round2事件去重归组默认使用 `embedding_config_path: "embedding_config.yaml"` 指向的 bge-m3 纯向量检索。填写该文件的 base_url，例如 `https://服务地址/v1`，程序追加 `/embeddings`；把密钥填入 `configs/.env` 的 EMBEDDING_API_KEY 或进程环境。默认每批 8 条，只编码 event；生成后保存到事件去重分析表的 embedding 列，JSON 包含 model、model_version、config_hash 和 vector，重启复用。config_hash 只标识服务、模型、版本和编码规则，不含 event；同名模型更换权重时要修改 model_version，人工修改 event 时须清空该行向量并确定下游重算范围。第二轮只使用 event 和候选历史，不再读取原帖；第三轮仅使用本条记录的 asset、event、new_information，也不读取原帖。初始化已包含该列，不使用 SQLite。
 
 用户确认模型已输出归一化向量；程序保留返回数值，直接用内积计算余弦相似度，不再归一化或转成 float32。仍校验格式、维度、有限数值、非零向量及单位范数，范数允许绝对误差 1e-5；新响应不满足约定时使用该批剩余请求预算重试，耗尽后停止。
 
-第二轮先按 event_processing_config.yaml 指定日期读取待处理任务，前史校验、候选检索及向量准备共用 history_lookback_months（默认 3 个日历月）。下面仅为范围填写示例，按实际要处理的日期修改：
+第二、三轮共用 `round2_asset_list_path` 配置，各自在入口中用 `json.loads(cli.read_object(path).decode('utf-8'))['InstrumentList']` 读取名单，取每项第一个 `.` 前的币名，去首尾空白、转大写并去重。当前路径为 `crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json`。两轮都只处理日期范围内 `asset` 命中名单的记录。第二轮在状态恢复、前史检查、向量准备和任务调度之前筛选；第三轮在检查第二轮状态、恢复第三轮状态、准备 AI 请求及 repeat 继承之前筛选，统计也只包含目标资产。每轮启动读取一次名单；配置留空字符串或未配置时处理全资产。本项不筛选权重入口。
+
+第二轮按 event_processing_config.yaml 指定日期读取待处理任务，前史校验、候选检索及向量准备共用 history_lookback_months（默认 3 个日历月）。下面仅为范围填写示例，按实际要处理的日期修改：
 
 ```yaml
 start_time: "2025-01-01"
@@ -105,7 +131,11 @@ history_lookback_months: 3
 
 每条披露按自身发布时间 t 检索 `[t-3个月, t)`，包含下界、排除同刻与未来。普通历史不读取 3 个月下界以前的数据；较晚已完成冲突只读取资产、状态两列，全表 AI 摘要仍只读单列。组起点不在窗口内时不回查旧组，保留已保存的组 ID 和窗口内进展；内部 first_disclosure=null、history_trimmed=true，并用 first_available_disclosure 提供窗口内最早披露。第二轮 AI 只接收 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 来自对应 df 的 date 索引值，以字符串保留完整精度和时区；不发送真实 event_id、资产、披露标识、增量、次数或截断标记。窗口内起点或最早可用披露与全部 update 的完整 event 按顺序保留。AI 返回 matched_candidate_id，程序校验并映射回真实 event_id 后保存；每个请求独立使用 E1、E2 等编号，重试沿用原输入和映射，数据库结构不变。第三轮不接收组历史，仅使用本条记录的事件输入。输入例子及边界见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)。
 
-第三轮先按配置范围读任务，无任务或全部完成时直接返回。检查整个范围的第二轮状态和本条基本关联后，恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new/update 均分析当前完整 event，new_information 辅助理解进展。第二轮保存 repeat 时不改第三轮状态，初始仍为 0；第三轮不调用模型，而是复制同币种、同事件组严格早于本条披露的最近有效第三轮响应，保存后标记完成。仅在有待处理 repeat 时读取必要的历史响应列和元数据，不受第二轮 3 个月窗口限制；new/update 的 AI 输入仍不含历史或原帖，不回查组起点。新回答须为恰好五字段的合法 JSON，五字段均为非空字符串，前四字段严格使用正式提示词规定的枚举；不合规则按原请求预算重试，耗尽后标记本条失败。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+第三轮先按配置范围读任务。当前事件配置开启 `round3_skip_incomplete_round2: true`：在状态检查、恢复、AI 请求和 repeat 继承前，跳过第二轮状态为 `0/9/-1` 的记录，先处理第二轮已完成的部分；跳过行的状态、回答与错误均保留。第二轮标记成功但基本关联不合法，或状态值未知，仍会停止。配置关闭或省略时保留严格规则，目标范围第二轮有未完成就停止。汇总的 total 等字段只计入可处理记录，skipped_round2 单列跳过数量；补跑第二轮后再运行第三轮，会补上新完成的记录，已成功的第三轮不重做。
+
+无可处理任务或可处理部分全部完成时，第三轮直接返回。其余记录检查通过后恢复第三轮状态，再按月分析 new/update。请求必含 asset、event；仅在有新增信息时附带 new_information，空值或纯空白时省略该字段。new/update 均分析当前完整 event，new_information 辅助理解进展。第二轮保存 repeat 时不改第三轮状态，初始仍为 0；第三轮不调用模型，而是复制同币种、同事件组严格早于本条披露的最近有效第三轮响应，保存后标记完成。仅在有待处理 repeat 时读取必要的历史响应列和元数据，不受第二轮 3 个月窗口限制；new/update 的 AI 输入仍不含历史或原帖，不回查组起点。新回答须为恰好五字段的合法 JSON，五字段均为非空字符串，前四字段严格使用正式提示词规定的枚举；不合规则按原请求预算重试，耗尽后标记本条失败。仍保留跨月 record_id 检查、全表第三轮配置摘要单列核对，以及原有并发、保存和停止恢复规则。详细边界见 [第三轮规则](docs/rules/EVENT_RULES.md#7-round3事件影响分析检查调度和保存)。
+
+使用 `round2 && round3` 连跑时，第二轮单条普通失败仍允许整轮正常返回并启动第三轮，开启上述开关即可先处理成功部分；若第二轮整轮异常退出，`&&` 不会启动第三轮，第三轮开关不改变外部命令的行为。第三轮自身的配置、摘要冲突、数据库和停止型 HTTP 错误仍按原规则停止。
 
 按事件组最高余弦分数筛选，只将分数大于等于 similarity_threshold 的最多 10 组交round2事件去重归组；无历史或所有组都低于阈值时直接 new，继续round3事件影响分析。默认阈值 0.50 是待真实样本标定的试运行起点，可在 Embedding 配置调整：
 
@@ -187,6 +217,14 @@ summary = run_extraction(
 ## 日志、停止和调试
 
 入口使用任务配置的 logging，级别和各入口既有默认格式保留；日志模块名称随目录更新。INFO 显示进度和统计，WARNING 显示重试和单条失败，ERROR 显示整体停止和保存故障。常规项目日志不主动输出正文、提示词、认证或完整响应；外部异常说明仍按原文显示。
+
+ReadTimeout 排查日志是例外：三轮 AI 每次读取超时都会在 WARNING 日志中直接输出任务已有的完整 `text` 输入，不反解析 HTTP 请求体，也不再次包装成 JSON 数组。第二轮即已组装好的 current 和 candidates，第一轮为原帖正文，第三轮为已组装好的当前事件输入。当前第二、三轮 user 模板为 `{{task.text}}`，与该业务输入一致；第一轮仅记录原帖，不附加模板里的固定说明。若以后修改模板，日志仍记录业务输入本身。若重试耗尽时最终仍为 ReadTimeout，同样的内容以换行及 `user=` 追加到 error_message，完整保留、不按 512 字符截断；其他错误继续沿用原限制，最终成功则清空错误。重试预算和状态规则不变。
+
+第二轮启动时显示读表、历史校验及向量准备阶段。主线程批量认领各币当前可推进时点的任务，再将固定输入交给独立准备线程，提前检索、判断自动 new、组装并编码 AI 请求。`configs/round2_ai_config.yaml` 的 `run.ready_request_buffer_size` 默认 20，只限制已经准备好、尚未发送的备用 AI 请求。网络线程取得 HTTP 名额后从就绪队列取请求，取走即通知补货；补货不等待答复写库。自动判新及构造失败直接进入同一结果队列，不占备用请求位置。主线程按当前队列快照收取已有结果，一条就直接保存，多条就一次合并保存，不等待未来结果凑批或定时刷新；写库期间新返回的结果留到下一批。第二轮不再使用 result_buffer_size 限制准备或结果总量；数据库慢时允许结果积压，继续发送就绪请求。只准备同币当前时点，下一时点仍等前一时点全部写库后再准备；同刻使用同一份此前历史。
+
+处理期间每保存确认 `configs/round2_ai_config.yaml` 中 `run.progress_every` 条结果（默认 100 条），或距上次汇报达到 10 秒时输出进度；开始、结束和异常停止也会汇报。日志包含已处理比例、已有完成、本次成功和失败、自动判新、剩余未处理、HTTP 请求中数量/并发上限、准备状态、待准备数量、就绪请求数量/备用上限、已认领未落库数量、待写库数量、累计 HTTP 尝试、暂停币种数、耗时及结果确认速度。直接读取各队列和计数的瞬时快照，不再用差值推算等待发送数量。成功和失败均在结果写库确认后才计入已处理；失败会单列，已处理 100% 不代表全部成功。统计不额外查库。10 秒汇报由调度循环触发，同步读写阻塞时会延后到返回后输出。
+
+每次进度之后另报瓶颈统计：HTTP 平均并发按网络启动以来实际请求占用时长积分计算，并给出峰值，避免单看主线程取样时的瞬时并发。待写库结果拆成 AI、自动判新和其他；同时显示仍未结束的币种、可认领币种、有后续数据且前序结果待写库的币种。结果保存与认领写库分别显示平均每批耗时、平均批量及折合每条耗时，统计覆盖运行以来的调用，包含存储重试；认领计时仅覆盖状态和配置摘要写入及内存同步，不包含读表、向量计算或请求准备。待准备和就绪都为 0、待写库较多时，应结合这些指标判断是否卡在同币写库解锁；名单命中资产数不等于同时可请求 AI 的币种数。结果确认速度是整轮处理速度，不能当作单次数据库调用速度。一批结果保存确认后，共同认领已解锁的下一时点任务并立即提交准备，不再等待解锁币种达到 HTTP 并发数；认领仍按每次最多 200 条提交。
 
 各轮专用日志使用完整主题名称，建表、读取及导入日志明确表名。公共网络与分段执行日志使用通用任务描述；内部阶段标识 `round1/round2/round3`、异常文本和错误字段继续沿用原值。
 

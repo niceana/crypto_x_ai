@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from common.config import load_ai_config
+from common.event_context import build_extraction_input, prepare_account_tickers
 from common.network import RequestJob, NetworkWorker as _NetworkWorker, _create_client, parse_retry_after as _retry_after
 from common.execution import check_month_complete, month_ranges as _month_ranges, run_segments
 from common.validation import validate_extraction_output
@@ -38,7 +39,7 @@ class ExtractionSummary:
 
 
 def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, *,
-               on_successful_posts=None) -> ExtractionSummary:
+               on_successful_posts=None, user_name_to_tickers=None) -> ExtractionSummary:
     """同步处理指定日期范围；当前月结果全部确认后才读取下一月。
 
     cli 直接读取 task_path 并按原索引更新指定列，始终在调用入口线程执行。
@@ -47,6 +48,7 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
     BatchPersistenceError，用户中断继续传播 KeyboardInterrupt。
     on_successful_posts(new_posts, previous_posts) 可在分段保存结束后接收成功帖副本；
     previous_posts 是本段载入时已经成功的帖子，两表仅含原索引和后续处理所需字段。
+    user_name_to_tickers 仅作为 AI 判断事件归属的账号背景，不在导入时兜底。
     """
     started = time.monotonic()
     logger.info("round1事件提取开始启动")
@@ -61,6 +63,7 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
             if start > end:
                 raise ValueError("start_time 不能晚于 end_time")
         config = load_ai_config(config_path)
+        account_tickers = prepare_account_tickers(user_name_to_tickers)
     except Exception:
         logger.exception("round1事件提取启动校验失败；尚未读取或更新round1帖子事件提取表")
         raise
@@ -80,7 +83,8 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
             keys = store.select(limit)
             jobs = store.claim(keys)
             digest = store.digest
-            return keys, (RequestJob(key, text, validate_extraction_output) for key, text in jobs)
+            return keys, (RequestJob(key, build_extraction_input(store.df.loc[key], account_tickers),
+                                     validate_extraction_output) for key, _ in jobs)
 
         def summarize_month():
             counts = summary.add_month(store)

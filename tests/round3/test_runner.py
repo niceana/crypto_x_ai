@@ -22,6 +22,86 @@ from tests.event_support import EventFixture, new_result, impact_result
 
 
 class ImpactRunnerTests(EventFixture, unittest.TestCase):
+    def test_skip_unfinished_round2_preserves_skipped_rows_and_resumes_after_completion(self):
+        backend = self.backend([("2021-01-01", "ready-root", ["ETH"], "a"),
+                                ("2021-01-02", "ready-repeat", ["ETH"], "a"),
+                                ("2021-01-03", "pending", ["ETH"], "a"),
+                                ("2021-01-04", "failed", ["ETH"], "a"),
+                                ("2021-02-01", "ready-other", ["BTC"], "a"),
+                                ("2021-02-02", "processing", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        ready = [frame.index[i] for i in (0, 1, 4)]
+        skipped = [frame.index[i] for i in (2, 3, 5)]
+        frame.loc[ready, "round2_status"] = "1"
+        frame.loc[ready, "event_relation"] = "new"
+        for key in ready:
+            frame.at[key, "event_id"] = key[1]
+        frame.loc[ready[1], ["event_relation", "event_id"]] = ["repeat", ready[0][1]]
+        frame.loc[skipped, "round2_status"] = ["0", "-1", "9"]
+        frame.loc[skipped, "round3_status"] = ["9", "-1", "0"]
+        frame.loc[skipped, "error_message"] = "preserve second-round error"
+        frame.loc[skipped, "round3_ai_response"] = "preserve old response"
+        before = frame.loc[skipped].copy(deep=True)
+        settings = self.relation_settings(backend, round3_skip_incomplete_round2=True)
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request_text(request))["event"])
+            return success(json.dumps(impact_result()))
+
+        with self.assertLogs("round3.runner", level="INFO") as logs:
+            summary = run_impact(backend, settings, ai_config=self.config(), network_factory=self.factory(handler))
+        self.assertEqual((summary.total, summary.new_completed, summary.skipped_round2), (3, 3, 3))
+        self.assertEqual(summary.http_attempts_started, 2)
+        self.assertEqual(set(requests), {"ready-root", "ready-other"})
+        self.assertIn("跳过第二轮未完成=3", "\n".join(logs.output))
+        pd.testing.assert_frame_equal(frame.loc[skipped], before)
+        self.assertTrue(all(not batch.index.isin(skipped).any() for batch in backend.updates))
+        self.assertEqual(frame.at[ready[1], "round3_ai_response"], frame.at[ready[0], "round3_ai_response"])
+
+        completed = frame.loc[ready].copy(deep=True)
+        frame.loc[skipped, "round2_status"] = "1"
+        frame.loc[skipped, "event_relation"] = "new"
+        for key in skipped:
+            frame.at[key, "event_id"] = key[1]
+        requests.clear()
+        summary = run_impact(backend, settings, ai_config=self.config(), network_factory=self.factory(handler))
+        self.assertEqual((summary.total, summary.already_completed, summary.new_completed, summary.skipped_round2),
+                         (6, 3, 3, 0))
+        self.assertEqual(set(requests), {"pending", "failed", "processing"})
+        pd.testing.assert_frame_equal(frame.loc[ready], completed)
+
+    def test_all_unfinished_round2_returns_skipped_count_without_recovery_or_ai(self):
+        backend = self.backend([("2021-01-01", "pending", ["ETH"], "a"),
+                                ("2021-02-01", "failed", ["ETH"], "a")])
+        frame = backend.tables["result"]
+        frame.loc[:, "round2_status"] = ["0", "-1"]
+        frame.loc[:, "round3_status"] = ["9", "-1"]
+        frame.loc[:, "event_relation"] = "repeat"
+        before = frame.copy(deep=True)
+        settings = self.relation_settings(backend, round3_skip_incomplete_round2=True)
+        with patch("round3.runner.load_ai_config", side_effect=AssertionError("不应加载 AI 配置")):
+            summary = run_impact(backend, settings, network_factory=lambda config: self.fail("不应启动网络"))
+        self.assertEqual((summary.total, summary.new_completed, summary.skipped_round2), (0, 0, 2))
+        self.assertFalse(backend.updates or backend.column_reads or backend.meta_reads)
+        pd.testing.assert_frame_equal(frame, before)
+
+    def test_skip_unfinished_round2_still_rejects_invalid_success_and_unknown_status(self):
+        for status, relation, event_id in (("1", "new", "wrong-self-id"),
+                                           ("1", "uncertain", "group"),
+                                           ("unknown", "new", "wrong-self-id")):
+            with self.subTest(status=status, relation=relation):
+                backend = self.backend([("2021-01-01", "invalid", ["ETH"], "a")])
+                frame = backend.tables["result"]
+                frame.loc[:, ["round2_status", "event_relation", "event_id", "round3_status"]] = [
+                    status, relation, event_id, "9"]
+                before = frame.copy(deep=True)
+                with self.assertRaisesRegex(ValueError, "第二轮未完成或结果不合法"):
+                    run_impact(backend, self.relation_settings(backend, round3_skip_incomplete_round2=True),
+                               ai_config=self.config(), network_factory=lambda config: self.fail("不应发请求"))
+                self.assertFalse(backend.updates)
+                pd.testing.assert_frame_equal(frame, before)
+
     def test_startup_logs_recovery_and_pending_counts_before_ai(self):
         backend = self.backend([("2021-01-01", "event {}".format(i), ["ETH"], "a") for i in range(4)])
         self.relate(backend)
@@ -483,7 +563,7 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         self.assertTrue(all(path == "result" and start == "2021-03-01" and end == "2021-03-31"
                             for path, start, end in backend.reads))
 
-    def test_impact_stop_does_not_execute_next_month(self):
+    def test_impact_429_exhaustion_does_not_execute_next_month(self):
         backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"),
                                 ("2021-02-01", "feb", ["ETH"], "a")])
         self.relate(backend)
@@ -494,9 +574,29 @@ class ImpactRunnerTests(EventFixture, unittest.TestCase):
         with self.assertRaises(BatchRunError):
             run_impact(backend, self.settings(start_time="2021-01-01", end_time="2021-02-01"),
                        ai_config=self.config(), network_factory=factory)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 3)
         self.assertFalse(any(start == "2021-02-01" for _, start, _ in actual_reads))
         self.assertEqual(list(backend.tables["result"]["round3_status"]), ["-1", "0"])
+
+    def test_impact_429_recovers_and_advances_month_in_same_run(self):
+        backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"),
+                                ("2021-02-01", "feb", ["ETH"], "a")])
+        self.relate(backend)
+        calls = []
+
+        def handler(request):
+            calls.append(request.content)
+            if len(calls) == 1:
+                return httpx.Response(429)
+            return success(json.dumps(impact_result()))
+
+        summary = run_impact(backend, self.relation_settings(backend), ai_config=self.config(),
+                             network_factory=self.factory(handler))
+        self.assertEqual((summary.new_completed, summary.failed, summary.http_attempts_started), (2, 0, 3))
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(list(backend.tables["result"]["round3_status"]), ["1", "1"])
+        responses = [json.loads(value) for value in backend.tables["result"]["round3_ai_response"]]
+        self.assertEqual([response["attempts"] for response in responses], [2, 1])
 
     def test_impact_storage_failure_does_not_read_or_advance_month_and_retains_buffer(self):
         backend = self.backend([("2021-01-01", "jan", ["ETH"], "a"),

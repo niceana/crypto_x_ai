@@ -57,6 +57,7 @@ class RunConfig:
     storage_max_attempts: int = 3
     storage_retry_seconds: float = 1
     progress_every: int = 100
+    ready_request_buffer_size: int = 20
 
 
 @dataclass(frozen=True)
@@ -74,12 +75,16 @@ class _UniqueLoader(yaml.SafeLoader):
 
 def _unique_mapping(loader, node):
     result = {}
+    key_marks = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=True)
         if not isinstance(key, str):
             raise ConfigError("配置字典键必须为字符串")
         if key in result:
-            raise ConfigError("配置存在重复键")
+            mark = key_node.start_mark
+            raise ConfigError("配置存在重复键：{}，键 {!r}，第 {} 行（首次出现在第 {} 行）".format(
+                mark.name, key, mark.line + 1, key_marks[key].line + 1))
+        key_marks[key] = key_node.start_mark
         result[key] = loader.construct_object(value_node, deep=True)
     return result
 
@@ -91,7 +96,7 @@ TEMPLATE_VARIABLE = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
 _ENVIRONMENT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _INTEGER_FIELDS = {
     "concurrency", "batch_size", "result_buffer_size", "max_attempts",
-    "storage_max_attempts", "progress_every",
+    "storage_max_attempts", "progress_every", "ready_request_buffer_size",
 }
 
 
@@ -248,18 +253,20 @@ class EventConfig:
     end_time: str = None
     user_name_to_tickers: dict = None
     retriever: str = ""
-    initialize_mode: str = "create"
     logging: dict = None
     embedding_config_path: str = ""
     history_lookback_months: int = 3
     weight_path: str = ""
     weight_grid: dict = None
+    round2_asset_list_path: str = ""
+    round3_skip_incomplete_round2: bool = False
 
 
 def load_event_config(path):
     """安全加载并拒绝重复键，按配置目录解析 AI 路径，数据系统路径原样保留。"""
     path = Path(path).absolute()
-    document = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueLoader)
+    with path.open(encoding="utf-8") as handle:
+        document = yaml.load(handle, Loader=_UniqueLoader)
     if not isinstance(document, dict):
         raise ValueError("扩展配置必须为字典")
     allowed = set(EventConfig.__dataclass_fields__)
@@ -296,11 +303,11 @@ def load_event_config(path):
         raise ValueError("retriever 必须为字符串")
     if not isinstance(document.get("embedding_config_path", ""), str):
         raise ValueError("embedding_config_path 必须为字符串")
+    if type(document.get("round3_skip_incomplete_round2", False)) is not bool:
+        raise ValueError("round3_skip_incomplete_round2 必须为布尔值")
     months = document.get("history_lookback_months", 3)
     if type(months) is not int or months <= 0:
         raise ValueError("history_lookback_months 必须为正整数日历月数")
-    if document.get("initialize_mode", "create") not in ("auto", "create", "resume"):
-        raise ValueError("initialize_mode 只能为 auto、create 或 resume")
     if not isinstance(document.get("logging", {}), dict):
         raise ValueError("logging 必须为字典")
     values = dict(document, user_name_to_tickers=mapping, logging=document.get("logging", {}))
@@ -332,7 +339,8 @@ def load_embedding_config(path):
     """加载向量接口及筛选阈值；.env 以本配置目录为准。"""
     path = Path(path).absolute()
     try:
-        document = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueLoader)
+        with path.open(encoding="utf-8") as handle:
+            document = yaml.load(handle, Loader=_UniqueLoader)
     except (yaml.YAMLError, UnicodeError) as exc:
         raise ConfigError("Embedding 配置无法作为 UTF-8 YAML 解析") from exc
     document = _mapping(document, "Embedding 配置", set(EmbeddingConfig.__dataclass_fields__))
@@ -375,7 +383,8 @@ def load_embedding_config(path):
 
 def load_job_config(path, required_fields):
     """安全加载并拒绝重复键，检查入口必填字段；其他约束由入口继续检查。"""
-    settings = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=_UniqueLoader)
+    with Path(path).open(encoding="utf-8") as handle:
+        settings = yaml.load(handle, Loader=_UniqueLoader)
     if not isinstance(settings, dict):
         raise ValueError("任务配置必须为字典")
     for field in required_fields:

@@ -1,4 +1,4 @@
-"""独立导入事件去重分析表，支持 auto/create/resume；日常由 main.py 自动调用导入模块。"""
+"""独立导入事件去重分析表，自动判断建表或追加；日常由 round1 入口自动导入。"""
 
 from initialization.event_records import import_event_records_from_table
 from entrypoints.runtime import execute, run_entrypoint

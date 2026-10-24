@@ -18,7 +18,7 @@ from tests.event_support import source_posts
 def completed_records(posts):
     """根据 (时间, 事件, 代币) 构造已完成的独立事件组。"""
     source = source_posts([(stamp, event, [asset], "account") for stamp, event, asset in posts])
-    frame = expand_first_round(source, {})
+    frame = expand_first_round(source)
     frame["round2_status"] = "1"
     frame["event_relation"] = "new"
     frame["event_id"] = frame.index.get_level_values("record_id")

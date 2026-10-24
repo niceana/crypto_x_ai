@@ -7,7 +7,7 @@ ai_config_path: "round1_ai_config.yaml"
 start_time: "2021-01-01"
 end_time: "2021-12-31"
 
-# 初始化启动入口、main.py 和接入函数使用此配置；应用已有日志处理器时保持它们。
+# 初始化入口、round1 入口和接入函数使用此配置；应用已有日志处理器时保持它们。
 logging:
   level: INFO
   format: "%(asctime)s | %(levelname)s | %(name)s | %(threadName)s | %(message)s"

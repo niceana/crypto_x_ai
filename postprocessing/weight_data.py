@@ -37,16 +37,16 @@ def _parse_impact(raw_response):
 
 
 def parse_weight_features(results):
-    """逐行解析本条已保存的响应；repeat 的响应填充由第三轮负责。"""
+    """只解析第二、三轮均成功的记录；repeat 的响应填充由第三轮负责。"""
     validate_index(results, "record_id")
     missing = set(SOURCE_COLUMNS) - set(results.columns)
     if missing:
         raise ValueError("结果表缺少字段：{}".format(sorted(missing)))
     rows = []
     for key, asset, relation, response, status2, status3 in results[SOURCE_COLUMNS].itertuples(name=None):
+        if status2 != "1" or status3 != "1":
+            continue
         try:
-            if status2 != "1" or status3 != "1":
-                raise ValueError("第二、三轮尚未全部成功完成")
             if not isinstance(asset, str) or not asset.strip():
                 raise ValueError("asset 必须为非空字符串")
             if relation not in EVENT_RELATIONS:
@@ -62,7 +62,8 @@ def parse_weight_features(results):
                      impact["execution_stage"], impact["persistence"], relation))
     features = pd.DataFrame(rows, columns=["date", "record_id", "asset", "direction", "materiality",
                                           "execution_stage", "persistence", "event_relation"])
-    logger.info("权重特征解析完成：事件=%d，全部使用本条已保存响应", len(features))
+    logger.info("权重特征解析完成：参与事件=%d，跳过未成功事件=%d，全部使用本条已保存响应",
+                len(features), len(results) - len(features))
     return features
 
 

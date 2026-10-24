@@ -1,5 +1,6 @@
 """round3事件影响分析独立分析和并发调度；按正式提示词校验五字段与枚举。"""
 
+import json
 import logging
 from collections import deque
 from datetime import date, timedelta
@@ -86,8 +87,28 @@ def _complete_repeat_impacts(store, groups, latest):
             _remember_impact_response(latest, groups, key, store.df.loc[key])
 
 
-def _prepare_impact(cli, settings, run, ranges):
-    """先检查整个范围的第二轮结果，再按月恢复第三轮，不读取原帖。
+def _load_impact_store(cli, settings, run, start, end, target_assets):
+    """在状态检查、恢复与结果继承前，限定本月工作表和索引位置。"""
+    store = EventRecordStore(cli, settings, run, start, end)
+    if target_assets is not None:
+        total = len(store.df)
+        store.df = store.df.loc[store.df["asset"].isin(target_assets)].copy()
+        store.positions = {key: position for position, key in enumerate(store.df.index)}
+        logger.debug("round3事件影响分析资产筛选完成：起点=%s，终点=%s，范围记录=%d，目标记录=%d，跳过记录=%d",
+                     start, end, total, len(store.df), total - len(store.df))
+    store.skipped_round2 = 0
+    if settings.round3_skip_incomplete_round2:
+        # 只跳过已知的未完成状态；未知状态及标记成功但关系非法仍由 require_relation 拒绝。
+        incomplete = store.df["round2_status"].isin(["0", "9", "-1"])
+        store.skipped_round2 = int(incomplete.sum())
+        if store.skipped_round2:
+            store.df = store.df.loc[~incomplete].copy()
+            store.positions = {key: position for position, key in enumerate(store.df.index)}
+    return store
+
+
+def _prepare_impact(cli, settings, run, ranges, target_assets=None):
+    """先筛选并检查整个可处理范围，再按月恢复第三轮，不读取原帖。
 
     首遍仅保留跨月唯一性检查所需的记录键和汇总；后月不合法时，前月也不
     恢复状态。第二轮已负责归组，本轮只检查各条记录自身的状态和基本关系。
@@ -97,7 +118,11 @@ def _prepare_impact(cli, settings, run, ranges):
     repeat_groups = set()
     record_keys = {}
     for start, end in ranges:
-        store = EventRecordStore(cli, settings, run, start, end)
+        store = _load_impact_store(cli, settings, run, start, end, target_assets)
+        summary.skipped_round2 += store.skipped_round2
+        if store.skipped_round2:
+            logger.warning("round3事件影响分析跳过第二轮未完成记录：起点=%s，终点=%s，跳过=%d，可处理=%d；跳过记录待补跑第二轮后续跑第三轮",
+                           start, end, store.skipped_round2, len(store.df))
         keys = store.keys_in_scope()
         store.require_relation(keys)
         for key in keys:
@@ -118,14 +143,16 @@ def _prepare_impact(cli, settings, run, ranges):
     if summary.total == summary.already_completed:
         return summary, needs_ai, repeat_groups
 
-    # 整个范围通过后才恢复；保留配置冲突前可能已经完成恢复的既有顺序。
+    # 整个可处理范围通过后才恢复；保留配置冲突前可能已经完成恢复的既有顺序。
     summary = StageSummary("round3")
     for start, end in ranges:
-        store = EventRecordStore(cli, settings, run, start, end)
+        store = _load_impact_store(cli, settings, run, start, end, target_assets)
         keys = store.keys_in_scope()
         store.recover("round3", keys)
         already = store.count_completed("round3", keys)
-        summary.add_month(summarize(store, keys, "round3", already))
+        month = summarize(store, keys, "round3", already)
+        month.skipped_round2 = store.skipped_round2
+        summary.add_month(month)
         store = None
     return summary, needs_ai, repeat_groups
 
@@ -141,12 +168,18 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
     start, end = date.fromisoformat(settings.start_time), date.fromisoformat(settings.end_time)
     if start > end:
         raise ValueError("start_time 不能晚于 end_time")
+    target_assets = None
+    if settings.round2_asset_list_path:
+        universe = json.loads(cli.read_object(settings.round2_asset_list_path).decode("utf-8"))["InstrumentList"]
+        target_assets = {instrument.split(".", 1)[0].strip().upper() for instrument in universe}
     ranges = tuple(month_ranges(start, end))
-    logger.info("round3事件影响分析启动准备：起点=%s，终点=%s，分段数=%d；先检查整个范围的第二轮状态，再恢复第三轮状态",
-                settings.start_time, settings.end_time, len(ranges))
-    summary, needs_ai, repeat_groups = _prepare_impact(cli, settings, ai_config.run if ai_config else None, ranges)
-    logger.info("round3事件影响分析启动准备完成：任务数=%d，已有完成=%d，待处理数=%d，失败数=%d，处理中数=%d",
-                summary.total, summary.already_completed, summary.pending, summary.failed, summary.processing)
+    logger.info("round3事件影响分析启动准备：起点=%s，终点=%s，分段数=%d，跳过第二轮未完成=%s；先筛选并检查第二轮结果，再恢复第三轮状态",
+                settings.start_time, settings.end_time, len(ranges), settings.round3_skip_incomplete_round2)
+    summary, needs_ai, repeat_groups = _prepare_impact(
+        cli, settings, ai_config.run if ai_config else None, ranges, target_assets)
+    logger.info("round3事件影响分析启动准备完成：任务数=%d，已有完成=%d，待处理数=%d，失败数=%d，处理中数=%d，跳过第二轮未完成=%d",
+                summary.total, summary.already_completed, summary.pending, summary.failed, summary.processing,
+                summary.skipped_round2)
     if not needs_ai and not repeat_groups:
         logger.info("round3事件影响分析本范围无需调用 AI，返回当前任务统计")
         return summary
@@ -159,7 +192,7 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
     run = config.run if config is not None else (ai_config.run if ai_config else None)
 
     def load_segment(start, end):
-        store = EventRecordStore(cli, settings, run, start, end)
+        store = _load_impact_store(cli, settings, run, start, end, target_assets)
         keys = store.keys_in_scope()
         store.require_relation(keys)
         if config is not None:
@@ -177,7 +210,9 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
         def finish_month():
             if repeat_groups:
                 _complete_repeat_impacts(store, repeat_groups, repeat_sources)
-            return summary.add_month(summarize(store, keys, "round3", already))
+            month = summarize(store, keys, "round3", already)
+            month.skipped_round2 = store.skipped_round2
+            return summary.add_month(month)
 
         return (store, candidates, claim_jobs, store.save_impact_batch,
                 finish_month)

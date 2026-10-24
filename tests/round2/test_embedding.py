@@ -184,7 +184,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                 self.prepare(retriever, ["one"])
         self.assertEqual(len(calls), 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.001, 0.002])
-        for status in (401, 429, 400, 302):
+        for status in (401, 400, 302):
             calls.clear()
             def stop(request):
                 calls.append(request)
@@ -192,6 +192,48 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             with self.assertRaisesRegex(EmbeddingError, str(status)):
                 self.prepare(self.retriever(stop), ["one"])
             self.assertEqual(len(calls), 1)
+
+    def test_429_retries_after_wait_and_recovers_same_batch(self):
+        for retry_after in (None, "invalid", "0", "5"):
+            with self.subTest(retry_after=retry_after):
+                calls, saved = [], {}
+
+                def handler(request):
+                    calls.append(request.content)
+                    if len(calls) == 1:
+                        headers = {} if retry_after is None else {"Retry-After": retry_after}
+                        return httpx.Response(429, headers=headers)
+                    return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.6, 0.8]}]})
+
+                with patch("round2.embedding.time.sleep") as sleep, \
+                        patch("common.network.random.uniform", side_effect=lambda low, high: high):
+                    self.prepare(self.retriever(handler), ["one"], saved)
+                self.assertEqual(calls, [calls[0], calls[0]])
+                self.assertEqual(sleep.call_count, 1)
+                self.assertEqual(sleep.call_args.args[0], 5 if retry_after == "5" else 0.001)
+                self.assertEqual(json.loads(saved["one"])["vector"], [0.6, 0.8])
+                self.assertTrue(all(client.is_closed for client in self.clients))
+
+    def test_429_exhaustion_shares_network_budget_without_saving(self):
+        for max_attempts in (1, 3):
+            with self.subTest(max_attempts=max_attempts):
+                calls, saved = [], {}
+
+                def handler(request):
+                    calls.append(request.content)
+                    if max_attempts > 1 and len(calls) == 1:
+                        raise httpx.ReadTimeout("timeout", request=request)
+                    return httpx.Response(429, headers={"Retry-After": "5"})
+
+                with patch("round2.embedding.time.sleep") as sleep:
+                    with self.assertRaisesRegex(EmbeddingError, "429"):
+                        self.prepare(self.retriever(handler, self.embedding_config(max_attempts=max_attempts)),
+                                     ["one"], saved)
+                self.assertEqual(len(calls), max_attempts)
+                self.assertEqual(sleep.call_count, max_attempts - 1)
+                self.assertEqual(len(set(calls)), 1)
+                self.assertFalse(saved)
+                self.assertTrue(all(client.is_closed for client in self.clients))
 
     def test_invalid_output_network_and_5xx_share_one_batch_budget(self):
         calls, saved = [], {}

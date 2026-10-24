@@ -59,6 +59,7 @@ def main():
         cli, settings["task_path"], settings["ai_config_path"],
         start_time=settings.get("start_time"), end_time=settings.get("end_time"),
         on_successful_posts=collect_successful_posts,
+        user_name_to_tickers=event_settings.user_name_to_tickers,
     )
     if summary.already_succeeded + summary.new_succeeded == 0:
         logging.getLogger(__name__).info("round1事件提取本次范围没有成功帖子，无需自动导入事件去重分析表")
@@ -72,20 +73,20 @@ def main():
             previous_posts=pd.concat(previous_successes).sort_index() if previous_successes else None,
         )
     except Exception:
-        logger.error("事件去重分析表自动导入未完成，round1帖子事件提取表已保存结果保留；重新运行同一范围的 main.py 可继续补导")
+        logger.error("事件去重分析表自动导入未完成，round1帖子事件提取表已保存结果保留；重新运行同一范围的 python -m entrypoints.run_round1 可继续补导")
         raise
     logger.info("事件去重分析表自动导入完成：新增=%d", imported)
     return summary
 
 
-def execute_round1(log_name=__name__):
-    """共用两种启动方式的退出处理；沿用调用脚本的日志来源名称。"""
+def execute_round1():
+    """处理第一轮入口的异常日志和退出码。"""
     try:
         main()
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except Exception:
-        logging.getLogger(log_name).exception("round1事件提取未完成")
+        logging.getLogger(__name__).exception("round1事件提取未完成")
         raise SystemExit(1) from None
 
 

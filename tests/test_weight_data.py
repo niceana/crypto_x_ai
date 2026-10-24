@@ -174,9 +174,36 @@ class WeightDataTests(unittest.TestCase):
         ])
         self.assertEqual(list(build_basic_df(source)["data"]), [6, -3, 1.5, 1.5])
 
-    def test_bad_or_incomplete_rows_stop_before_register(self):
-        for column, value in (("round2_status", "0"), ("round3_status", "-1"),
-                              ("asset", ""), ("event_relation", "uncertain"),
+    def test_only_both_successful_rows_contribute_assets_and_scores(self):
+        statuses = list(itertools.product(("1", "0", "9", "-1"), repeat=2))
+        source = result_frame([
+            ("2017-12-31 00:20:00", "BTC" if number == 0 else "SKIP{}".format(number),
+             "new" if number == 0 else "uncertain", "利好" if number == 0 else None, "高")
+            for number in range(len(statuses))
+        ])
+        source["round2_status"] = [status2 for status2, _ in statuses]
+        source["round3_status"] = [status3 for _, status3 in statuses]
+        original = source.copy(deep=True)
+        backend = Tables(pd.DataFrame(), source)
+        weight = write_weight_data(backend, "result", "weights", **READ_RANGE)
+        expected = write_weight_data(Tables(pd.DataFrame(), source.iloc[:1]),
+                                     "result", "weights", **READ_RANGE)
+        assert_frame_equal(weight, expected)
+        assert_frame_equal(source, original)
+        self.assertEqual(list(weight.columns), ["BTC" + ASSET_SUFFIX])
+        self.assertEqual(weight.loc["2017-12-31 09:00:00", "BTC" + ASSET_SUFFIX], "6.0")
+
+    def test_no_successful_rows_do_not_create_weight_table(self):
+        source = sample_results()
+        source["round3_status"] = "-1"
+        source["round3_ai_response"] = ""
+        backend = Tables(pd.DataFrame(), source)
+        with self.assertRaisesRegex(ValueError, "没有事件"):
+            write_weight_data(backend, "result", "weights", **READ_RANGE)
+        self.assertFalse(backend.registers or backend.writes)
+
+    def test_bad_successful_rows_stop_before_register(self):
+        for column, value in (("asset", ""), ("event_relation", "uncertain"),
                               ("round3_ai_response", ""), ("round3_ai_response", "{broken"),
                               ("round3_ai_response", '{"ai_response_content":"{}"}')):
             with self.subTest(column=column, value=value):

@@ -95,6 +95,8 @@ class EventResponseTests(EventFixture, unittest.TestCase):
         for stage in ("round2", "round3"):
             with self.subTest(stage=stage):
                 backend = self.prepare_stage(stage)
+                long_event = "需要排查的完整事件内容" * 100 + "事件末尾标记"
+                backend.tables["result"].loc[:, "event"] = long_event
                 backend.tables["result"].loc[:, stage + "_ai_response"] = "旧回答"
                 calls = []
 
@@ -114,6 +116,12 @@ class EventResponseTests(EventFixture, unittest.TestCase):
                 self.assertEqual(saved["attempts"], 2)
                 self.assertTrue(saved["created"])
                 self.assertIn("读取超时", row["error_message"])
+                self.assertTrue(row["error_message"].startswith("ReadTimeout:"))
+                self.assertGreater(len(row["error_message"]), 512)
+                sent_user = [message["content"] for message in json.loads(calls[-1].content)["messages"]
+                             if message["role"] == "user"]
+                self.assertEqual(row["error_message"].split("\nuser=", 1)[1], sent_user[0])
+                self.assertIn("事件末尾标记", row["error_message"])
 
     def test_final_invalid_output_is_saved_with_failure_and_last_usage(self):
         for stage in ("round2", "round3"):

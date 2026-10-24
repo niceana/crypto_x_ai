@@ -192,7 +192,9 @@ class WeightGridExecutionTests(unittest.TestCase):
     def test_grid_reads_and_parses_source_once_and_records_full_manifest(self):
         config = settings({"coefficients": {"B": [1, 2], "C": [1, 2]},
                            "mappings": {"materiality": {"高": [3, 4]}}})
-        backend = Tables(pd.DataFrame(), completed_events())
+        failed = result_frame([("2017-12-31 15:30:00", "FAILED", "uncertain", None, None)])
+        failed["round3_status"] = "-1"
+        backend = Tables(pd.DataFrame(), pd.concat([completed_events(), failed]))
         backend.tables["weights"] = pd.DataFrame({"legacy": ["keep"]})
         original = backend.tables["weights"].copy()
         with patch("postprocessing.weight_parameters.SCORING_VERSION", "direction_product_v1"):

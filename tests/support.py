@@ -131,7 +131,8 @@ class Fixture:
         self.write_config()
         return load_ai_config(self.path)
 
-    def worker(self, cli, handler, start_time=None, end_time=None, *, on_successful_posts=None):
+    def worker(self, cli, handler, start_time=None, end_time=None, *, on_successful_posts=None,
+               user_name_to_tickers=None):
         self.write_config()
         clients = []
 
@@ -148,7 +149,8 @@ class Fixture:
                     lambda record: record.name.startswith(("common.", "round1."))
                 )
                 return run_extraction(cli, self.task_path, self.path, start_time, end_time,
-                                  on_successful_posts=on_successful_posts)
+                                  on_successful_posts=on_successful_posts,
+                                  user_name_to_tickers=user_name_to_tickers)
         finally:
             self.last_output = "\n".join(captured.output)
             self.log_records = captured.records
@@ -158,4 +160,12 @@ class Fixture:
 
 
 def request_text(request):
-    return json.loads(request.content)["messages"][1]["content"]
+    content = json.loads(request.content)["messages"][1]["content"]
+    # 旧的调度测试继续按正文断言，账号上下文由第一轮专项测试检查完整消息。
+    try:
+        value = json.loads(content)
+    except (ValueError, TypeError):
+        return content
+    if isinstance(value, dict) and "user_name" in value and "text" in value:
+        return value["text"]
+    return content
