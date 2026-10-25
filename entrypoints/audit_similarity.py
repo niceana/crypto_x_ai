@@ -1,4 +1,4 @@
-"""复用事件表 embedding，只读导出指定批次的相似度对照文件。"""
+"""复用事件表 embedding，只读导出指定日期范围内第二轮成功记录的相似度对照文件。"""
 
 import argparse
 import logging

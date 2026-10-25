@@ -121,6 +121,7 @@ class SimilarityAuditTests(unittest.TestCase):
         event = self.csv(output, "events.csv")[0]
         self.assertEqual((event["max_similarity"], event["max_similarity_record_id"]), ("", ""))
         self.assertEqual(event["recomputed_decision"], "no_history_auto_new")
+        self.assertEqual(event["tenth_candidate_similarity"], "")
         self.assertFalse(self.csv(output, "candidates.csv"))
         self.assertTrue(all(row["no_history"] == "1" and row["below_threshold_auto_new"] == "0"
                             for row in self.csv(output, "thresholds.csv")))
@@ -135,7 +136,32 @@ class SimilarityAuditTests(unittest.TestCase):
         event = self.csv(output, "events.csv")[0]
         self.assertEqual((event["max_similarity_event_id"], event["stored_match_rank"]), ("highest", "2"))
         self.assertEqual(event["groups_sent_to_ai"], "2")
+        self.assertEqual(event["tenth_candidate_similarity"], "")
         self.assertEqual(len(self.csv(output, "candidates.csv")), 1)
+
+    def test_tenth_selected_candidate_is_independent_of_export_top_k(self):
+        scores = [0.99 - 0.03 * index for index in range(12)]
+        items = [("2021-01-01", "g{:02d}".format(index), [score, math.sqrt(1 - score ** 2)],
+                  "g{:02d}".format(index), "new", "ETH") for index, score in enumerate(scores)]
+        frame = records(*items, ("2021-01-03", "now", [1, 0], "now", "new", "ETH"))
+        _, output, _ = self.export(frame, top_k=1)
+        event = self.csv(output, "events.csv")[0]
+        self.assertEqual((event["qualifying_groups"], event["groups_sent_to_ai"]), ("12", "10"))
+        self.assertEqual(float(event["tenth_candidate_similarity"]), scores[9])
+        self.assertEqual(len(self.csv(output, "candidates.csv")), 1)
+
+    def test_tenth_candidate_below_threshold_is_blank_and_equality_passes(self):
+        items = [("2021-01-01", "g{:02d}".format(index), [1, 0], "g{:02d}".format(index), "new", "ETH")
+                 for index in range(9)]
+        frame = records(*items,
+                        ("2021-01-02", "tenth", [0.5, math.sqrt(0.75)], "tenth", "new", "ETH"),
+                        ("2021-01-03", "now", [1, 0], "now", "new", "ETH"))
+        for threshold in (0.5, 0.55):
+            with self.subTest(threshold=threshold):
+                _, output, _ = self.export(frame, name="tenth-{}".format(threshold), threshold=threshold)
+                event = self.csv(output, "events.csv")[0]
+                self.assertEqual(event["history_groups"], "10")
+                self.assertEqual(event["tenth_candidate_similarity"], "0.5" if threshold == 0.5 else "")
 
     def test_top_ten_limit_and_tie_order_match_production(self):
         items = [("2021-01-01", "g{:02d}".format(i), [1, 0], "g{:02d}".format(i), "new", "ETH")
@@ -173,24 +199,64 @@ class SimilarityAuditTests(unittest.TestCase):
                     self.export(frame, name="invalid-{}".format(number))
                 self.assertFalse((self.root / "invalid-{}".format(number) / "manifest.json").exists())
 
-    def test_unfinished_current_or_needed_history_is_not_silently_omitted(self):
-        for position in (0, 1):
-            frame = records(
-                ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
-                ("2021-01-03", "now", [1, 0], "old", "repeat", "ETH"),
-            )
-            frame.iloc[position, frame.columns.get_loc("round2_status")] = "0"
-            with self.assertRaisesRegex(ValueError, "尚未.*完成"):
-                self.export(frame, name="unfinished-{}".format(position))
+    def test_only_successful_current_and_history_records_are_counted(self):
+        items = [
+            ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
+            ("2021-01-03", "first", [0, 1], "first", "new", "ETH"),
+            ("2021-01-03 12:00:00", "now", [1, 0], "old", "repeat", "ETH"),
+        ]
+        statuses = ("0", "9", "-1", "", 1, None)
+        for number in range(len(statuses)):
+            for when, prefix in (("2021-01-02", "history"), ("2021-01-03 06:00:00", "current")):
+                items.append((when, "{}-{}".format(prefix, number), [1, 0], "", "", "ETH"))
+        frame = records(*items)
+        for number, status in enumerate(statuses):
+            mask = frame.index.get_level_values("record_id").isin(
+                ["history-{}".format(number), "current-{}".format(number)])
+            frame.loc[mask, "round2_status"] = status
+            frame.loc[mask, ["event", "embedding"]] = ""
+        before = frame.copy(deep=True)
+        client, output, manifest = self.export(frame)
+        pd.testing.assert_frame_equal(frame, before)
+        pd.testing.assert_frame_equal(client.frame, before)
+        self.assertEqual((manifest["events"], manifest["candidate_rows"]), (2, 3))
+        events = self.csv(output, "events.csv")
+        self.assertEqual([row["record_id"] for row in events], ["first", "now"])
+        self.assertEqual([row["history_records"] for row in events], ["1", "2"])
+        self.assertEqual({row["best_record_id"] for row in self.csv(output, "candidates.csv")},
+                         {"old", "first"})
+        self.assertTrue(all(row["events"] == "2" and row["stored_update_repeat_events"] == "1"
+                            for row in self.csv(output, "thresholds.csv")))
 
-    def test_asset_list_excludes_unprocessed_assets_before_completion_check(self):
+    def test_no_successful_current_records_exports_empty_without_reading_history(self):
+        frame = records(
+            ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
+            ("2021-01-03", "pending", [1, 0], "", "", "ETH"),
+            ("2021-01-03", "processing", [1, 0], "", "", "ETH"),
+            ("2021-01-03", "failed", [1, 0], "", "", "ETH"),
+        )
+        frame.loc[frame.index.get_level_values("date") == pd.Timestamp("2021-01-03"),
+                  "round2_status"] = ["0", "9", "-1"]
+        frame["embedding"] = ""
+        client, output, manifest = self.export(frame)
+        self.assertEqual(len(client.reads), 1)
+        self.assertEqual((manifest["events"], manifest["candidate_rows"]), (0, 0))
+        self.assertIsNone(manifest["embedding_identity"])
+        self.assertTrue(manifest["completed"])
+        self.assertFalse(self.csv(output, "events.csv"))
+        self.assertFalse(self.csv(output, "candidates.csv"))
+        self.assertTrue(all(all(row[column] == "0" for column in row if column != "threshold")
+                            for row in self.csv(output, "thresholds.csv")))
+
+    def test_asset_list_excludes_successful_and_unprocessed_assets(self):
         frame = records(
             ("2021-01-01", "old", [1, 0], "old", "new", "ETH"),
             ("2021-01-01", "skipped-history", [1, 0], "", "", "ZZZ"),
             ("2021-01-03", "now", [1, 0], "old", "update", "ETH"),
             ("2021-01-03", "skipped-current", [1, 0], "", "", "ZZZ"),
+            ("2021-01-03", "skipped-success", [1, 0], "skipped-success", "new", "ZZZ"),
         )
-        frame.loc[frame["asset"] == "ZZZ", ["round2_status", "embedding"]] = ["0", ""]
+        frame.loc[frame["event_relation"] == "", ["round2_status", "embedding"]] = ["0", ""]
         self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
         document = {"InstrumentList": [" eth.exchange", "ETH.other", "BTC.exchange"]}
         with patch.object(ReadOnlyClient, "read_object", return_value=json.dumps(document).encode("utf-8"),
@@ -204,7 +270,7 @@ class SimilarityAuditTests(unittest.TestCase):
         self.assertEqual([row["best_record_id"] for row in self.csv(output, "candidates.csv")], ["old"])
         self.assertTrue(all(row["events"] == "1" for row in self.csv(output, "thresholds.csv")))
 
-    def test_asset_list_still_rejects_unfinished_target_current_or_history(self):
+    def test_asset_list_skips_unsuccessful_target_current_or_history(self):
         self.settings = replace(self.settings, round2_asset_list_path="asset-list.json")
         document = {"InstrumentList": ["ETH.exchange"]}
         for position in (0, 1):
@@ -214,9 +280,19 @@ class SimilarityAuditTests(unittest.TestCase):
                     ("2021-01-03", "now", [1, 0], "old", "update", "ETH"),
                 )
                 frame.iloc[position, frame.columns.get_loc("round2_status")] = "0"
+                frame.iloc[position, frame.columns.get_loc("embedding")] = ""
                 with patch.object(ReadOnlyClient, "read_object", return_value=json.dumps(document).encode("utf-8"),
-                                  create=True), self.assertRaisesRegex(ValueError, "尚未.*完成"):
-                    self.export(frame, name="unfinished-target-{}".format(position))
+                                  create=True) as read:
+                    client, output, manifest = self.export(frame, name="unfinished-target-{}".format(position))
+                read.assert_called_once_with("asset-list.json")
+                self.assertEqual((manifest["events"], manifest["candidate_rows"]), (1 - position, 0))
+                self.assertEqual(len(client.reads), 2 - position)
+                events = self.csv(output, "events.csv")
+                if position == 0:
+                    self.assertEqual((events[0]["record_id"], events[0]["history_records"],
+                                      events[0]["recomputed_decision"]), ("now", "0", "no_history_auto_new"))
+                else:
+                    self.assertFalse(events)
 
     def test_asset_list_with_no_target_records_exports_empty_without_reading_history(self):
         frame = records(("2021-01-03", "skipped", [1, 0], "", "", "ZZZ"))
@@ -265,7 +341,13 @@ class SimilarityAuditTests(unittest.TestCase):
             'first_round_task_path: first\nresult_path: result\nround2_ai_config_path: unused.yaml\n'
             'round3_ai_config_path: unused.yaml\nembedding_config_path: embedding.yaml\n', encoding="utf-8")
         (self.root / "embedding.yaml").write_text('base_url: ""\nsimilarity_threshold: 0.55\n', encoding="utf-8")
-        client = ReadOnlyClient(records(("2021-01-03", "only", [1, 0], "only", "new", "ETH")))
+        frame = records(
+            ("2021-01-03", "only", [1, 0], "only", "new", "ETH"),
+            ("2021-01-03", "pending", [1, 0], "", "", "ETH"),
+        )
+        frame.iloc[1, frame.columns.get_loc("round2_status")] = "9"
+        frame.iloc[1, frame.columns.get_loc("embedding")] = ""
+        client = ReadOnlyClient(frame)
         manifest = main(["--config", str(config), "--start-time", "2021-01-03", "--end-time", "2021-01-03",
                          "--output-dir", str(self.root / "command")], cli=client)
         self.assertEqual((manifest["events"], manifest["threshold"]), (1, 0.55))

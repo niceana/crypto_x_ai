@@ -4,8 +4,6 @@ import csv
 import json
 import logging
 import math
-from bisect import bisect_left
-from collections import defaultdict
 from contextlib import ExitStack
 from datetime import date
 from pathlib import Path
@@ -15,7 +13,7 @@ import pandas as pd
 
 from common.event_context import EventHistory
 from common.store import read_event_history
-from common.time_rules import history_read_bounds, history_window_start, published_time
+from common.time_rules import history_read_bounds, published_time
 from common.validation import parse_strict_json, validate_index
 from round2.embedding import EmbeddingError, _validate_unit_vector
 
@@ -28,6 +26,7 @@ EVENT_COLUMNS = [
     "max_similarity_record_id", "max_similarity_event_id", "max_similarity_date",
     "stored_relation", "stored_event_id", "new_information",
     "history_records", "history_groups", "threshold", "recomputed_decision", "qualifying_groups", "groups_sent_to_ai",
+    "tenth_candidate_similarity",
     "stored_match_rank", "stored_match_similarity", "manual_has_historical_match", "manual_note",
 ]
 CANDIDATE_COLUMNS = [
@@ -51,16 +50,21 @@ def _threshold(value):
 
 def _read_batch(cli, settings):
     if not settings.start_time or not settings.end_time:
-        raise ValueError("请用 start_time/end_time 指定刚跑完这一批的日期范围")
+        raise ValueError("请用 start_time/end_time 指定需要观察的日期范围")
     if date.fromisoformat(settings.start_time) > date.fromisoformat(settings.end_time):
         raise ValueError("start_time 不能晚于 end_time")
     if settings.retriever:
         raise ValueError("本工具仅复算内置纯向量检索，不能重放自定义 retriever")
     current = read_event_history(cli, settings.result_path, settings.start_time, settings.end_time,
                                  columns=READ_COLUMNS, label="观察批次读取")
-    unfinished = current.loc[current["round2_status"] != "1"]
-    if not unfinished.empty:
-        raise ValueError("本批第二轮尚未全部完成，不能作为已完成批次复算：{}".format(unfinished.index[0][1]))
+    if settings.round2_asset_list_path:
+        universe = json.loads(cli.read_object(settings.round2_asset_list_path).decode("utf-8"))["InstrumentList"]
+        target_assets = {instrument.split(".", 1)[0].strip().upper() for instrument in universe}
+        current = current.loc[current["asset"].isin(target_assets)]
+    total = len(current)
+    current = current.loc[current["round2_status"] == "1"]
+    logger.info("相似度观察批次筛选：范围记录=%d，第二轮成功=%d，跳过未成功=%d",
+                total, len(current), total - len(current))
     keys = sorted(current.index, key=lambda key: (published_time(key[0]), key[1]))
     bounds = history_read_bounds((key[0] for key in keys), settings.start_time,
                                  settings.history_lookback_months)
@@ -69,6 +73,7 @@ def _read_batch(cli, settings):
     begin, end = bounds
     history = read_event_history(cli, settings.result_path, begin.isoformat(), end.isoformat(),
                                  columns=READ_COLUMNS, label="观察前史读取")
+    history = history.loc[history["round2_status"] == "1"]
     combined = pd.concat([history, current])
     validate_index(combined, "record_id")
     return combined, keys
@@ -134,10 +139,11 @@ def _writer(stack, path, columns):
 
 def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=10,
                             thresholds=(0.4, 0.45, 0.5, 0.55, 0.6)):
-    """读取指定批次和必要前史，导出所有当前记录及每条记录阈值筛选前的 Top K 组。
+    """读取指定批次和必要前史，仅导出第二轮成功记录及其阈值筛选前的 Top K 组。
 
-    cli 只须提供 read；不使用 Store，不恢复、认领或保存状态。thresholds 只改变
-    候选筛选统计，始终固定使用表内已有分组，不模拟改阈值后的整轮 AI 决策。
+    cli 提供 read，配置资产名单时另须 read_object；不使用 Store，不恢复、认领
+    或保存状态。thresholds 只改变候选筛选统计，始终固定使用表内已有分组，
+    不模拟改阈值后的整轮 AI 决策。
     """
     threshold = _threshold(threshold)
     sweep = sorted({_threshold(value) for value in thresholds} | {threshold})
@@ -151,18 +157,13 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
     frame, keys = _read_batch(cli, settings)
     assets = set(frame.loc[keys, "asset"]) if keys else set()
     frame = frame.loc[frame["asset"].isin(assets)]
-    unfinished = defaultdict(list)
     for key, row in frame.iterrows():
         if not isinstance(key[1], str) or not key[1]:
             raise ValueError("record_id 必须为非空字符串")
-        if row["round2_status"] != "1":
-            unfinished[row["asset"]].append((published_time(key[0]), key[1]))
-        elif (not isinstance(row["event"], str) or not row["event"].strip()
-              or not isinstance(row["event_id"], str) or not row["event_id"].strip()
-              or row["event_relation"] not in ("new", "update", "repeat")):
+        if (not isinstance(row["event"], str) or not row["event"].strip()
+                or not isinstance(row["event_id"], str) or not row["event_id"].strip()
+                or row["event_relation"] not in ("new", "update", "repeat")):
             raise ValueError("已完成记录缺少合法的事件或关联信息：{}".format(key[1]))
-    for entries in unfinished.values():
-        entries.sort()
     # 不把最终表内的未来记录带入当前时点；EventHistory 每次查询都排除同刻和未来。
     history = EventHistory(frame, settings.history_lookback_months)
     embeddings = dict(zip(frame.index.get_level_values("record_id"), frame["embedding"]))
@@ -176,11 +177,6 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
         for position, key in enumerate(keys, 1):
             row = frame.loc[key]
             current = {"date": str(key[0]), "record_id": key[1], "asset": row["asset"], "event": row["event"]}
-            bad = unfinished[row["asset"]]
-            begin = history_window_start(key[0], settings.history_lookback_months)
-            left, right = bisect_left(bad, (begin,)), bisect_left(bad, (published_time(key[0]),))
-            if left < right:
-                raise ValueError("所需同币前史尚未完成，无法重建本批候选：{} / {}".format(row["asset"], bad[left][1]))
             searchable = history.get_searchable_records(row["asset"], key[0])
             groups = _rank_groups(current, searchable, vectors, embeddings)
             matched = next(((rank, group["similarity"]) for rank, group in enumerate(groups, 1)
@@ -209,6 +205,8 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
                 event.update(max_similarity=best["similarity"], max_similarity_event_id=best["event_id"],
                              max_similarity_record_id=best["record"]["record_id"],
                              max_similarity_date=best["record"]["date"], max_similarity_event=best["record"]["event"])
+            if eligible >= 10:
+                event["tenth_candidate_similarity"] = groups[9]["similarity"]
             if is_match and matched:
                 event.update(stored_match_rank=matched[0], stored_match_similarity=matched[1])
             event_writer.writerow(event)
@@ -242,7 +240,8 @@ def export_similarity_audit(cli, settings, output_dir, *, threshold=0.5, top_k=1
         "notes": [
             "只读复算，未调用模型、未写数据库；缺失或不兼容的向量会报错，不自动补齐。",
             "使用当前表内历史和分组，排除同刻及未来；历史补录、向量、分组或窗口变更会影响还原。",
-            "按日期范围观察全部已完成记录；没有运行 ID，不能单独识别本次新完成的记录。",
+            "按日期范围及配置的资产名单，仅统计 round2_status=1 的成功记录；未成功的当前记录和前史均跳过，无需等待整轮完成。",
+            "没有运行 ID，不能单独识别本次新完成的记录；复算仅使用读取时已成功的历史。",
             "Top K 在阈值筛选前导出，包含低于阈值的组；同分来源记录取最早日期和 record_id。",
             "thresholds.csv 固定既有分组，只估算筛选量；AI 既有判断不是人工真值，不代表准确率或召回率。",
             "send_to_ai_events 是待调用的事件数量，不包含重试，也不是实际发生的 HTTP 请求数。",

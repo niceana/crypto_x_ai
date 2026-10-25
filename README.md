@@ -149,9 +149,34 @@ similarity_threshold: 0.50
 
 update 的 new_information 须独立说明此前已知状态、本次变化及当前状态和条件，不能只写“获批”“金额提高”。旧状态引用唯一匹配组历史，新事实引用当前 event；未知部分说明未披露，不补造，累计总值与本次新增量分清。第三轮 AI 输入不含历史，用这段对照辅助理解当前事件的进展。完整要求及例子见 [第二轮规则](docs/rules/EVENT_RULES.md#6-round2事件去重归组调度和输出)；程序的非空字符串校验不能代替真实样本的语义质量验证。
 
-## 只读观察已完成批次的相似度
+## 单独备份事件结果
 
-在刚才运行第二轮的 Python 环境执行 `python -X utf8 -m entrypoints.audit_similarity`，按 `event_processing_config.yaml` 的日期范围复用表内向量，导出本地 `events.csv`、`candidates.csv`、`thresholds.csv` 和完成说明。最高相似度对应的具体历史事件、记录 ID、事件组 ID 及低于阈值的候选都可查看；不调用模型、不恢复状态、不写数据库。默认每条导出阈值筛选前的前 10 个组，可用 `--top-k 20` 增加。多阈值统计固定使用已有分组，不代表人工验收准确率。命令参数、观察方法及还原限制见 [相似度只读观察](docs/SIMILARITY_AUDIT.md)。
+在运行第二轮的 Python 环境执行 `python -X utf8 -m entrypoints.backup_events`，只读备份 `event_processing_config.yaml` 的结果表、日期范围及资产名单内的完整记录，默认包含所有状态。若只备份第二轮已成功的 5000 条，可执行：
+
+```powershell
+python -X utf8 -m entrypoints.backup_events --completed-only --expected-records 5000
+```
+
+`--completed-only` 仅选择 `round2_status="1"`，不要求第三轮完成；`--expected-records` 校验条数，不符时停止，不截取或补足，可省略。备份前停止相关写入任务，使这批数据保持固定。目录默认为 `reports/events_backup_北京时间/`，也可用 `--output-dir` 指定新目录，已有目录不会覆盖；`--config` 可指定其他事件配置。范围内同日期、同资产的其他成功记录也会纳入，不通过运行 ID 区分批次。
+
+输出 `events.pkl` 保留原始 date/record_id 索引、字段类型及全部 14 个普通列，包括事件、关联、向量、两轮回答、状态及配置摘要，并读回逐值校验；`events.csv` 使用带 BOM 的 UTF-8，保留完整字段供查看；`manifest.json` 最后生成，保存条数、筛选范围、运行环境和两个文件的 SHA-256。缺少完成说明表示备份未完整完成。该入口不调用模型、不写数据库、不重置状态，也不备份范围外历史、第一轮原帖表或权重表；完整原值以 `events.pkl` 为准。
+
+## 调整阈值后重跑已有记录
+
+修改 `embedding_config.yaml` 的 `similarity_threshold` 只影响待处理记录。需要统一重跑时，先停止第二、三轮任务，将 `event_processing_config.yaml` 的日期设为本次重跑范围，资产名单沿用 `round2_asset_list_path`。在运行第二轮的 Python 环境执行：
+
+```powershell
+python -X utf8 -m entrypoints.reset_round2
+python -X utf8 -m entrypoints.reset_round2 --apply
+```
+
+第一条只读预览记录数、资产及两轮已完成数量；第二条先将目标完整记录备份至 `reports/round2_reset_北京时间/before_reset.pkl`，再只把 `round2_status`、`round3_status` 设为字符串 `"0"`，包含范围内已成功及未完成记录。事件正文、向量、旧回答、关联和配置摘要保留；旧结果须结合待处理状态理解，重跑成功时覆盖。`scope.csv` 可查看目标和原状态，`manifest.json` 记录范围及执行结果。备份失败时不写数据库，已有备份目录不覆盖；可用 `--backup-dir` 指定新目录，`--config` 指定其他事件配置。
+
+工具通过全表 `asset`、`round2_status` 两列检查后续依赖；结束日期之后仍有同币第二轮成功记录时停止，提示先扩大 `end_time`。它不自动重置范围外数据，不修改第一轮、向量配置或权重表。重置后用相同日期、资产范围重新运行 `entrypoints.run_round2`、`entrypoints.run_round3`；已有权重需在两轮完成后重新计算。仅更改阈值可复用原向量，不会绕过原有 AI 配置摘要检查。若要对比旧结果的相似度，须先导出再重置，因为只读观察会跳过状态为 `"0"` 的记录。
+
+## 只读观察第二轮成功记录的相似度
+
+在运行第二轮的 Python 环境执行 `python -X utf8 -m entrypoints.audit_similarity`，按 `event_processing_config.yaml` 的日期范围及资产名单复用表内向量，仅统计 `round2_status="1"` 的成功记录；当前批次和前史中的非成功记录均跳过，无需等待整轮完成。导出本地 `events.csv`、`candidates.csv`、`thresholds.csv` 和完成说明。最高相似度对应的具体历史事件、记录 ID、事件组 ID 及低于阈值的候选都可查看；不调用模型、不恢复状态、不写数据库。默认每条导出阈值筛选前的前 10 个组，可用 `--top-k 20` 增加。多阈值统计固定使用已有分组，不代表人工验收准确率。命令参数、观察方法及还原限制见 [相似度只读观察](docs/SIMILARITY_AUDIT.md)。
 
 ## 第三轮结果转为小时权重表
 
