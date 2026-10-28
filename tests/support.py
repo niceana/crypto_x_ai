@@ -110,7 +110,7 @@ class Fixture:
             "api": {"url": "https://mock.invalid/ai", "headers": {}, "payload": {
                 "model": "test", "messages": [{"role": "system", "content": "{{prompts.system}}"},
                                                {"role": "user", "content": "{{prompts.user}}"}], "stream": False}},
-            "run": {"concurrency": 3, "batch_size": 200, "result_buffer_size": 200,
+            "run": {"concurrency": 3, "batch_size": 200, "result_buffer_size": 200, "storage_max_attempts": 3,
                     "flush_interval_seconds": 0.01, "backoff_base_seconds": 0.001,
                     "backoff_max_seconds": 0.001, "storage_retry_seconds": 0.001,
                     "progress_every": 100000},

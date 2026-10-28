@@ -320,7 +320,7 @@ class EventRecordStore(TableStore):
         self.settings = settings
         stages = {
             "round2": ("round2_status", "round2_config_hash", set(RELATION_COLUMNS + [
-                "round2_ai_response", "round2_status", "round2_config_hash", "round3_status", "error_message", "embedding"])),
+                "round2_ai_response", "round2_status", "round2_config_hash", "round3_status", "error_message"])),
             "round3": ("round3_status", "round3_config_hash", {
                 "round3_ai_response", "round3_status", "round3_config_hash", "error_message"}),
         }
@@ -397,15 +397,6 @@ class EventRecordStore(TableStore):
             rows.append(values)
         self.update_stage_columns([key for key, _, _, _ in items], rows, "round2",
                                   prepare_write=_stamp_event_responses)
-
-    def save_embeddings(self, values):
-        """按原索引只保存向量 JSON；存储重试不重新调用 Embedding 接口。"""
-        keys = list(values)
-        size = self.config.run.batch_size
-        for offset in range(0, len(keys), size):
-            batch = keys[offset:offset + size]
-            self.update_stage_columns(batch, [{"embedding": values[key]} for key in batch],
-                                      "round2", operation="embedding")
 
     def save_impact_batch(self, items):
         """正文已在网络入口校验；按键整批保存最后一次原始回答、调用信息和终态。"""

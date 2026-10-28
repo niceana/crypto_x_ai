@@ -32,7 +32,7 @@
 
 ## 模块职责与依赖
 
-第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 3 个日历月的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及向量准备共用 history_lookback_months，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 事件列表，每条包含 published_at、event。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
+第二轮在内存位置字典、按币分组和有序候选索引的基础上，默认采用 3 个日历月的历史期限。启动必须配置处理起止日期，先按日期读取本次任务，有待处理任务时才补读所需前史；较晚已完成冲突只按日期读取资产、状态两列。前史校验、候选检索及已保存向量载入共用 history_lookback_months，不再读取全表事件内容或回查窗口外组起点。内部截断组保留 event_id 和窗口内事实，缺起点时 first_disclosure=null、history_trimmed=true；发送第二轮 AI 前转换为 candidate_id 短编号和 history 事件列表，每条包含 published_at、event。第三轮仅使用本条记录的 asset、event、new_information，具体流程见下文；第二轮向量临时矩阵和评分方式保留。读取顺序和截断例子见 [事件规则](docs/rules/EVENT_RULES.md#4-round2事件去重归组前置检查与恢复)。
 
 | 目录或文件 | 职责 | 主要依赖 |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ round3事件影响分析 → 本范围第二轮完成检查 → 事件输入 →
 - `common.store.TableStore` 提供快照、阶段恢复、选择、认领、写入和结束状态统计；PostTaskStore、EventRecordStore 保留各自转换和表约定。
 - `common.store.read_stage_hashes(cli, task_path, hash_column)` 调用 `cli.read(task_path, start_time='', end_time='', columns=[hash_column])` 读取全表单列，返回 DataFrame 中该列的原值；三轮在本次首次认领前核对一次，跨月复用。
 - `common.config.load_job_config`、`load_event_config`、`load_ai_config` 分别加载任务、事件及 AI 配置；不会因为共用模块而提前读取 AI 配置。
-- `common.config.load_embedding_config` 加载向量服务及阈值配置；`round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings)` 读取原键、event 和表内向量，按批生成缺失或标识不匹配的向量，调用 `EventRecordStore.save_embeddings` 只更新 embedding 列。保存完成后才认领关联，评分对象接收 current/searchable 并返回 RetrievalSelection。生成向量不代表关联完成，业务阶段只做内存比较，round3事件影响分析不修改或发送向量。
+- 独立向量计算由 vectorization.encoder.EmbeddingEncoder.prepare 和 vectorization.preparation.prepare_vectors 完成，生成、复用并仅保存 embedding 列，沿用原有格式和重试。第二轮 EmbeddingRetriever 只载入向量、缓存矩阵并检索，缺失向量不自动请求服务。统一流程为第一轮及导入、向量计算、第二轮、第三轮。
 - `common.event_context.build_relation_input(current, candidates)` 返回 `(text, candidate_event_ids)`：text 为 `{"current":{"published_at":...,"event":...},"candidates":[{"candidate_id":"E1","history":[{"published_at":...,"event":...}]}]}`，每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。candidate_event_ids 为本次短编号到真实 event_id 的映射；起点或最早可用披露与全部 update 按原顺序提供，同一披露不重复发送。`build_impact_input(store, key)` 组织 asset、event 两个必填字段，仅在有内容时附带 new_information；`common.ai_protocol.render_payload` 只把文本填入请求模板。
 - `common.validation.validate_extraction_output`、`validate_relation_output`、`validate_impact_output` 分别检查三轮输出；`validate_relation_output(content, candidate_event_ids)` 校验 AI 的 matched_candidate_id，再返回带真实 matched_event_id 的内部结果，保存和数据库结构不变。每个 RequestJob 独立持有输入及映射，所有请求重试复用；round3事件影响分析检查五字段非空文本及前四字段严格枚举，保留 validator 注入接口。
 

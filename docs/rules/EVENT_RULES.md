@@ -159,13 +159,13 @@ round2事件去重归组按 batch_size 分批将当前范围 9/-1 恢复为 0，
 
 默认通过 `embedding_config_path: "embedding_config.yaml"` 使用内置向量检索。也可设置 `retriever: "模块:函数"`，或在应用调用 run_relation 时传入 retriever 函数；选择优先级为应用注入、自定义函数、内置向量。业务接口仍为 `retrieve(current, searchable) -> RetrievalSelection`。
 
-独立 Embedding 配置的 base_url 后追加 `/embeddings`，模型默认 bge-m3，每批默认 8 条。密钥从进程环境或该配置同目录 `.env` 中的 EMBEDDING_API_KEY 读取，进程环境优先。缺少地址、密钥或合法参数时不认领新任务。similarity_threshold 默认 0.50，允许 [-1, 1] 内有限数值；不再有本地缓存路径。
+独立向量计算读取 Embedding 配置，base_url 后追加 /embeddings，默认 bge-m3、每批 8 条；密钥从进程环境或同目录 .env 读取。第二轮只读取向量版本及检索配置，不读取或展开向量密钥。similarity_threshold 默认 0.50，范围 [-1, 1]，包含等于阈值的分数。
 
-第二轮按配置日期读取任务及所需历史，按币和时间队列在内存中推进，不逐条查数据库。开始认领前，准备本范围全部待处理披露，以及同币且至少能进入一个待处理时点前 3 个日历月窗口的已完成历史披露的 embedding；窗口为 t-3个月 ≤ 历史时间 < t。该列用 JSON 字符串保存 model、model_version、config_hash 和模型已归一化的 vector；标识匹配才复用，空字符串或标识变化时重新生成，格式损坏时停止。同文本在内存去重，每条对应披露仍保存自己的向量。响应须数量一致、index 完整唯一、维度一致、数值有限且非零，范数与 1 的绝对误差不超过 1e-5。程序保留模型返回数值，不重新归一化或转成 float32，内存用 float64 数组直接计算内积；编码规则标识为 event-only-service-unit-f64-v3。整批通过后通过共用存储重试仅更新 embedding 列，保存成功才进入内存评分；写入重试不重新调用 Embedding。准备结束或异常均关闭 HTTP 客户端，不使用 SQLite。提前编码未来披露不改变其历史资格；无历史的待处理行也保存向量供后续时点使用。窗口外起点不读取、不生成向量，缺起点的候选按前述截断规则提供。
+第二轮按日期读取任务及必要历史，按币和时间队列推进，不逐条查库。认领前只载入当前待处理披露和所需已完成历史披露的已保存向量；缺失、损坏或版本不符时停止，不生成、不保存向量。独立向量阶段提前编码必要前史，包括尚未归组的前月记录；候选仍按 t-history_lookback_months <= 历史时间 < t 判断，已编码不改变历史资格。JSON 和 float64 口径不变。
 
 对当前时点合格历史逐条计算余弦相似度，按 event_id 取组内最高分，只保留分数大于等于 similarity_threshold 的组，再按组分数降序取最多 10 组，同分按 event_id 升序。不能先取 10 条披露再去重，也不把重复披露分数相加。默认阈值下，0.49 不提交、0.50 提交；无历史或所有组都低于阈值时直接 new，进入round3事件影响分析。阈值是试运行参数，不表示同一事件的概率。
 
-每批 Embedding 默认最多尝试 3 次，包含首次；网络传输故障、429、5xx 和无效响应共用预算。复用 common.network 的异常分类、指数随机退避和 Retry-After 解析，本地退避上界从 1 秒翻倍，最高 30 秒，可配置；429 和 5xx 的合法 Retry-After 与退避取较长等待，在本次运行中重试同一批输入。其他非成功 HTTP 或预算耗尽停止本轮，不伪造空候选；该预算不占关联 AI 请求次数。表内损坏、程序异常及存储失败不作为接口输出重试。config_hash 只包含服务、模型、人工版本及编码规则，不含实际 event；同一配置各行一致。event 沿用固定输入约定，人工改动时清空对应 embedding 并确定下游重算范围；更换同名模型权重时要更改 model_version。表内已成功保存的批次在重启后复用，Embedding 或存储错误不按低分处理。
+每批 Embedding 默认最多尝试 10 次，包含首次；网络传输故障、429、5xx 和无效响应共用预算。复用 common.network 的异常分类、指数随机退避和 Retry-After 解析，本地退避上界从 1 秒翻倍，最高 30 秒，可配置；429 和 5xx 的合法 Retry-After 与退避取较长等待，在本次运行中重试同一批输入。其他非成功 HTTP 或预算耗尽停止本轮，不伪造空候选；该预算不占关联 AI 请求次数。表内损坏、程序异常及存储失败不作为接口输出重试。config_hash 只包含服务、模型、人工版本及编码规则，不含实际 event；同一配置各行一致。event 沿用固定输入约定，人工改动时清空对应 embedding 并确定下游重算范围；更换同名模型权重时要更改 model_version。表内已成功保存的批次在重启后复用，Embedding 或存储错误不按低分处理。
 
 - 检索接口的 current 包含 record_id、原发布时间 date、asset、event 和 source_post_id，不含 source_text；第二轮 AI 仅接收 published_at 和 event，published_at 取内部 date 值，其余定位字段供程序使用。
 - searchable 是同代币、当前披露时间回推配置月数至当前时刻之前的已完成披露副本，默认 3 个月，包含 event_id、event_relation 和 update 的 new_information。下界包含，上界排除；返回顺序为时间、record_id。

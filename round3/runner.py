@@ -161,15 +161,15 @@ def _impact_result(message):
     return message.key, message.response, message.http_attempts_started
 
 
-def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, validator=validate_impact_output):
+def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, validator=validate_impact_output, *,
+               target_assets=None):
     """检查本范围第二轮结果后，分月分析 new/update，并为 repeat 复制此前响应。"""
     if not settings.start_time or not settings.end_time:
         raise ValueError("第三轮必须配置 start_time/end_time，明确本次处理的事件日期范围")
     start, end = date.fromisoformat(settings.start_time), date.fromisoformat(settings.end_time)
     if start > end:
         raise ValueError("start_time 不能晚于 end_time")
-    target_assets = None
-    if settings.round2_asset_list_path:
+    if target_assets is None and settings.round2_asset_list_path:
         universe = json.loads(cli.read_object(settings.round2_asset_list_path).decode("utf-8"))["InstrumentList"]
         target_assets = {instrument.split(".", 1)[0].strip().upper() for instrument in universe}
     ranges = tuple(month_ranges(start, end))

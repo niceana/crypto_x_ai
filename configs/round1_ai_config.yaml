@@ -73,7 +73,7 @@ prompts:
 api:
   url: "" # 填写公司接口的完整 URL。
   headers:
-    Authorization: "Bearer ${AI_API_KEY}"
+    Authorization: "Bearer ${ROUND1_AI_API_KEY}"
   trust_env: false
   payload:
     model: glm-5.3-flash
@@ -94,9 +94,9 @@ run:
   flush_interval_seconds: 1
   timeout_seconds: 120
   requests_per_second: 0
-  max_attempts: 3
+  max_attempts: 10
   backoff_base_seconds: 1
   backoff_max_seconds: 30
-  storage_max_attempts: 3
+  storage_max_attempts: 10
   storage_retry_seconds: 1
   progress_every: 100

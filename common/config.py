@@ -51,10 +51,10 @@ class RunConfig:
     flush_interval_seconds: float = 1
     timeout_seconds: float = 120
     requests_per_second: float = 0
-    max_attempts: int = 3
+    max_attempts: int = 10
     backoff_base_seconds: float = 1
     backoff_max_seconds: float = 30
-    storage_max_attempts: int = 3
+    storage_max_attempts: int = 10
     storage_retry_seconds: float = 1
     progress_every: int = 100
     ready_request_buffer_size: int = 20
@@ -328,15 +328,15 @@ class EmbeddingConfig:
     model_version: str = "bge-m3-v1"
     batch_size: int = 8
     timeout_seconds: float = 120
-    max_attempts: int = 3
+    max_attempts: int = 10
     backoff_base_seconds: float = 1
     backoff_max_seconds: float = 30
     trust_env: bool = False
     similarity_threshold: float = 0.50
 
 
-def load_embedding_config(path):
-    """加载向量接口及筛选阈值；.env 以本配置目录为准。"""
+def load_embedding_config(path, *, require_api_key=True):
+    """计算阶段加载密钥；第二轮只加载版本及检索配置，不读取或展开凭证。"""
     path = Path(path).absolute()
     try:
         with path.open(encoding="utf-8") as handle:
@@ -344,13 +344,17 @@ def load_embedding_config(path):
     except (yaml.YAMLError, UnicodeError) as exc:
         raise ConfigError("Embedding 配置无法作为 UTF-8 YAML 解析") from exc
     document = _mapping(document, "Embedding 配置", set(EmbeddingConfig.__dataclass_fields__))
-    load_dotenv(dotenv_path=path.parent / ".env", override=False)
+    if require_api_key:
+        load_dotenv(dotenv_path=path.parent / ".env", override=False)
     values = {name: document.get(name, definition.default)
               for name, definition in EmbeddingConfig.__dataclass_fields__.items()}
-    for name in ("base_url", "api_key", "model", "model_version"):
+    if not require_api_key:
+        values["api_key"] = ""
+    for name in (("base_url", "api_key", "model", "model_version") if require_api_key else ("base_url", "model", "model_version")):
         if not isinstance(values[name], str) or not values[name].strip():
             raise ConfigError("Embedding {} 必须为非空字符串".format(name))
-    values["api_key"] = _expand_environment(values["api_key"], "Embedding api_key")
+    if require_api_key:
+        values["api_key"] = _expand_environment(values["api_key"], "Embedding api_key")
     if any(character in values["api_key"] for character in "\r\n"):
         raise ConfigError("Embedding api_key 不能含换行")
     try:

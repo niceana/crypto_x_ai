@@ -120,11 +120,10 @@ def build_weight_data(basic_df, *, start_time, end_time=None):
     if not np.isfinite(data.to_numpy()).all():
         raise ValueError("basic_df.data 包含非有限值")
     hourly = data.groupby([target_hours.rename("date"), basic_df["asset"]], sort=True).sum().unstack("asset", fill_value=0.0)
-    # 先用数值完成聚合和补零，最后才转文本；date 单独保留为 DatetimeIndex。
-    numeric = hourly.reindex(index=hours, columns=assets, fill_value=0.0).astype("float64")
-    if not np.isfinite(numeric.to_numpy()).all():
+    # 聚合、补零及写库均保留 float64；date 单独保留为 DatetimeIndex。
+    weight_data = hourly.reindex(index=hours, columns=assets, fill_value=0.0).astype("float64")
+    if not np.isfinite(weight_data.to_numpy()).all():
         raise ValueError("小时权重聚合结果出现非有限值或数值溢出")
-    weight_data = numeric.astype(str)
     weight_data = weight_data.rename(columns={asset: asset + ASSET_SUFFIX for asset in assets})
     weight_data.columns.name = None
     return weight_data
@@ -200,14 +199,14 @@ def _save_weight_data(cli, weight_path, weight_data):
     existing = existing.sort_index()
     new_columns = weight_data.columns.difference(existing.columns, sort=False)
     columns = existing.columns.union(weight_data.columns, sort=False).sort_values()
-    batch = weight_data.reindex(columns=columns, fill_value="0.0")
-    existing = existing.reindex(columns=columns, fill_value="0.0")
+    batch = weight_data.reindex(columns=columns, fill_value=0.0)
+    existing = existing.reindex(columns=columns, fill_value=0.0)
     boundary = batch.index[0]
     if boundary in existing.index:
         # 起点已整体加 8 小时；该时刻的已有值属于上一批，不能用补零覆盖。
-        batch.loc[boundary] = existing.loc[boundary]
+        batch.loc[boundary] = existing.loc[boundary].astype("float64")
 
-    # 新资产历史上没有列，先按列补零，避免历史行因扩列出现非文本空值。
+    # 新资产历史上没有列，先按列补浮点零，避免历史行因扩列出现空值。
     if len(new_columns) and not existing.empty:
         save(cli.update_by_column, existing[new_columns], "weight_data_add_columns")
     overlap = batch.index.intersection(existing.index)
@@ -231,7 +230,7 @@ def _write_weight_features(cli, features, result_path, weight_path, *, start_tim
             comparison["unexpected_columns"], comparison["missing_columns"], comparison["columns_unique"]))
     logger.info("权重列名来源核对通过：result_path=%s，weight_path=%s，asset去重原值=%s",
                 result_path, weight_path, comparison["source_assets"])
-    # 完成评分、聚合、补零和文本转换后，仅平移最终索引，不改变源数据读取范围。
+    # 完成评分、聚合和补零后，仅平移最终索引，不改变源数据读取范围。
     # 先平移再与已有表对齐，避免续写重复加时或破坏上一批边界值。
     weight_data.index = weight_data.index + pd.Timedelta(hours=OUTPUT_TIME_OFFSET_HOURS)
     logger.info("权重表计算完成：小时=%d，资产=%d，起点=%s，终点=%s",

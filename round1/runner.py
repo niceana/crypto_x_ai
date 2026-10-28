@@ -39,7 +39,8 @@ class ExtractionSummary:
 
 
 def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, *,
-               on_successful_posts=None, user_name_to_tickers=None) -> ExtractionSummary:
+               on_successful_posts=None, user_name_to_tickers=None,
+               ai_config=None, network_factory=None) -> ExtractionSummary:
     """同步处理指定日期范围；当前月结果全部确认后才读取下一月。
 
     cli 直接读取 task_path 并按原索引更新指定列，始终在调用入口线程执行。
@@ -62,7 +63,7 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
             end = date.fromisoformat(end_time)
             if start > end:
                 raise ValueError("start_time 不能晚于 end_time")
-        config = load_ai_config(config_path)
+        config = ai_config or load_ai_config(config_path)
         account_tickers = prepare_account_tickers(user_name_to_tickers)
     except Exception:
         logger.exception("round1事件提取启动校验失败；尚未读取或更新round1帖子事件提取表")
@@ -103,6 +104,8 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
         return store, store.candidates, claim_jobs, store.save_results, summarize_month
 
     def create_network():
+        if network_factory is not None:
+            return network_factory(config)
         return _NetworkWorker(config, client_factory=_create_client,
                               retry_after=_retry_after, log=logger)
 

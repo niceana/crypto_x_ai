@@ -13,6 +13,7 @@ from common.ai_protocol import parse_response
 from common.config import EmbeddingConfig
 from common.network import CompletionMessage
 from round2.runner import run_relation
+from vectorization.preparation import prepare_vectors
 from tests.event_support import EventFixture, choose, new_result
 from tests.support import success
 
@@ -115,7 +116,8 @@ class AssetScopeTests(EventFixture, unittest.TestCase):
         self.addCleanup(embedding_client.close)
         with self.asset_list(backend, {"InstrumentList": ["ETH.exchange"]}):
             with patch("round2.runner.load_embedding_config", return_value=EmbeddingConfig("https://mock.invalid/v1", "test-key")):
-                with patch("round2.embedding._create_client", return_value=embedding_client):
+                with patch("vectorization.encoder._create_client", return_value=embedding_client):
+                    prepare_vectors(backend, settings, embedding_config=EmbeddingConfig("https://mock.invalid/v1", "test-key"))
                     summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.memory_network(requests))
         self.assertEqual((summary.total, summary.new_completed), (1, 1))
         self.assertEqual(embedding_texts, ["target-history", "target-current"])

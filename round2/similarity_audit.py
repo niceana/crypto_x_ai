@@ -15,7 +15,7 @@ from common.event_context import EventHistory
 from common.store import read_event_history
 from common.time_rules import history_read_bounds, published_time
 from common.validation import parse_strict_json, validate_index
-from round2.embedding import EmbeddingError, _validate_unit_vector
+from vectorization.storage import EmbeddingError, _validate_unit_vector
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ model: "bge-m3"
 model_version: "bge-m3-v1"
 batch_size: 8
 timeout_seconds: 120
-max_attempts: 3
+max_attempts: 10
 backoff_base_seconds: 1
 backoff_max_seconds: 30
 trust_env: false

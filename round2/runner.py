@@ -42,7 +42,8 @@ def _load_relation_history(store, pending_keys):
                               columns=["asset", "round2_status"], label="补录检查读取")
 
 
-def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker):
+def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker, *,
+                 embedding_config=None, target_assets=None):
     """读取已有任务，恢复状态，按币协调检索、请求与即时保存。
 
     调用线程独占 cli；同币下一时点必须等当前时间全部结果保存确认。相同
@@ -53,8 +54,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     if date.fromisoformat(settings.start_time) > date.fromisoformat(settings.end_time):
         raise ValueError("start_time 不能晚于 end_time")
     logger.info("round2事件去重归组启动准备：起点=%s，终点=%s", settings.start_time, settings.end_time)
-    target_assets = None
-    if settings.round2_asset_list_path:
+    if target_assets is None and settings.round2_asset_list_path:
         universe = json.loads(cli.read_object(settings.round2_asset_list_path).decode("utf-8"))["InstrumentList"]
         target_assets = {instrument.split(".", 1)[0].strip().upper() for instrument in universe}
     logger.info("round2事件去重归组开始读取本范围任务")
@@ -84,7 +84,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     elif settings.retriever or not settings.embedding_config_path:
         retrieve = load_retriever(settings.retriever)
     else:
-        embedding = EmbeddingRetriever(load_embedding_config(settings.embedding_config_path))
+        embedding = EmbeddingRetriever(embedding_config or load_embedding_config(settings.embedding_config_path, require_api_key=False))
         retrieve = embedding
     config = ai_config or load_ai_config(settings.round2_ai_config_path)
     require_prompts(config)
@@ -104,13 +104,12 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                 continue
             if is_history_needed(key[0], times[row["asset"]], settings.history_lookback_months):
                 embedding_keys.add(key)
-        # 编码固定事实可以提前批处理；实际候选仍由 history 严格按披露时点筛选。
-        # 向量按批写入事件去重分析表后才开始认领，避免同步请求阻塞关联结果的保存。
+        # 只加载独立向量阶段已保存的内容，不调用服务、不写 embedding 列。
         ordered = sorted(embedding_keys, key=lambda key: (published_time(key[0]), key[1]))
-        logger.info("round2事件去重归组开始准备向量：当前及历史记录=%d", len(ordered))
-        embedding.prepare(((key, store.df.at[key, "event"], store.df.at[key, "embedding"])
-                           for key in ordered), store.save_embeddings)
-        logger.info("round2事件去重归组向量准备及保存完成")
+        logger.info("round2事件去重归组开始载入已保存向量：当前及历史记录=%d", len(ordered))
+        records = ((key, store.df.at[key, "event"], store.df.at[key, "embedding"]) for key in ordered)
+        embedding.load_prepared(records)
+        logger.info("round2事件去重归组已保存向量载入完成")
     waves = {asset: deque(deque(sorted(batch, key=lambda key: key[1])) for _, batch in sorted(times.items()))
              for asset, times in sorted(grouped.items())}
     logger.info("round2事件去重归组准备运行：范围记录=%d，已有完成=%d，待处理记录=%d，待处理资产=%d，HTTP并发上限=%d，备用AI请求上限=%d；独立补货，已有结果即时合批写库",

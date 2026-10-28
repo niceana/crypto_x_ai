@@ -88,7 +88,7 @@ entrypoints.run_round1 自动导入已改为内存交接：round1事件提取每
 | 事项 | 当前状态及影响 | 需要的信息或处理 |
 | --- | --- | --- |
 | 数据路径及正式环境 | post_extraction_config、event_processing_config 的数据路径仍为占位文本。本地 .python38 用于模拟验证，未安装 xdata；用户此前已确认正式环境可用。 | 提供实际源帖、第一轮表、事件表路径及正式解释器。已有表先核对结构和结果，无须重复初始化；新事件表由现有导入代码创建。 |
-| 三轮 AI 服务和认证 | 三轮 URL 均为空，第二、三轮模型名为空；本地未配置 configs/.env，检查时进程也未设置 AI_API_KEY、EMBEDDING_API_KEY。 | 确定各轮接口和模型，密钥由用户写入环境或 .env。三轮可复用同一服务；换服务时核对非流式请求及 choices/message.content 等响应字段。 |
+| 三轮 AI 服务和认证 | 三轮 URL 均为空，第二、三轮模型名为空；各轮分别引用 ROUND1_AI_API_KEY、ROUND2_AI_API_KEY、ROUND3_AI_API_KEY，Embedding 使用 EMBEDDING_API_KEY。 | 确定各轮接口和模型，分别在环境或 configs/.env 填写密钥，并设置对应 run.concurrency；核对非流式请求及 choices/message.content 等响应字段。 |
 | 第一轮提示词 | 已配置 events/event/tickers 提取与可选账号背景规则，空 tickers 在导入时跳过、不再兜底。 | 用真实样本验证事件、币种归属及输出上限，币种目录和别名策略尚未启用。 |
 | 第二轮提示词及质量 | system 已配置，只接收 current.event 和各候选组的 candidate_id、history，使用 E1、E2 等短编号；关系选择和增量填写融入两个判断步骤，保留 `# ***标题***` 和四种固定 JSON 输出示例。matched_candidate_id 校验后映射回真实 event_id，重试沿用同一映射，数据库结构不变；实际接口和模型尚未配置。 | 接入后用真实样本检验 new/update/repeat/uncertain、候选选择和新增事实质量；新提示词与已有摘要冲突时，按原规则先确定处理或重算范围，不自动覆盖。 |
 | Embedding 服务 | 内置 bge-m3 调用、表内复用及阈值筛选已实现，base_url 仍为空。 | 提供基础地址和认证方式；程序追加 /embeddings，发送 model/input/encoding_format，使用 Bearer 认证。确认真实返回的 index/embedding、单位范数及向量 JSON 保存兼容性。格式不兼容才另行确定适配。 |

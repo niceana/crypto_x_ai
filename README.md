@@ -1,6 +1,8 @@
 # AI 帖子三轮处理项目
 
-本项目从帖子提取事件，建立按代币划分的披露记录，关联历史事件，再分析经济影响。项目独立运行，不需要打包或安装本项目；三个轮次分别启动，round1事件提取正常结束后自动导入成功帖。
+本项目从帖子提取事件，建立按代币划分的披露记录，关联历史事件，再分析经济影响。项目独立运行，不需要打包或安装本项目；统一流程为第一轮提取及导入、独立向量计算、第二轮归组、第三轮分析；支持按月流水线和按顺序独立启动。
+
+运行每条命令前，请先看 [命令运行前配置检查清单](docs/RUN_COMMAND_CHECKLIST.md)：逐项核对三轮 AI 的表路径、日期、接口、资产范围、历史与向量配置，以及备份、重置和权重命令的影响范围。
 
 三个轮次统一称为 **round1事件提取**、**round2事件去重归组**、**round3事件影响分析**。两张表按用途区分：
 
@@ -24,7 +26,7 @@
 
 下文命令中的 `python` 均应使用 Python 3.8.5；本机可替换为 `.\.python38\venv\Scripts\python.exe`，不依赖系统 PATH 的默认版本。
 
-三轮 AI 请求遇到 HTTP 429 时会在本次运行中暂停后重试，全部后续起发共同等待本地指数随机退避和有效 `Retry-After` 中的较长时间；缺少有效响应头时使用本地退避。429 与网络故障、5xx、无效输出共用 `run.max_attempts`，默认 3 次且包含首次；最后仍为 429 时保存失败并停止，避免无限重试。第二轮 Embedding 请求也在其独立批次预算内重试 429。持续限流时应降低 `concurrency` 或设置 `requests_per_second`；等待重试不会自动调整并发配置。
+三轮 AI 请求遇到 HTTP 429 时会在本次运行中暂停后重试，全部后续起发共同等待本地指数随机退避和有效 `Retry-After` 中的较长时间；缺少有效响应头时使用本地退避。429 与网络故障、5xx、无效输出共用 `run.max_attempts`，默认 10 次且包含首次；最后仍为 429 时保存失败并停止，避免无限重试。独立向量计算请求也在其独立批次预算内重试 429。持续限流时应降低 `concurrency` 或设置 `requests_per_second`；等待重试不会自动调整并发配置。
 
 | 文件 | 用途 |
 | --- | --- |
@@ -34,11 +36,13 @@
 | `configs/round2_ai_config.yaml` | round2事件去重归组提示词、接口、请求及运行参数 |
 | `configs/round3_ai_config.yaml` | round3事件影响分析提示词、接口、请求及运行参数 |
 | `configs/embedding_config.yaml` | round2事件去重归组使用的 bge-m3 地址、模型、每批条数、重试及相似度阈值 |
-| 进程环境或 `configs/.env` | AI_API_KEY、EMBEDDING_API_KEY，参考 `configs/.env.example` |
+| 进程环境或 `configs/.env` | ROUND1_AI_API_KEY、ROUND2_AI_API_KEY、ROUND3_AI_API_KEY、EMBEDDING_API_KEY，参考 `configs/.env.example` |
 
 入口按脚本位置读取项目的 `configs`，不依赖当前工作目录。两份任务配置中的相对 AI 配置路径按配置所在目录解析，例如round1事件提取填写 `ai_config_path: "round1_ai_config.yaml"`；绝对路径继续支持。数据系统路径原样传给客户端。
 
 `.env` 继续与 AI 配置放在同一目录，进程环境优先。因此使用本地文件时放在 `configs/.env`；不要只移动 YAML 而留下原根目录 `.env`。自定义绝对 AI 配置路径时，仍查找该文件同目录的 `.env`。
+
+三轮分别引用上述三个 AI 密钥变量，各自在对应 YAML 的 `run.concurrency` 设置 HTTP 并发上限，当前分别为 100、5、10；并行启动后相互独立，不共用并发名额。已有 `AI_API_KEY` 不会自动转成三个新变量，运行前需分别填写。独立向量阶段继续使用 `EMBEDDING_API_KEY`。
 
 起止日期使用带引号的 `YYYY-MM-DD`，包含起止日全天。第二、三轮必须同时填写起止日期；round1事件提取和独立导入仍允许两端同时为空。第一轮设置范围时按自然月分段，第三轮始终按配置范围分段。
 
@@ -46,6 +50,12 @@
 start_time: "2021-01-01"
 end_time: "2021-12-31"
 ```
+
+## 按月并行流水线
+
+已初始化第一轮任务表后，可以用 `python -X utf8 -m entrypoints.run_pipeline` 启动按月交接的第一轮、独立向量准备、第二轮、第三轮四进程流水线。每月第一轮必须全部成功且导入确认后才放行；流水线第二轮只载入已经准备的向量，候选矩阵使用内存缓存，检索时间范围、组内最高分、阈值和排序不变。沿用现有 AI 并发，不加入短窗口合批。
+
+统一日期取帖子配置；失败或中断后用 `--resume <运行记录目录>` 按数据库状态核验续跑。配置、空月份和停止行为见 [按月流水线说明](docs/MONTHLY_PIPELINE.md)。三个原独立入口继续可用。
 
 ## 初始化和日常运行
 
@@ -61,11 +71,12 @@ round1事件提取初始化完整读取源帖，校验后注册目标并一次�
 
 ```powershell
 python -X utf8 -m entrypoints.run_round1
+python -X utf8 -m entrypoints.prepare_vectors
 python -X utf8 -m entrypoints.run_round2
 python -X utf8 -m entrypoints.run_round3
 ```
 
-`entrypoints.run_round1` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 post_extraction_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。round2事件去重归组与round3事件影响分析仍分别启动，不会自动串行执行。
+`entrypoints.run_round1` 跳过读取时已成功的帖子，处理其余任务；正常返回后，将本范围成功帖从内存导入事件去重分析表。自动导入沿用 post_extraction_config 的实际round1帖子事件提取表及范围，无需手工同步两份配置。独立向量计算、第二轮、第三轮分别启动；也可使用 run_pipeline 按月交接。
 
 当前三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第一轮已配置事件 JSON 提取及账号背景规则，第二、三轮 system 均已配置正式提示词；提取及经济影响判断的质量仍需真实样本验证。账号背景已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_processing_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词始终分析当前完整 event，new_information 仅辅助理解事件进展和新旧变化。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
 
@@ -113,7 +124,7 @@ print(frequency.head(100))
 
 每次绘制 Top N 条形图、全部资产排名频数对数图和累计覆盖率曲线，标注覆盖 80%/90%/95% 数据需要的资产数；可选输出目录保存 PNG 与完整 CSV。累计占比的分母为全部有效资产行，不限于 Top N。`asset` 按原值统计，方便发现大小写、空白或别名造成的拆分；不读取状态或 event_id，不按事件组去重。没有出现在 df 中的资产不自动补零。只需统计时使用 `asset_frequency(df)`，不需要绘图库。
 
-round2事件去重归组默认使用 `embedding_config_path: "embedding_config.yaml"` 指向的 bge-m3 纯向量检索。填写该文件的 base_url，例如 `https://服务地址/v1`，程序追加 `/embeddings`；把密钥填入 `configs/.env` 的 EMBEDDING_API_KEY 或进程环境。默认每批 8 条，只编码 event；生成后保存到事件去重分析表的 embedding 列，JSON 包含 model、model_version、config_hash 和 vector，重启复用。config_hash 只标识服务、模型、版本和编码规则，不含 event；同名模型更换权重时要修改 model_version，人工修改 event 时须清空该行向量并确定下游重算范围。第二轮只使用 event 和候选历史，不再读取原帖；第三轮仅使用本条记录的 asset、event、new_information，也不读取原帖。初始化已包含该列，不使用 SQLite。
+独立向量计算由 vectorization.encoder.EmbeddingEncoder 和 entrypoints.prepare_vectors 执行，使用 embedding_config_path 指向的配置。填写 bge-m3 服务 base_url 和 EMBEDDING_API_KEY；默认每批 8 条，只编码 event。向量保存于事件表 embedding 列，JSON 含 model、model_version、config_hash、vector，重启复用。config_hash 标识服务、模型、版本和编码规则，不含 event；换权重时修改 model_version，修改 event 时清空相应向量并确定下游重算范围。第二轮只载入同版本的已保存向量和检索候选，不调用向量服务、不读取向量密钥；缺失或损坏时先补齐独立向量阶段。第二轮 AI 仅使用 event 和候选历史；第三轮仅使用 asset、event、new_information。不使用 SQLite。
 
 用户确认模型已输出归一化向量；程序保留返回数值，直接用内积计算余弦相似度，不再归一化或转成 float32。仍校验格式、维度、有限数值、非零向量及单位范数，范数允许绝对误差 1e-5；新响应不满足约定时使用该批剩余请求预算重试，耗尽后停止。
 
@@ -193,11 +204,11 @@ python -X utf8 -m entrypoints.write_weight_data
 
 可用 `--config "另一个事件配置文件路径"` 指定同结构的事件配置。源表按日期范围只读取一次、回答只解析一次，供所有组合复用，不调用 AI。逐组合生成、保存并释放 DataFrame。目标不存在时注册并首次 write；已有表通过 `update_by_column` 替换重叠小时，通过 `update_by_index` 追加新小时。重复运行不累加，范围外数据保留。完整参数、目标表和状态保存到 `reports/weight_grid/<北京时间>/manifest.json`，可用 `--report-dir` 指定新目录。某表失败时停止，已成功表保留，重跑继续对齐更新。
 
-`weight_data` 的单层索引名为 `date`，类型为 `DatetimeIndex`（`datetime64[ns]`），每条时间均为整点。列为读取范围内去重资产加 `.USDT.UFUTURE.BINANCE` 后缀。`basic_df` 保留原始完整发布时间，内存构建时将事件归入下一小时：`15:20:10 → 16:00:00`，整点也顺延。先按目标小时和资产以数值求和、补零并将普通列转为文本，写库前最后把时间索引整体加 8 小时；例如 `12-31 15:20 → 16:00 → 写入 01-01 00:00`。实际写库范围从 `start_time 08:00:00` 到 end_time 次日 `08:00:00`。源表读取日期不变，索引仍为无时区的 datetime。
+`weight_data` 的单层索引名为 `date`，类型为 `DatetimeIndex`（`datetime64[ns]`），每条时间均为整点。列为读取范围内去重资产加 `.USDT.UFUTURE.BINANCE` 后缀。`basic_df` 保留原始完整发布时间，内存构建时将事件归入下一小时：`15:20:10 → 16:00:00`，整点也顺延。按目标小时和资产以 float64 求和、补零并直接以浮点数写库，写库前最后把时间索引整体加 8 小时；例如 `12-31 15:20 → 16:00 → 写入 01-01 00:00`。实际写库范围从 `start_time 08:00:00` 到 end_time 次日 `08:00:00`。源表读取日期不变，索引仍为无时区的 datetime。旧表字符串权重仅在重跑覆盖范围内改写为浮点数，范围外数据不自动迁移。
 
 当前版本 `direction_product_v2` 的参数标识与旧版不同，避免将平移后的数据混入原时间口径的参数表；旧表保留。`reports/weight_grid/` 只保存本地参数和状态清单，不存权重 DataFrame；重跑依赖数据库实际数据，不依赖旧清单。
 
-续写时保留已有资产列：本批未出现的旧资产在新小时填 `"0.0"`，新资产的已有历史行也补文本零值。平移后的批次起点 08:00 行若已存在则保留，避免覆盖上一批最后一小时的顺延权重。重复运行不会再次平移已有表。返回的本批 df 包含保留的起点值及合并后的资产列。
+续写时保留已有资产列：本批未出现的旧资产在新小时填浮点数 `0.0`，新资产的已有历史行也补浮点零值。平移后的批次起点 08:00 行若已存在则保留其数值并转换为 float64，避免覆盖上一批最后一小时的顺延权重。重复运行不会再次平移已有表。返回的本批 df 包含保留的起点值及合并后的资产列。
 
 默认 B/C/D 为 1；方向为利好 `1`、利空 `-1`、其他 `0`；重要性为高 `3`、中 `2`、低 `1`、不确定 `0`；执行阶段为未开始 `1`、执行中 `2`、已完成 `3`、不确定 `0`；关系为 new `2`、update `1.5`、repeat `0.5`。利好、高、已完成、new 得分为 `18`，利空为 `-18`。任一乘数为零则得分为零；事件及小时聚合结果溢出时停止。
 
@@ -217,6 +228,10 @@ print(summary["manifest_path"])
 单组合接口仍返回一个 DataFrame：`build_basic_df(results, parameters=WeightParameters(...))`、`build_weight_data(basic_df, start_time=..., end_time=...)` 在内存构建；`write_weight_data(..., parameters=...)` 续写指定目标。完整配置、口径和示例见 [小时权重表](docs/data/WEIGHT_DATA.md)。
 
 已有表出现无法对应源资产的列时，运行 `python -X utf8 -m entrypoints.audit_weight_columns --param-id <参数标识>`；只有一个组合时可省略参数标识。该入口只读对照配置范围内 asset 与所选参数表列名。续写表中本批未出现的列可能来自历史批次，需结合此前范围判断。保存入口也会核对本批生成列的来源。
+
+## Weight 信号覆盖与事件分布诊断
+
+修改 `entrypoints/plot_signal_diagnostics.py` 顶部的表路径和日期，运行 `python -X utf8 -m entrypoints.plot_signal_diagnostics`。统一用 `cli.read` 读取，输出非零资产数、集中度、资产占比热图和连续全零时段；可选分析第二、三轮分布、实际映射的零分来源及同资产小时多空抵消。不接入策略或净值，详细配置和 CSV 字段见 [信号诊断](docs/SIGNAL_DIAGNOSTICS.md)。
 
 ## 代码目录与应用内调用
 

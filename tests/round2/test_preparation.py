@@ -26,8 +26,8 @@ class PreparationTests(Fixture, unittest.TestCase):
         return preparer, network
 
     def records(self, events):
-        return [(("2021-01-01", str(index)), {
-            "record_id": str(index), "date": "2021-01-01", "asset": "ASSET{}".format(index),
+        return [(("2021-01-01 00:00:00", str(index)), {
+            "record_id": str(index), "date": "2021-01-01 00:00:00", "asset": "ASSET{}".format(index),
             "event": event, "source_post_id": str(index)}) for index, event in enumerate(events)]
 
     def wait_ready(self, preparer, network, count):

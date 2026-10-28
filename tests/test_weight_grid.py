@@ -193,6 +193,7 @@ class WeightGridExecutionTests(unittest.TestCase):
         config = settings({"coefficients": {"B": [1, 2], "C": [1, 2]},
                            "mappings": {"materiality": {"高": [3, 4]}}})
         failed = result_frame([("2017-12-31 15:30:00", "FAILED", "uncertain", None, None)])
+        failed = failed.rename(index={"record0": "failed"}, level="record_id")
         failed["round3_status"] = "-1"
         backend = Tables(pd.DataFrame(), pd.concat([completed_events(), failed]))
         backend.tables["weights"] = pd.DataFrame({"legacy": ["keep"]})
@@ -222,14 +223,14 @@ class WeightGridExecutionTests(unittest.TestCase):
             table = backend.tables[entry["table_path"]]
             coefficient = entry["parameters"]["coefficients"]
             expected = 6 * entry["parameters"]["mappings"]["materiality"]["高"] * coefficient["B"] * coefficient["C"]
-            self.assertEqual(table.loc["2018-01-01 00:00:00", "BTC" + ASSET_SUFFIX], str(float(expected)))
-            self.assertEqual(table.loc["2018-01-01 00:00:00", "ETH" + ASSET_SUFFIX], str(float(-expected)))
+            self.assertEqual(table.loc["2018-01-01 00:00:00", "BTC" + ASSET_SUFFIX], float(expected))
+            self.assertEqual(table.loc["2018-01-01 00:00:00", "ETH" + ASSET_SUFFIX], float(-expected))
             self.assertEqual(entry["start_time"], "2017-12-31 08:00:00")
             self.assertEqual(entry["end_time"], "2018-01-01 08:00:00")
             self.assertIsInstance(table.index, pd.DatetimeIndex)
             self.assertEqual(table.index.name, "date")
             self.assertTrue(table.index.equals(table.index.floor("h")))
-            self.assertTrue(all(isinstance(value, str) for value in table.to_numpy().flat))
+            self.assertTrue(table.dtypes.eq("float64").all())
             self.assertEqual(len(table), 25)
 
     def test_failed_second_table_stops_and_rerun_updates_same_targets(self):
@@ -284,8 +285,8 @@ class WeightGridExecutionTests(unittest.TestCase):
             table = backend.tables[variant.table_path]
             self.assertEqual(len(table), 49)
             self.assertTrue(table.index.is_unique)
-            self.assertEqual(table.loc["2018-01-01 08:00:00", "BTC" + ASSET_SUFFIX], str(18 * variant.parameters.B))
-            self.assertEqual(table.loc["2018-01-01 09:00:00", "BTC" + ASSET_SUFFIX], str(-6 * variant.parameters.B))
+            self.assertEqual(table.loc["2018-01-01 08:00:00", "BTC" + ASSET_SUFFIX], 18 * variant.parameters.B)
+            self.assertEqual(table.loc["2018-01-01 09:00:00", "BTC" + ASSET_SUFFIX], -6 * variant.parameters.B)
 
     def test_overflow_records_failure_without_creating_or_writing_target(self):
         backend = Tables(pd.DataFrame(), completed_events())

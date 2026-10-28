@@ -22,6 +22,7 @@
 │  ├─ first_round_answers.py     历史第一轮回答解析及正文引号兼容
 │  └─ event_records.py           事件展开、自动导入和独立续建
 ├─ round1/runner.py              round1事件提取执行和成功帖回调
+├─ vectorization/                独立向量计算、保存和格式校验
 ├─ round2/                       round2事件去重归组：runner 调度、preparation 异步准备及向量检索
 ├─ round3/runner.py              round3事件影响分析前提检查、事件输入和执行
 ├─ entrypoints/                  五种独立任务入口及 runtime.py
@@ -49,7 +50,7 @@ common.time_rules.history_read_bounds(current_times, scope_start, months) 为第
 
 第三轮也必须配置日期。启动时读取同一目标资产名单，round3.runner._load_impact_store 在前置检查、状态恢复及实际执行各阶段逐月读取任务后先按 asset 筛选工作表；开启 round3_skip_incomplete_round2 时，再排除第二轮状态为 0/9/-1 的记录并重建 positions。该开关对象默认 false，当前事件 YAML 设为 true。_prepare_impact 对保留记录检查第二轮状态、本条基本关联和跨月 record_id 唯一性；标记成功但关联非法或状态未知仍停止。无可处理记录或可处理部分第三轮全部完成时直接返回。整个可处理范围通过后才按月恢复遗留第三轮状态，再核对全表配置摘要单列并执行。AI 请求、repeat 继承和状态统计均限定保留记录，跳过行不更新；StageSummary.skipped_round2 按月单列累计，正常的 total 等字段仅包含可处理记录。EventRecordStore.require_relation 只检查本条已保存的状态、关系及组 ID，不回查组起点。第三轮 build_impact_input 只使用当前任务行，不读取原帖。repeat 逻辑直接位于 round3.runner：_load_repeat_sources 为待处理 repeat 按月从近到远读取必要历史响应列与元数据，找到全部组的最近有效来源后停止；_remember_impact_response 校验来源，并用字典为每组保留一条有效响应；_complete_repeat_impacts 在本月 new/update 结果保存后按披露时间处理 repeat，排除同刻和未来，复制后才标记完成；并发、批量保存和停止恢复沿用共用执行器。
 
-common.config.load_embedding_config 独立加载向量服务地址、模型版本、认证、批量及阈值。round2.embedding.EmbeddingRetriever.prepare(records, save_embeddings) 接收原键、event 与表内 embedding，复用模型及配置标识匹配的 JSON；config_hash 不含 event。模型已归一化，_validate_unit_vector 只校验原向量及单位范数，不修改分量；保存响应数值，内存使用 float64 数组直接计算内积，编码规则标识同步更新。使用 HTTPX 批量生成缺失向量，复用 common.network 的 RETRYABLE_NETWORK_ERRORS、retry_backoff 和 parse_retry_after，传输、5xx 和无效输出共用批次预算。再调用 EventRecordStore.save_embeddings 仅按原索引更新 embedding 列；Store 使用独立存储重试，失败不重新请求 Embedding。全部向量保存后才认领关联。HTTP 客户端在准备结束或异常时关闭，业务评分只做内存点积，按组取最高分后过滤阈值，再取最多 10 组，不补足；全低分或无历史返回自动 new。第二轮按配置日期读取任务和必要历史，窗口筛选及按币时间队列推进均在内存完成。向量准备不改变记录的历史资格，round3事件影响分析保留向量列但不解析或发送给 AI。不使用 SQLite，未新增安装依赖，详细流程见 [方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。
+向量计算是独立阶段：vectorization.encoder.EmbeddingEncoder.prepare 复用或生成向量，沿用既有 HTTP 重试；vectorization.preparation.prepare_vectors 只读 asset/event/embedding 并仅写 embedding 列，写入重试不重复请求向量；vectorization.storage.StoredVectors 共用原有 JSON、版本摘要及 float64 校验。round2.embedding.EmbeddingRetriever 仅载入已保存向量、缓存矩阵、计算内积、组内取最高分、过滤阈值，再按分数与 event_id 排序取最多 10 组。第二轮没有生成或保存向量的分支，也不允许 EventRecordStore 写 embedding 列；缺失时先运行 entrypoints.prepare_vectors。第二轮加载配置时不读取或展开向量密钥。候选仍由 EventHistory 按原披露时刻窗口筛选，提前编码不改变历史资格。
 
 common.ai_protocol.render_payload 接收已准备的文本，完成一次模板替换和请求体编码检查，不读取数据库、不重新查询历史。TaskRenderError 也由 common.ai_protocol 定义。配置加载不依赖 ai_protocol；ai_protocol 使用 AIConfig 和同一模板变量语法。
 
@@ -107,6 +108,6 @@ entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客
 
 上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当时完整 267 项模拟测试通过；内存索引优化新增 7 项，当时完整 274 项测试通过，覆盖时间边界、按币隔离、乱序载入与加入、返回副本、完整组前史及起点合法性。事件去重分析表仍为 14 个普通列，向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
 
-此前内存索引优化使用上一版代码和相同模拟数据对比：4,000 条同币历史的前史校验从约 8.12 秒降至 0.31 秒；2 万条历史、180 条窗口记录连续检索 100 次，结果一致，耗时从约 0.089 秒降至 0.004 秒。这是本机单次模拟观测，只衡量内存校验和窗口查询，不含数据库、Embedding 或 AI 请求；向量临时矩阵保持原实现。
+此前内存索引优化使用上一版代码和相同模拟数据对比：4,000 条同币历史的前史校验从约 8.12 秒降至 0.31 秒；2 万条历史、180 条窗口记录连续检索 100 次，结果一致，耗时从约 0.089 秒降至 0.004 秒。这是本机单次模拟观测，只衡量内存校验和窗口查询，不含数据库、Embedding 或 AI 请求；现版本已加入按资产矩阵缓存，规则见按月流水线说明。
 
 任务和事件配置的重复键修复新增 4 项测试，覆盖根层、嵌套账号与日志键、重复值相同、不同字典同名键、单账号多代币，以及配置出错时不创建数据客户端。当时完整 278 项测试通过；仓库 6 份 YAML 在新旧加载器下解析值一致，50 组账号映射保留。
