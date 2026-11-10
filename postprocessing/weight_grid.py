@@ -5,8 +5,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from common.store import read_event_history
-from postprocessing.weight_data import SOURCE_COLUMNS, _validate_weight_request, _write_weight_features, parse_weight_features
+from postprocessing.weight_data import (
+    SOURCE_COLUMNS, _validate_weight_request, _write_weight_features, parse_weight_features, read_weight_events,
+)
 from postprocessing.weight_parameters import WeightGridPlan, prepare_weight_grid
 
 
@@ -48,8 +49,8 @@ def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
     logger.info("权重参数网格开始：组合=%d，清单=%s", len(plan.variants), manifest_path)
     current = None
     try:
-        results = read_event_history(cli, settings.result_path, settings.start_time, settings.end_time,
-                                     columns=SOURCE_COLUMNS, label="权重网格来源读取")
+        results = read_weight_events(cli, settings.result_path, settings.start_time, settings.end_time,
+                                    columns=SOURCE_COLUMNS, label="权重网格来源读取")
         features = parse_weight_features(results)
         del results
         if features.empty:
@@ -60,8 +61,9 @@ def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
             current = entry
             entry["status"] = "running"
             _write_manifest(manifest_path, manifest)
-            logger.info("生成权重组合 %d/%d：参数=%s，目标=%s", manifest["completed"] + 1,
-                        len(plan.variants), variant.parameters.param_id, variant.table_path)
+            logger.info("生成权重组合 %d/%d：参数=%s，聚合=%s，目标=%s", manifest["completed"] + 1,
+                        len(plan.variants), variant.parameters.param_id,
+                        variant.parameters.aggregation_method, variant.table_path)
             saved = _write_weight_features(cli, features, settings.result_path, variant.table_path,
                                             start_time=settings.start_time, end_time=settings.end_time,
                                             parameters=variant.parameters)
@@ -86,7 +88,7 @@ def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
         raise
     manifest.update(status="completed", finished_at=_now().isoformat())
     _write_manifest(manifest_path, manifest)
-    tables = [{key: entry[key] for key in ("param_id", "table_path", "status", "hours", "assets", "start_time", "end_time")}
+    tables = [{key: entry[key] for key in ("param_id", "aggregation_method", "table_path", "status", "hours", "assets", "start_time", "end_time")}
               for entry in manifest["variants"]]
     logger.info("权重网格完成：组合=%d，清单=%s", len(tables), manifest_path)
     return {"combination_count": len(tables), "completed": manifest["completed"],

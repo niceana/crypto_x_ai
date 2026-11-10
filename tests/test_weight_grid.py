@@ -16,7 +16,7 @@ from common.persistence import BatchPersistenceError
 from postprocessing import weight_data
 from postprocessing.weight_data import ASSET_SUFFIX, SOURCE_COLUMNS, build_basic_df, build_weight_data
 from postprocessing.weight_grid import run_weight_grid
-from postprocessing.weight_parameters import DEFAULT_MAPPINGS, WeightParameters, prepare_weight_grid
+from postprocessing.weight_parameters import DEFAULT_MAPPINGS, WeightParameters, prepare_weight_grid, select_weight_variant
 from tests.event_support import Tables
 from tests.test_weight_data import result_frame
 
@@ -35,6 +35,78 @@ def completed_events():
 
 
 class WeightParameterTests(unittest.TestCase):
+    def test_aggregation_axis_shares_score_identity_and_has_distinct_paths(self):
+        summed = WeightParameters()
+        maximum = WeightParameters(aggregation_method="max_abs")
+        self.assertEqual(summed.param_id, "e795f558c8aacbb8")
+        self.assertEqual(summed.parameter_hash, maximum.parameter_hash)
+        self.assertEqual(summed.param_id, maximum.param_id)
+        self.assertEqual(maximum.to_dict()["aggregation_method"], "max_abs")
+        plan = prepare_weight_grid("weights", {"aggregation_methods": ["max_abs", "sum", "max_abs"],
+                                                "coefficients": {"B": [1, 2]}})
+        self.assertEqual(len(plan.variants), 4)
+        self.assertEqual(len({v.table_path for v in plan.variants}), 4)
+        self.assertEqual(len({v.parameters.param_id for v in plan.variants}), 2)
+        for variant in plan.variants:
+            parameters = variant.parameters
+            self.assertEqual(parameters.param_id, WeightParameters(B=parameters.B).param_id)
+            self.assertEqual(variant.table_path, "weights/{}__B{}_C1_D1__{}".format(
+                parameters.aggregation_method, int(parameters.B), parameters.param_id))
+        self.assertEqual(plan.candidates["aggregation_methods"], ["max_abs", "sum"])
+        reordered = prepare_weight_grid("weights", {"aggregation_methods": ["sum", "max_abs"],
+                                                     "coefficients": {"B": [2, 1]}})
+        self.assertEqual({v.table_path for v in plan.variants}, {v.table_path for v in reordered.variants})
+        explicit_sum = prepare_weight_grid("weights", {"aggregation_methods": ["sum"]})
+        self.assertEqual(explicit_sum.variants[0].table_path, prepare_weight_grid("weights").variants[0].table_path)
+        for entry in plan.to_dict()["variants"]:
+            self.assertIn(entry["aggregation_method"], ("sum", "max_abs"))
+        template = "{weight_path}__{aggregation_method}__{param_id}"
+        named = prepare_weight_grid("weights", {"aggregation_methods": ["max_abs"],
+                                                 "table_name_template": template})
+        self.assertIn("__max_abs__", named.variants[0].table_path)
+
+    def test_default_paths_are_children_of_weight_path_with_one_separator(self):
+        for base in ("crypto/weights", "crypto/weights/"):
+            with self.subTest(weight_path=base):
+                plan = prepare_weight_grid(base, {"aggregation_methods": ["sum", "max_abs"],
+                                                  "coefficients": {"B": [2], "C": [0.5]}})
+                param_id = WeightParameters(B=2, C=0.5).param_id
+                self.assertEqual([v.table_path for v in plan.variants], [
+                    "crypto/weights/sum__B2_C0.5_D1__" + param_id,
+                    "crypto/weights/max_abs__B2_C0.5_D1__" + param_id,
+                ])
+
+    def test_templates_require_aggregation_method_even_for_single_mode_runs(self):
+        for methods in (["sum"], ["max_abs"], ["sum", "max_abs"]):
+            with self.subTest(methods=methods), self.assertRaisesRegex(ValueError, "aggregation_method"):
+                prepare_weight_grid("weights", {"aggregation_methods": methods,
+                                                "table_name_template": "{weight_path}__{param_id}"})
+
+    def test_select_variant_uses_parameter_id_and_aggregation_method(self):
+        plan = prepare_weight_grid("weights", {"aggregation_methods": ["sum", "max_abs"],
+                                               "coefficients": {"B": [1, 2]}})
+        param_id = WeightParameters(B=2).param_id
+        with self.assertRaisesRegex(ValueError, "aggregation-method"):
+            select_weight_variant(plan, param_id=param_id)
+        for method in ("sum", "max_abs"):
+            selected = select_weight_variant(plan, param_id=param_id, aggregation_method=method)
+            self.assertEqual(selected.parameters.B, 2)
+            self.assertEqual(selected.parameters.aggregation_method, method)
+        with self.assertRaises(ValueError):
+            select_weight_variant(plan, param_id="missing", aggregation_method="sum")
+        with self.assertRaises(ValueError):
+            select_weight_variant(plan, param_id=param_id, aggregation_method="unknown")
+
+    def test_invalid_aggregation_candidates_and_combination_limit_are_rejected(self):
+        for methods in ([], None, "max_abs", ["unknown"], [True], [1], [[]], [{}]):
+            with self.subTest(methods=methods), self.assertRaisesRegex(ValueError, "aggregation"):
+                prepare_weight_grid("weights", {"aggregation_methods": methods})
+        with self.assertRaisesRegex(ValueError, "aggregation_method"):
+            WeightParameters(aggregation_method="unknown")
+        with self.assertRaisesRegex(ValueError, "4.*3"):
+            prepare_weight_grid("weights", {"aggregation_methods": ["sum", "max_abs"],
+                                             "coefficients": {"B": [1, 2]}, "max_combinations": 3})
+
     def test_defaults_and_independent_coefficient_and_enum_axes(self):
         default = prepare_weight_grid("weights")
         self.assertEqual(len(default.variants), 1)
@@ -114,16 +186,17 @@ class WeightParameterTests(unittest.TestCase):
             prepare_weight_grid("weights", {"coefficients": {"B": list(range(1001))}})
 
     def test_custom_template_and_path_collisions_checked_before_execution(self):
-        config = {"table_name_template": "{weight_path}/{param_id}/B{B}C{C}D{D}"}
+        config = {"table_name_template": "{weight_path}/{aggregation_method}/{param_id}/B{B}C{C}D{D}"}
         variant = prepare_weight_grid("weights", config).variants[0]
-        self.assertEqual(variant.table_path, "weights/{}/B1C1D1".format(variant.parameters.param_id))
+        self.assertEqual(variant.table_path, "weights/sum/{}/B1C1D1".format(variant.parameters.param_id))
         with self.assertRaisesRegex(ValueError, "冲突"):
             prepare_weight_grid("weights", config, result_path=variant.table_path)
         with patch.object(WeightParameters, "param_id", new_callable=PropertyMock, return_value="same"):
             with self.assertRaisesRegex(ValueError, "冲突"):
-                prepare_weight_grid("weights", {"coefficients": {"B": [1, 2]}, "table_name_template": "{param_id}"})
+                prepare_weight_grid("weights", {"coefficients": {"B": [1, 2]},
+                                                "table_name_template": "{aggregation_method}/{param_id}"})
             with self.assertRaisesRegex(ValueError, "冲突"):
-                prepare_weight_grid("same", {"table_name_template": "{param_id}"})
+                prepare_weight_grid("sum/same", {"table_name_template": "{aggregation_method}/{param_id}"})
 
 
 class WeightScoringTests(unittest.TestCase):
@@ -189,6 +262,38 @@ class WeightScoringTests(unittest.TestCase):
 
 
 class WeightGridExecutionTests(unittest.TestCase):
+    def test_both_aggregations_write_separate_tables_and_rerun_without_accumulating(self):
+        source = result_frame([
+            ("2017-12-31 15:10:00", "BTC", "new", "利好", "中"),
+            ("2017-12-31 15:20:00", "BTC", "new", "利空", "高"),
+            ("2017-12-31 15:30:00", "BTC", "update", "利好", "高"),
+        ], execution_stage="已完成")
+        backend = Tables(pd.DataFrame(), source)
+        config = settings({"aggregation_methods": ["sum", "max_abs"]})
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(weight_data, "_parse_impact", wraps=weight_data._parse_impact) as parse:
+                summary = run_weight_grid(backend, config, report_dir=directory / "first")
+            self.assertEqual(parse.call_count, 3)
+            manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["candidates"]["aggregation_methods"], ["sum", "max_abs"])
+            self.assertEqual(len({table["param_id"] for table in summary["tables"]}), 1)
+            self.assertEqual({table["table_path"] for table in summary["tables"]}, {
+                "weights/sum__B1_C1_D1__e795f558c8aacbb8",
+                "weights/max_abs__B1_C1_D1__e795f558c8aacbb8",
+            })
+            for table in summary["tables"]:
+                expected = 7.5 if table["aggregation_method"] == "sum" else -18.0
+                saved = backend.tables[table["table_path"]]
+                self.assertEqual(saved.loc["2018-01-01 00:00:00", "BTC" + ASSET_SUFFIX], expected)
+                self.assertEqual(len(saved), 26)
+                self.assertTrue(saved.dtypes.eq("float64").all())
+            before = (len(backend.writes), len(backend.updates), len(backend.appends))
+            run_weight_grid(backend, config, report_dir=directory / "again")
+            self.assertEqual(before, (len(backend.writes), len(backend.updates), len(backend.appends)))
+        self.assertEqual(summary["completed"], 2)
+        self.assertEqual(len(backend.registers), 2)
+
     def test_grid_reads_and_parses_source_once_and_records_full_manifest(self):
         config = settings({"coefficients": {"B": [1, 2], "C": [1, 2]},
                            "mappings": {"materiality": {"高": [3, 4]}}})
@@ -198,7 +303,7 @@ class WeightGridExecutionTests(unittest.TestCase):
         backend = Tables(pd.DataFrame(), pd.concat([completed_events(), failed]))
         backend.tables["weights"] = pd.DataFrame({"legacy": ["keep"]})
         original = backend.tables["weights"].copy()
-        with patch("postprocessing.weight_parameters.SCORING_VERSION", "direction_product_v1"):
+        with patch("postprocessing.weight_parameters.SCORING_VERSION", "direction_product_v2"):
             old_path = prepare_weight_grid("weights").variants[0].table_path
         backend.tables[old_path] = pd.DataFrame({"BTC" + ASSET_SUFFIX: ["18.0"]},
             index=pd.DatetimeIndex(["2017-12-31 16:00:00"], name="date"))
@@ -208,7 +313,7 @@ class WeightGridExecutionTests(unittest.TestCase):
                 summary = run_weight_grid(backend, config, report_dir=Path(temporary) / "run")
             manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
         self.assertEqual(parse.call_count, 2)
-        self.assertEqual(backend.column_reads, [("result", "2017-12-31", "2017-12-31", SOURCE_COLUMNS)])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2018-01-01", SOURCE_COLUMNS)])
         self.assertEqual(summary["combination_count"], 8)
         self.assertEqual(manifest["completed"], 8)
         self.assertEqual(manifest["status"], "completed")
@@ -226,12 +331,12 @@ class WeightGridExecutionTests(unittest.TestCase):
             self.assertEqual(table.loc["2018-01-01 00:00:00", "BTC" + ASSET_SUFFIX], float(expected))
             self.assertEqual(table.loc["2018-01-01 00:00:00", "ETH" + ASSET_SUFFIX], float(-expected))
             self.assertEqual(entry["start_time"], "2017-12-31 08:00:00")
-            self.assertEqual(entry["end_time"], "2018-01-01 08:00:00")
+            self.assertEqual(entry["end_time"], "2018-01-01 09:00:00")
             self.assertIsInstance(table.index, pd.DatetimeIndex)
             self.assertEqual(table.index.name, "date")
             self.assertTrue(table.index.equals(table.index.floor("h")))
             self.assertTrue(table.dtypes.eq("float64").all())
-            self.assertEqual(len(table), 25)
+            self.assertEqual(len(table), 26)
 
     def test_failed_second_table_stops_and_rerun_updates_same_targets(self):
         config = settings({"coefficients": {"B": [1, 2, 3]}})
@@ -273,7 +378,7 @@ class WeightGridExecutionTests(unittest.TestCase):
             ("2017-12-31 23:20:00", "BTC", "new", "利好", "高"),
             ("2018-01-01 00:20:00", "BTC", "new", "利空", "低"),
         ], execution_stage="已完成")
-        config = settings({"coefficients": {"B": [1, 2]}})
+        config = settings({"coefficients": {"B": [1, 2]}, "aggregation_methods": ["sum", "max_abs"]})
         backend = Tables(pd.DataFrame(), source)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -283,7 +388,7 @@ class WeightGridExecutionTests(unittest.TestCase):
         self.assertEqual([t["table_path"] for t in first["tables"]], [t["table_path"] for t in second["tables"]])
         for variant in prepare_weight_grid("weights", config.weight_grid).variants:
             table = backend.tables[variant.table_path]
-            self.assertEqual(len(table), 49)
+            self.assertEqual(len(table), 50)
             self.assertTrue(table.index.is_unique)
             self.assertEqual(table.loc["2018-01-01 08:00:00", "BTC" + ASSET_SUFFIX], 18 * variant.parameters.B)
             self.assertEqual(table.loc["2018-01-01 09:00:00", "BTC" + ASSET_SUFFIX], -6 * variant.parameters.B)
@@ -301,7 +406,7 @@ class WeightGridExecutionTests(unittest.TestCase):
 
     def test_dry_run_never_imports_database_client_or_creates_reports(self):
         module = importlib.import_module("entrypoints.write_weight_data")
-        config = settings({"coefficients": {"D": [1, -1]}}, start_time=None, end_time=None)
+        config = settings({"aggregation_methods": ["sum", "max_abs"]}, start_time=None, end_time=None)
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "must_not_exist"
             with patch.object(module, "load_event_config", return_value=config), patch("builtins.print") as output:
@@ -309,12 +414,15 @@ class WeightGridExecutionTests(unittest.TestCase):
                     preview = module.main(["--dry-run", "--report-dir", str(report)])
             self.assertFalse(report.exists())
         self.assertEqual(preview["combination_count"], 2)
+        self.assertEqual({v["aggregation_method"] for v in preview["variants"]}, {"sum", "max_abs"})
         self.assertEqual(json.loads(output.call_args.args[0]), preview)
 
     def test_invalid_grid_and_excessive_combinations_stop_before_database_import(self):
         module = importlib.import_module("entrypoints.write_weight_data")
         grids = ({"coefficients": {"B": list(range(1001))}},
                  {"coefficients": {"B": [float("inf")]}},
+                 {"aggregation_methods": ["unknown"]},
+                 {"aggregation_methods": []},
                  {"table_name_template": "{weight_path}"})
         with patch.dict("sys.modules", {"xdata": None, "xdata.client": None}):
             for grid in grids:

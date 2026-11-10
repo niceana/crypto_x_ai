@@ -32,6 +32,20 @@ def events():
 
 
 class WeightDiagnosticsTests(unittest.TestCase):
+    def test_event_windows_use_45_minute_cutoff_before_eight_hour_offset(self):
+        source = events().iloc[:4].copy()
+        source.index = pd.MultiIndex.from_tuples([
+            ("2023-01-01 16:44:59.999999999", "before"),
+            ("2023-01-01 16:45:00", "start"),
+            ("2023-01-01 17:44:59.999999999", "last"),
+            ("2023-01-01 17:45:00", "next"),
+        ], names=source.index.names)
+        report = analyze_events(source)
+        self.assertEqual(list(report["event_scores"]["target_hour"]), list(pd.to_datetime([
+            "2023-01-02 01:00:00", "2023-01-02 02:00:00",
+            "2023-01-02 02:00:00", "2023-01-02 03:00:00",
+        ])))
+
     def test_heatmap_without_new_matplotlib_apis_preserves_global_colormap(self):
         import matplotlib
         matplotlib.use("Agg")
@@ -135,11 +149,18 @@ class EventDiagnosticsTests(unittest.TestCase):
         self.assertEqual(zero["summary"]["fully_cancelled_asset_hours"], 0)
 
     def test_entrypoint_reads_only_configured_tables_and_source_boundary_day(self):
+        from common.config import EventConfig
         from entrypoints import plot_signal_diagnostics as entry
         weight = pd.DataFrame({"BTC" + ASSET_SUFFIX: [0.0, 2.0]},
                               index=pd.date_range("2023-01-01", periods=2, freq="h"))
-        source = events().iloc[:1].copy()
-        source.index = pd.MultiIndex.from_tuples([("2022-12-31 16:10:00", "before_year")], names=["date", "record_id"])
+        source = pd.concat([events().iloc[:1]] * 5)
+        source.index = pd.MultiIndex.from_tuples([
+            ("2022-12-31 14:44:59", "too_early"),
+            ("2022-12-31 14:45:00", "first_window"),
+            ("2022-12-31 16:45:00", "before_year"),
+            ("2023-01-01 14:44:59", "last_window"),
+            ("2023-01-01 14:45:00", "too_late"),
+        ], names=["date", "record_id"])
         calls = []
 
         class Reader:
@@ -147,13 +168,20 @@ class EventDiagnosticsTests(unittest.TestCase):
                 calls.append((path, kwargs))
                 return weight.copy() if path == "weights" else source.copy()
 
+        settings = EventConfig("first", "results", "round2.yaml", "round3.yaml", weight_path="weights",
+                               weight_grid={"aggregation_methods": ["sum", "max_abs"]})
         with tempfile.TemporaryDirectory(prefix=".test-diagnostics-", dir=Path.cwd()) as temporary, patch.multiple(
                 entry, WEIGHT_PATH="weights", RESULT_PATH="results", START_TIME="2023-01-01",
-                END_TIME="2023-01-01", OUTPUT_DIR=Path(temporary), TOP_N=1):
+                END_TIME="2023-01-01", OUTPUT_DIR=Path(temporary), TOP_N=1,
+                PARAM_ID=WeightParameters().param_id, AGGREGATION_METHOD="max_abs"), patch(
+                    "common.config.load_event_config", return_value=settings):
             report = entry.main(Reader())
             self.assertEqual([call[0] for call in calls], ["weights", "results"])
             self.assertEqual(calls[1][1]["start_time"], "2022-12-31")
-            self.assertEqual(report["events"]["event_scores"].iloc[0]["target_hour"], pd.Timestamp("2023-01-01 01:00"))
+            self.assertEqual(list(report["events"]["event_scores"]["target_hour"]), list(pd.to_datetime([
+                "2023-01-01 00:00:00", "2023-01-01 02:00:00", "2023-01-01 23:00:00",
+            ])))
+            self.assertEqual(report["events"]["summary"]["parameters"]["aggregation_method"], "max_abs")
             for name in ("weight_overview.png", "weight_hourly.csv", "event_distributions.png",
                          "event_zero_cancellation.png", "event_zero_combinations.csv"):
                 self.assertTrue((Path(temporary) / name).exists(), name)

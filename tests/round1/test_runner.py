@@ -62,6 +62,9 @@ class RunnerTests(Fixture, unittest.TestCase):
             def shutdown(self):
                 pass
 
+            def http_snapshot(self):
+                return 0, 0, 0.0
+
             def submit(self, job):
                 request = httpx.Request("POST", self.config.api.url,
                                         json=render_payload(self.config, job.text))
@@ -70,7 +73,10 @@ class RunnerTests(Fixture, unittest.TestCase):
                 self.http_attempts_started += 1
                 self.completions.put(CompletionMessage(job.key, response, 1))
 
-        with patch("round1.runner._NetworkWorker", LocalNetwork):
+        def local_network(config, **kwargs):
+            return self.add_memory_ready_queue(LocalNetwork(config, **kwargs))
+
+        with patch("round1.runner._NetworkWorker", side_effect=local_network):
             summary = self.worker(FakeCli(frame), handler, user_name_to_tickers=mapping)
         self.assertEqual(summary.new_succeeded, 3)
         self.assertCountEqual(bodies, [
@@ -1170,7 +1176,7 @@ class RunnerTests(Fixture, unittest.TestCase):
         self.assertNotIn("全部处理完了", self.last_output)
 
     def test_stop_during_claim_does_not_submit_newly_claimed_post(self):
-        self.document["run"]["concurrency"] = 2
+        self.document["run"].update(concurrency=2, batch_size=2)
         cli = FakeCli(tasks(["2021-01-01"] * 4))
         claim_started = threading.Event()
         error_returned = threading.Event()
@@ -1212,7 +1218,7 @@ class RunnerTests(Fixture, unittest.TestCase):
         with patch.object(httpx.AsyncClient, "__aexit__", new=record_close), self.assertRaises(BatchRunError):
             self.worker(cli, handler)
         self.assertEqual(requested, ["post 0", "post 1"])
-        self.assertEqual(list(cli.frame["status"]), ["1", "-1", "9", "0"])
+        self.assertEqual(list(cli.frame["status"]), ["1", "-1", "9", "9"])
 
 
 if __name__ == "__main__":

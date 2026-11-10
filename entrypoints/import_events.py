@@ -5,7 +5,7 @@ from entrypoints.runtime import execute, run_entrypoint
 
 
 def main():
-    return run_entrypoint(import_event_records_from_table)
+    return run_entrypoint(import_event_records_from_table, stage="import_events")
 
 
 if __name__ == "__main__":

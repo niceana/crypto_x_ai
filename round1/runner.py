@@ -110,7 +110,7 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
                               retry_after=_retry_after, log=logger)
 
     run_segments(_month_ranges(start, end), load_segment, summary, create_network,
-                 log=logger)
+                 log=logger, label="round1事件提取")
     summary.elapsed_seconds = time.monotonic() - started
     scope = "本次读取范围" if start is None else "本次日期范围"
     logger.info("round1事件提取：%s内的任务全部处理完了：成功 %d，失败 %d；HTTP起发=%d，耗时=%.3f秒",

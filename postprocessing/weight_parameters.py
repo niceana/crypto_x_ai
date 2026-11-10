@@ -10,11 +10,12 @@ from string import Formatter
 from types import MappingProxyType
 
 
-# v2 的写库时间轴整体加 8 小时，使用新标识避免与旧时间口径表混写。
-SCORING_VERSION = "direction_product_v2"
+# v3 使用 [T-75分钟, T-15分钟) 窗口，使用新标识避免与旧时间口径表混写。
+SCORING_VERSION = "direction_product_v3"
 OUTPUT_TIME_OFFSET_HOURS = 8
 FORMULA = "direction * (B * materiality) * (C * execution_stage) * (D * event_relation)"
 COEFFICIENTS = ("B", "C", "D")
+AGGREGATION_METHODS = ("sum", "max_abs")
 ACTIVE_MAPPINGS = ("direction", "materiality", "execution_stage", "event_relation")
 DEFAULT_MAPPINGS = {
     "direction": {"利好": 1, "利空": -1, "中性": 0, "不确定": 0, "其他": 0},
@@ -23,7 +24,7 @@ DEFAULT_MAPPINGS = {
     "event_relation": {"new": 2, "update": 1.5, "repeat": 0.5},
     "persistence": {"短期": 1, "中期": 100, "长期": 10000, "不确定": 0},
 }
-DEFAULT_TABLE_TEMPLATE = "{weight_path}__B{B}_C{C}_D{D}__{param_id}"
+DEFAULT_TABLE_TEMPLATE = "{weight_path}/{aggregation_method}__B{B}_C{C}_D{D}__{param_id}"
 
 
 def _number(value, label):
@@ -52,6 +53,12 @@ def _reject_unknown(document, allowed, label):
         raise ValueError("{} 包含未知字段：{}".format(label, sorted(unknown)))
 
 
+def validate_aggregation_method(method):
+    if not isinstance(method, str) or method not in AGGREGATION_METHODS:
+        raise ValueError("aggregation_method 必须为 sum 或 max_abs")
+    return method
+
+
 @dataclass(frozen=True)
 class WeightParameters:
     """一个组合的标量参数；省略项采用默认映射，不含未启用的 persistence。"""
@@ -60,8 +67,10 @@ class WeightParameters:
     C: float = 1
     D: float = 1
     mappings: object = None
+    aggregation_method: str = "sum"
 
     def __post_init__(self):
+        validate_aggregation_method(self.aggregation_method)
         for name in COEFFICIENTS:
             object.__setattr__(self, name, _number(getattr(self, name), name))
         overrides = _mapping({} if self.mappings is None else self.mappings, "mappings")
@@ -76,13 +85,20 @@ class WeightParameters:
         object.__setattr__(self, "mappings", MappingProxyType(normalized))
 
     def to_dict(self):
-        return {"scoring_version": SCORING_VERSION,
-                "coefficients": {name: getattr(self, name) for name in COEFFICIENTS},
-                "mappings": {field: dict(self.mappings[field]) for field in ACTIVE_MAPPINGS}}
+        values = {"scoring_version": SCORING_VERSION,
+                  "coefficients": {name: getattr(self, name) for name in COEFFICIENTS},
+                  "mappings": {field: dict(self.mappings[field]) for field in ACTIVE_MAPPINGS}}
+        # 保留完整计算参数；sum 沿用原有序列化格式，省略默认聚合模式。
+        if self.aggregation_method != "sum":
+            values["aggregation_method"] = self.aggregation_method
+        return values
 
     @property
     def parameter_hash(self):
-        encoded = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False,
+        # 标识只依赖评分参数；聚合模式由表名独立区分，便于跨模式对照。
+        values = self.to_dict()
+        values.pop("aggregation_method", None)
+        encoded = json.dumps(values, sort_keys=True, ensure_ascii=False,
                              separators=(",", ":"), allow_nan=False).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -98,6 +114,7 @@ class WeightVariant:
 
     def to_dict(self):
         return {"param_id": self.parameters.param_id, "parameter_hash": self.parameters.parameter_hash,
+                "aggregation_method": self.parameters.aggregation_method,
                 "table_path": self.table_path, "parameters": self.parameters.to_dict()}
 
 
@@ -138,17 +155,32 @@ def _validate_template(template):
         for _, name, format_spec, conversion in Formatter().parse(template):
             if name is None:
                 continue
-            if name not in {"weight_path", "B", "C", "D", "param_id"} or format_spec or conversion:
-                raise ValueError("表名模板只支持 weight_path、B、C、D、param_id 简单占位符")
+            if name not in {"weight_path", "B", "C", "D", "param_id", "aggregation_method"} or format_spec or conversion:
+                raise ValueError("表名模板只支持 weight_path、B、C、D、param_id、aggregation_method 简单占位符")
             names.add(name)
     except ValueError as exc:
         raise ValueError("table_name_template 不合法：{}".format(exc)) from exc
     if "param_id" not in names:
         raise ValueError("table_name_template 必须包含 {param_id}")
+    if "aggregation_method" not in names:
+        raise ValueError("table_name_template 必须包含 {aggregation_method}，以区分不同聚合模式的表")
 
 
 def _coefficient_text(number):
     return str(int(number)) if number.is_integer() and abs(number) < 1e16 else str(number)
+
+
+def select_weight_variant(plan, *, param_id=None, aggregation_method=None):
+    """评分参数标识可跨模式复用；选择单张表时同时按模式筛选。"""
+    if aggregation_method is not None:
+        validate_aggregation_method(aggregation_method)
+    choices = [variant for variant in plan.variants
+               if (param_id is None or variant.parameters.param_id == param_id)
+               and (aggregation_method is None or variant.parameters.aggregation_method == aggregation_method)]
+    if len(choices) != 1:
+        raise ValueError("请用 --param-id 和 --aggregation-method 选择一个有效组合；"
+                         "可先运行 write_weight_data --dry-run 查看参数标识及聚合模式")
+    return choices[0]
 
 
 def prepare_weight_grid(weight_path, config=None, *, result_path=None):
@@ -156,7 +188,11 @@ def prepare_weight_grid(weight_path, config=None, *, result_path=None):
     if not isinstance(weight_path, str) or not weight_path.strip():
         raise ValueError("请在事件配置中填写 weight_path，作为各参数表的基础路径")
     config = _mapping({} if config is None else config, "weight_grid")
-    _reject_unknown(config, ("coefficients", "mappings", "table_name_template", "max_combinations"), "weight_grid")
+    _reject_unknown(config, ("coefficients", "mappings", "aggregation_methods", "table_name_template", "max_combinations"), "weight_grid")
+    raw_methods = config.get("aggregation_methods", ["sum"])
+    if not isinstance(raw_methods, list) or not raw_methods:
+        raise ValueError("weight_grid.aggregation_methods 必须为非空数组，只支持 sum 和 max_abs")
+    methods = list(dict.fromkeys(validate_aggregation_method(method) for method in raw_methods))
     raw_coefficients = _mapping(config.get("coefficients", {}), "weight_grid.coefficients")
     _reject_unknown(raw_coefficients, COEFFICIENTS, "weight_grid.coefficients")
     coefficients = {name: _candidates(raw_coefficients.get(name, [1]), "coefficients." + name)
@@ -178,11 +214,11 @@ def prepare_weight_grid(weight_path, config=None, *, result_path=None):
     axes = [("coefficient", name) for name in COEFFICIENTS]
     axes.extend((field, key) for field in ACTIVE_MAPPINGS for key in sorted(mappings[field]))
     choices = [coefficients[key] if field == "coefficient" else mappings[field][key] for field, key in axes]
-    count = math.prod(len(values) for values in choices)
+    count = len(methods) * math.prod(len(values) for values in choices)
     if count > limit:
         raise ValueError("参数组合数 {} 超过 max_combinations={}；请缩小候选数组或调高上限".format(count, limit))
     variants, paths = [], set()
-    for values in product(*choices):
+    for method, *values in product(methods, *choices):
         scalar_coefficients = {}
         scalar_mappings = {field: {} for field in ACTIVE_MAPPINGS}
         for (field, key), value in zip(axes, values):
@@ -190,13 +226,14 @@ def prepare_weight_grid(weight_path, config=None, *, result_path=None):
                 scalar_coefficients[key] = value
             else:
                 scalar_mappings[field][key] = value
-        parameters = WeightParameters(mappings=scalar_mappings, **scalar_coefficients)
+        parameters = WeightParameters(mappings=scalar_mappings, aggregation_method=method, **scalar_coefficients)
         substitutions = {name: _coefficient_text(getattr(parameters, name)) for name in COEFFICIENTS}
-        substitutions.update(weight_path=weight_path, param_id=parameters.param_id)
+        substitutions.update(weight_path=weight_path.rstrip("/"), param_id=parameters.param_id, aggregation_method=method)
         table_path = template.format(**substitutions)
         if not table_path.strip() or table_path in (weight_path, result_path) or table_path in paths:
             raise ValueError("参数表路径为空、冲突或覆盖来源/无参数基础表：{}".format(table_path))
         paths.add(table_path)
         variants.append(WeightVariant(parameters, table_path))
     return WeightGridPlan(weight_path, template, limit,
-                          {"coefficients": coefficients, "mappings": mappings}, tuple(variants))
+                          {"coefficients": coefficients, "mappings": mappings,
+                           "aggregation_methods": methods}, tuple(variants))

@@ -7,10 +7,14 @@ result_path: "填写统一结果表路径"
 # 小时权重表的基础路径；运行前填写，各组合追加参数后缀，后续按日期索引更新并追加。
 weight_path: ""
 # 每个有效参数组合生成独立表；persistence 暂不计分，也不参与组合展开。
-# 小时计算完成后，写库前最终时间索引整体加 8 小时；源表读取日期不变。
+# 整点 T 聚合 [T-75分钟, T-15分钟)；写库前时间索引整体加 8 小时。
+# 自动补读前后相邻日以覆盖完整窗口；输出结束在 end_time 次日 09:00（平移后）。
 # 公式：direction × (B × materiality) × (C × execution_stage) × (D × event_relation)。
 # 每个枚举各自的候选数组独立展开；先用 --dry-run 预览表名及组合数。
 weight_grid:
+  # sum: 同资产同小时求和；max_abs: 只取绝对值最大的原信号（保留正负号）。
+  # 改为 [max_abs] 仅生成新算法；[sum, max_abs] 同时生成两种算法的独立表。
+  aggregation_methods: [sum]
   coefficients:
     B: [2]
     C: [0.5]
@@ -24,9 +28,9 @@ weight_grid:
       其他: [0]
     materiality:
       高: [3]
-      中: [2]
-      低: [1]
-      不确定: [2]
+      中: [2.5]
+      低: [0.5]
+      不确定: [2.5]
     execution_stage:
       未开始: [1]
       执行中: [2]
@@ -34,14 +38,15 @@ weight_grid:
       不确定: [2]
     event_relation:
       new: [2]
-      update: [1.5]
-      repeat: [0.5]
+      update: [1.0]
+      repeat: [0.2]
     persistence:
       短期: [1]
       中期: [100]
       长期: [10000]
       不确定: [0]
-  table_name_template: "{weight_path}__B{B}_C{C}_D{D}__{param_id}"
+  # 相同评分参数共享 param_id；不同聚合模式写入 weight_path 下的独立表。
+  table_name_template: "{weight_path}/{aggregation_method}__B{B}_C{C}_D{D}__{param_id}"
   max_combinations: 1000
 round2_ai_config_path: "round2_ai_config.yaml"
 round3_ai_config_path: "round3_ai_config.yaml"

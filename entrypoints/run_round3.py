@@ -5,7 +5,7 @@ from entrypoints.runtime import execute, run_entrypoint
 
 
 def main():
-    return run_entrypoint(run_impact)
+    return run_entrypoint(run_impact, stage="round3")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+# 三个逻辑结果路径对应两张物理表；第二、三轮必须填同一路径。
+round1_result_path: ""
+round2_result_path: ""
+round3_result_path: ""
+round2_ai_config_path: "media_round2_ai_config.yaml"
+round3_ai_config_path: "media_round3_ai_config.yaml"
+# 第二、三轮必须同时填写日期；含起止日全天。
+start_time: null
+end_time: null
+history_lookback_months: 1
+# 留空处理所有对象；如填交易资产名单，程序仍保留 INDUSTRY/MACRO。
+round2_asset_list_path: ""
+round3_skip_incomplete_round2: true
+# 可选：第二轮业务 JSON 字符上限（不是 token 上限，不含 system 提示词）。
+# 按实际模型容量填写正整数；超限保存失败并暂停该对象，不截断。null 不设本地字符限制。
+round2_max_input_characters: null
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"

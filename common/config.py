@@ -267,6 +267,12 @@ def load_event_config(path):
     path = Path(path).absolute()
     with path.open(encoding="utf-8") as handle:
         document = yaml.load(handle, Loader=_UniqueLoader)
+    return event_config_from_mapping(document, path)
+
+
+def event_config_from_mapping(document, path):
+    """校验已加载的事件配置；适配其他配置命名时复用相同约束。"""
+    path = Path(path).absolute()
     if not isinstance(document, dict):
         raise ValueError("扩展配置必须为字典")
     allowed = set(EventConfig.__dataclass_fields__)

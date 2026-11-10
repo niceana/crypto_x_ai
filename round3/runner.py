@@ -219,6 +219,6 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
 
     summary = StageSummary("round3")
     run_segments(ranges, load_segment, summary,
-                 lambda: network_factory(config), _impact_result, logger)
+                 lambda: network_factory(config), _impact_result, logger, "round3事件影响分析")
     logger.info("round3事件影响分析处理结束：%s", summary)
     return summary

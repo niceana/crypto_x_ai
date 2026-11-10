@@ -22,7 +22,7 @@ from common.validation import (
     validate_event_table_structure,
     validate_index,
 )
-from common.time_rules import history_window_start, in_scope, published_time
+from common.time_rules import in_scope, published_time
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +199,7 @@ class PostTaskStore(TableStore):
         logger.info("round1帖子事件提取表当前分段状态恢复完成：恢复数=%d，待处理数=%d", restored, len(self.candidates))
 
     def select(self, count: int) -> List[TaskKey]:
-        """沿原读取顺序选取待处理键，名额仅由网络作业占用决定。"""
+        """沿原读取顺序选择本批待认领键，由执行器提前补充备用输入。"""
         return self.select_pending(self.candidates, count, "round1")
 
     def claim(self, keys: Sequence[TaskKey]):
@@ -256,39 +256,6 @@ class StageSummary:
 def summarize(store, keys, stage, already, attempts=0, blocked=()):
     return StageSummary(stage, **store.summarize(stage, keys, already),
                         http_attempts_started=attempts, blocked_assets=tuple(sorted(blocked)))
-
-
-def is_stored_relation_valid(key, row, frame, record_positions=None,
-                             origin_start=None):
-    """检查第二轮前史的组引用、阶段、资产及时间，可复用原行位置索引。
-
-    record_positions 供当前表前史校验；未传索引时按表查找。
-    传入 origin_start 时，允许未读到或早于下界
-    的组起点，其引用无法核实，必须在业务输入中标记历史截断。
-    """
-    relation, event_id = row["event_relation"], row["event_id"]
-    if relation == "new":
-        return event_id == key[1]
-    if relation not in ("update", "repeat"):
-        return False
-    if origin_start is not None and (not isinstance(event_id, str) or not event_id.strip()):
-        return False
-    if record_positions is not None:
-        position = record_positions.get(event_id)
-        if position is None:
-            return origin_start is not None
-        root_key, origin = frame.index[position], frame.iloc[position]
-    else:
-        root = frame.loc[frame.index.get_level_values("record_id") == event_id]
-        if len(root) != 1:
-            return origin_start is not None and root.empty
-        root_key, origin = next(root.iterrows())
-    if origin_start is not None and published_time(root_key[0]) < origin_start:
-        # 不回查或核实窗口外起点，保留已保存组 ID 并在输入中标记截断。
-        return True
-    return (origin["round2_status"] == "1" and origin["event_relation"] == "new"
-            and origin["event_id"] == root_key[1] and origin["asset"] == row["asset"]
-            and published_time(root_key[0]) < published_time(key[0]))
 
 
 def _event_response_json(response, attempts):
@@ -418,47 +385,3 @@ class EventRecordStore(TableStore):
                          "error_message": "" if response is not None else
                          "repeat 找不到同币种、同事件组中严格早于当前披露的有效第三轮响应"})
         self.update_stage_columns([key for key, _, _ in items], rows, "round3")
-
-
-def validate_relation_history(store, keys, history_lookback_months=3, later_records=None):
-    """用内存位置索引检查指定月数内的同币前史，保留更晚完成冲突检查。
-
-    ID 字典和按币分组只保存原行位置；不复制完整表，不增加数据库查询。
-    窗口内较早记录须全部完成；窗口外组起点不再核实，输入另行标记截断。
-    later_records 仅含处理范围之后的资产与状态，用于保留补录冲突检查。
-    """
-    earliest, begins = {}, {}
-    for key in keys:
-        if store.df.at[key, "round2_status"] != "1":
-            asset = store.df.at[key, "asset"]
-            stamp = published_time(key[0])
-            begin = history_window_start(stamp, history_lookback_months)
-            if asset not in begins or begin < begins[asset]:
-                begins[asset] = begin
-            if asset not in earliest or stamp < earliest[asset][0]:
-                earliest[asset] = stamp, key
-    if not earliest:
-        return
-    record_positions = {}
-    rows_by_asset = {asset: [] for asset in earliest}
-    for frame in (store.df, later_records):
-        if frame is None:
-            continue
-        for position, (key, asset) in enumerate(zip(frame.index, frame["asset"])):
-            if frame is store.df:
-                record_positions[key[1]] = position
-            if asset in rows_by_asset and published_time(key[0]) >= begins[asset]:
-                rows_by_asset[asset].append((frame, position))
-    for asset, (stamp, pending_key) in earliest.items():
-        # 较早任务只检查历史窗口；更晚已完成仍识别为补录或状态缺口。
-        for frame, position in rows_by_asset[asset]:
-            old_key, row = frame.index[position], frame.iloc[position]
-            old_stamp = published_time(old_key[0])
-            if old_stamp > stamp and row["round2_status"] == "1":
-                raise ValueError("疑似历史补录或历史状态缺口，请核查：asset={}，待处理={} / {}，更晚已完成={} / {}".format(
-                    asset, pending_key[0], pending_key[1], old_key[0], old_key[1]))
-            if old_stamp < stamp:
-                if row["round2_status"] != "1" or not is_stored_relation_valid(
-                        old_key, row, store.df, record_positions=record_positions,
-                        origin_start=begins[asset]):
-                    raise ValueError("所需前史未完成，请手动补跑：{} / {}".format(asset, old_key[1]))

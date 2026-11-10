@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from entrypoints import runtime
+from common.process_lock import ProcessLockBusy, stage_guard
 
 
 class RuntimeTests(unittest.TestCase):
@@ -18,6 +19,9 @@ class RuntimeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix=".test-runtime-", dir=str(Path.cwd()))
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        environment = patch.dict(os.environ, {"CRYPTO_X_AI_LOCK_DIR": str(self.root / "locks")})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.configs = self.root / "configs"
         self.configs.mkdir()
         self.path = self.configs / "event_processing_config.yaml"
@@ -77,3 +81,53 @@ class RuntimeTests(unittest.TestCase):
         self.get_client.assert_not_called()
         operation.assert_not_called()
         setup_logging.assert_not_called()
+
+    def test_duplicate_stage_stops_before_client_and_any_operation(self):
+        self.path.write_text(json.dumps(self.document), encoding="utf-8")
+        for stage in ("round2", "round3", "vectors", "import_events"):
+            with self.subTest(stage=stage), stage_guard(stage, "result"):
+                operation = Mock()
+                with self.assertRaises(ProcessLockBusy):
+                    runtime.run_entrypoint(operation, stage=stage)
+                self.get_client.assert_not_called()
+                operation.assert_not_called()
+
+    def test_lock_is_held_before_client_creation_through_operation_and_released_on_exception(self):
+        self.path.write_text(json.dumps(self.document), encoding="utf-8")
+
+        def check_lock():
+            with self.assertRaises(ProcessLockBusy):
+                with stage_guard("round2", "result"):
+                    self.fail("创建客户端之前就应上锁")
+            return self.client
+
+        self.get_client.side_effect = check_lock
+
+        def operation(cli, settings):
+            check_lock()
+            raise RuntimeError("模拟运行异常")
+
+        with self.assertRaisesRegex(RuntimeError, "模拟运行异常"):
+            runtime.run_entrypoint(operation, stage="round2")
+        with stage_guard("round2", "result"):
+            pass
+
+    def test_import_and_round1_share_source_lock(self):
+        self.path.write_text(json.dumps(self.document), encoding="utf-8")
+        with stage_guard("round1", "first"):
+            with patch.object(runtime, "stage_guard", wraps=stage_guard) as guard:
+                with self.assertRaises(ProcessLockBusy):
+                    runtime.run_entrypoint(Mock(), stage="import_events")
+                self.assertEqual([call.args[0] for call in guard.call_args_list], ["round1"])
+        self.get_client.assert_not_called()
+        # 来源冲突时，不应遗留导入锁。
+        with stage_guard("import_events", "result"):
+            pass
+
+    def test_busy_exit_is_code_two_with_clear_message_and_without_traceback(self):
+        with self.assertLogs(runtime.__name__, level="WARNING") as captured:
+            with self.assertRaises(SystemExit) as caught:
+                runtime.execute(Mock(side_effect=ProcessLockBusy("已有进程 PID=123")))
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("PID=123", captured.output[0])
+        self.assertIsNone(captured.records[0].exc_info)

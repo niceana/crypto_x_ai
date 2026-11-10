@@ -1,0 +1,10 @@
+# 媒体独立第一轮；所有路径填写完成后再运行。
+source_path: ""
+round1_result_path: ""
+ai_config_path: "media_round1_ai_config.yaml"
+# 两端同时为空时第一轮处理全表；填写日期则包含首尾日。
+start_time: null
+end_time: null
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"

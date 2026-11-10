@@ -1,15 +1,69 @@
-"""round1事件提取与round3事件影响分析共用的自然月推进和独立任务执行，不依赖业务表结构。"""
+"""三轮共用进度统计，第一轮与第三轮共用自然月推进和独立任务执行。"""
 
 import logging
 import queue
 import time
 from calendar import monthrange
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 from common.network import BatchRunError
 from common.persistence import BatchPersistenceError
+from common.preparation import RequestPreparer
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BatchStats:
+    calls: int = 0
+    records: int = 0
+    seconds: float = 0.0
+
+    def record(self, records, started_at):
+        self.calls += 1
+        self.records += records
+        self.seconds += time.monotonic() - started_at
+
+    def fields(self, label, batch_label=None):
+        return (
+            "{}平均每批耗时={:.3f}秒，{}平均批量={:.1f}条，{}折合每条耗时={:.3f}秒".format(
+                label, self.seconds / self.calls if self.calls else 0.0,
+                batch_label or label, self.records / self.calls if self.calls else 0.0,
+                label, self.seconds / self.records if self.records else 0.0)
+        )
+
+
+class ProgressStats:
+    """三轮共用进度节流和瓶颈日志；只持有标量，HTTP 统计读取网络快照。"""
+
+    def __init__(self, run, log, label):
+        self.run = run
+        self.logger = log
+        self.label = label
+        self.started_at = self.last_report_at = time.monotonic()
+        self.next_progress = run.progress_every
+        self.confirmed = 0
+        self.claim = BatchStats()
+        self.save = BatchStats()
+
+    def should_report(self, processed, force=False):
+        now = time.monotonic()
+        if not force and processed < self.next_progress and now - self.last_report_at < 10:
+            return False
+        self.last_report_at = now
+        self.next_progress = (processed // self.run.progress_every + 1) * self.run.progress_every
+        return True
+
+    @property
+    def elapsed_seconds(self):
+        return time.monotonic() - self.started_at
+
+    def report_bottlenecks(self, http_peak, http_average, details=""):
+        self.logger.info(
+            "%s瓶颈统计：HTTP平均并发=%.2f/%d，HTTP峰值=%d，%s%s，%s",
+            self.label, http_average, self.run.concurrency, http_peak,
+            details + "，" if details else "", self.save.fields("结果保存"), self.claim.fields("认领写库", "认领"))
 
 
 def month_ranges(start, end):
@@ -34,16 +88,16 @@ def check_month_complete(processing):
 
 
 class SegmentCoordinator:
-    """调用线程执行当前分段，限制网络作业和未保存结果的条数。
+    """调用线程执行当前分段，提前认领输入并分批保存结果。
 
     candidates 只保存当前月候选键。claim_jobs(limit) 确认认领后返回本批键和
     逐条生成的 RequestJob；save_results 整批确认后返回。业务表、请求校验、
-    结果转换、存储结束检查和统计由调用方提供，协调器只记录网络占用、
-    结果缓冲与整批保存进度。
+    结果转换、存储结束检查和统计由调用方提供。准备与网络线程独立补货，
+    concurrency 只限制 HTTP；完成队列允许积压，提交缓冲仍按批次保存。
     """
 
     def __init__(self, run, network, candidates, claim_jobs, save_results,
-                 confirmed_before=0, result_item=None, log=None):
+                 confirmed_before=0, result_item=None, log=None, progress=None, preparer=None):
         self.run_config = run
         self.network = network
         self.candidates = candidates
@@ -51,7 +105,11 @@ class SegmentCoordinator:
         self.save_results = save_results
         self.result_item = result_item or (lambda message: (message.key, message.response))
         self.logger = log or logger
-        # 收取完成消息即释放网络名额；保存完成由缓冲和存储状态判断。
+        self.progress = progress or ProgressStats(run, self.logger, "任务")
+        self.preparer = preparer
+        self.total = len(candidates)
+        self.succeeded = self.failed = 0
+        # 只跟踪已认领未收取的任务，不用它限制 HTTP 或备用请求补货。
         self.submitted = set()
         self.buffer = []
         self.first_buffer_at = None
@@ -59,12 +117,46 @@ class SegmentCoordinator:
         step = run.progress_every
         self.next_progress = (confirmed_before // step + 1) * step
 
+    def report_progress(self, force=False, phase="处理中"):
+        """本段只统计启动时待执行的 AI 任务；写库确认后才计入已处理。"""
+        if not self.progress.should_report(self.progress.confirmed, force):
+            return
+        with self.network.completions.mutex:
+            waiting = sum(message.response is not None for message in self.network.completions.queue)
+        waiting += sum(message.response is not None for message in self.network.unpublished)
+        waiting += len(self.buffer)
+        http_in_flight, http_peak, http_average = self.network.http_snapshot()
+        preparation_state, pending_preparation = self.preparer.snapshot() if self.preparer else ("未启动", 0)
+        ready = self.preparer.ready_requests.qsize() if self.preparer else 0
+        processed = self.succeeded + self.failed
+        elapsed = self.progress.elapsed_seconds
+        self.logger.info(
+            "%s当前分段AI任务处理进度：阶段=%s，已处理=%d/%d（%.1f%%），本次成功=%d，失败=%d，"
+            "剩余未处理=%d，待认领=%d，HTTP请求中=%d/%d，准备状态=%s，待准备=%d，就绪请求=%d/%d，"
+            "已认领未落库=%d，待写库结果=%d，"
+            "HTTP累计尝试=%d，耗时=%.1f秒，结果确认速度=%.2f条/秒",
+            self.progress.label, phase, processed, self.total,
+            processed * 100.0 / self.total if self.total else 0.0,
+            self.succeeded, self.failed, self.total - processed, len(self.candidates),
+            http_in_flight, self.run_config.concurrency, preparation_state, pending_preparation,
+            ready, self.run_config.ready_request_buffer_size, len(self.submitted) + len(self.buffer), waiting,
+            self.network.http_attempts_started, elapsed,
+            self.progress.confirmed / elapsed if elapsed > 0 else 0.0)
+        self.progress.report_bottlenecks(http_peak, http_average)
+
     def flush(self):
         """整批保存返回后才清空；保存失败时保留全部结果。"""
         if not self.buffer:
             return
         self.logger.debug("开始提交最终结果缓冲：结果数=%d", len(self.buffer))
-        self.save_results(self.buffer)
+        started_at = time.monotonic()
+        try:
+            self.save_results(self.buffer)
+        finally:
+            self.progress.save.record(len(self.buffer), started_at)
+        self.succeeded += sum(item[1].success for item in self.buffer)
+        self.failed += sum(not item[1].success for item in self.buffer)
+        self.progress.confirmed += len(self.buffer)
         self.confirmed += len(self.buffer)
         self.buffer.clear()
         self.first_buffer_at = None
@@ -96,31 +188,53 @@ class SegmentCoordinator:
         if self.should_flush():
             self.flush()
 
-    def run(self):
-        """先保存、逐条收取并检查容量，最后按空闲名额补充请求。"""
-        run = self.run_config
-        while True:
+    def check(self):
+        self.preparer.check()
+        try:
             self.network.check()
+        except BatchRunError:
+            # 准备失败可能发生在两次检查之间，优先保留其原始异常。
+            self.preparer.check()
+            raise
+
+    def run(self):
+        """分批提前认领；准备和网络补货不等待调用线程写库。"""
+        run = self.run_config
+        self.report_progress(force=True)
+        while True:
+            self.report_progress()
+            self.check()
             if self.should_flush():
                 self.flush()
-            while True:
+            # 只取当前快照，避免持续到达的结果推迟下一批备用输入认领。
+            for _ in range(self.network.completions.qsize()):
                 try:
                     message = self.network.completions.get_nowait()
                 except queue.Empty:
                     break
                 self.consume(message)
-                self.network.check()
-            self.network.check()
+                self.check()
+            self.check()
             if not self.submitted and not self.candidates:
                 self.flush()
+                self.report_progress(force=True, phase="处理结束")
                 return
-            keys, jobs = self.claim_jobs(run.concurrency - len(self.submitted))
+            keys = []
+            _, pending_preparation = self.preparer.snapshot()
+            # 保留一批待准备输入；认领大小及补货与未结束 HTTP/待写库数量无关。
+            measure_claim = bool(self.candidates) and pending_preparation < run.batch_size
+            started_at = time.monotonic()
+            try:
+                if measure_claim:
+                    keys, jobs = self.claim_jobs(run.batch_size)
+            finally:
+                if measure_claim:
+                    self.progress.claim.record(len(keys), started_at)
             if keys:
-                for job in jobs:
-                    # 同步认领可能耗时；写入确认后仍要再次检查整体停止。
-                    self.network.check()
-                    self.submitted.add(job.key)
-                    self.network.submit(job)
+                # 同步认领可能耗时；确认后再次检查停止，再交付固定输入副本。
+                self.check()
+                self.submitted.update(keys)
+                self.preparer.submit_batch(list(jobs))
                 continue
             timeout = 0.25
             if self.buffer:
@@ -154,7 +268,7 @@ def _retain_unsaved(error, coordinator, network):
 
 
 def run_segments(ranges, load_segment, summary, network_factory,
-                 result_item=None, log=None):
+                 result_item=None, log=None, label="任务"):
     """逐段加载和执行，复用一个网络线程，只跨段保留标量汇总。
 
     load_segment(start, end) 返回 store、候选队列、claim_jobs、save_results、
@@ -164,7 +278,7 @@ def run_segments(ranges, load_segment, summary, network_factory,
     各轮的全范围前置检查应在进入本函数之前完成。
     """
     active_logger = log or logger
-    network = store = coordinator = None
+    network = store = coordinator = progress = preparer = None
     confirmed = 0
     try:
         try:
@@ -176,9 +290,14 @@ def run_segments(ranges, load_segment, summary, network_factory,
                 if candidates:
                     if network is None:
                         network = network_factory()
+                        preparer = RequestPreparer(store.config, network, log=active_logger, label=label)
+                        network.bind_ready_queue(preparer.ready_requests, preparer.wake)
                         network.start()
+                        preparer.start()
+                        progress = ProgressStats(store.config.run, active_logger, label)
                     coordinator = SegmentCoordinator(store.config.run, network, candidates,
-                                                     claim_jobs, save_results, confirmed, result_item, active_logger)
+                                                     claim_jobs, save_results, confirmed, result_item,
+                                                     active_logger, progress, preparer)
                     coordinator.run()
                 else:
                     active_logger.info("当前分段无待处理任务：%s → %s", segment_start, segment_end)
@@ -190,8 +309,16 @@ def run_segments(ranges, load_segment, summary, network_factory,
                 # 不在生成器或闭包中保留上一段的原帖、表和结果。
                 coordinator = store = candidates = claim_jobs = save_results = summarize_month = None
         finally:
-            if network is not None:
-                network.shutdown()
+            if preparer is not None:
+                preparer.request_stop()
+            try:
+                if network is not None:
+                    network.shutdown()
+            finally:
+                if preparer is not None:
+                    preparer.shutdown()
+        if preparer is not None:
+            preparer.check()
         if network is not None:
             if network.failure is not None:
                 raise BatchRunError("网络资源关闭失败") from network.failure
@@ -205,11 +332,14 @@ def run_segments(ranges, load_segment, summary, network_factory,
             if coordinator is not None and not isinstance(error, BatchPersistenceError):
                 coordinator.finish()
         except BaseException as persistence_error:
+            coordinator.report_progress(force=True, phase="异常停止")
             _retain_unsaved(persistence_error, coordinator, network)
             active_logger.exception("异常收尾时结果保存失败")
             active_logger.info("worker 收尾结束")
             raise persistence_error from error
         _retain_unsaved(error, coordinator, network)
+        if coordinator is not None:
+            coordinator.report_progress(force=True, phase="异常停止")
         active_logger.info("worker 收尾结束")
         raise
     return summary

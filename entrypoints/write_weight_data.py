@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from common.config import load_event_config
+from common.process_lock import stage_guard
 from entrypoints.runtime import execute
 from postprocessing.weight_data import _validate_weight_request
 from postprocessing.weight_grid import run_weight_grid
@@ -28,10 +29,12 @@ def main(argv=None, cli=None):
     logging.basicConfig(**(settings.logging or {
         "level": "INFO", "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"}))
     _validate_weight_request(settings.result_path, settings.weight_path, settings.start_time, settings.end_time)
-    if cli is None:
-        from xdata.client import get_client
-        cli = get_client()
-    return run_weight_grid(cli, settings, prepared=plan, report_dir=args.report_dir)
+    with stage_guard("weights", settings.weight_path,
+                     start_time=settings.start_time, end_time=settings.end_time):
+        if cli is None:
+            from xdata.client import get_client
+            cli = get_client()
+        return run_weight_grid(cli, settings, prepared=plan, report_dir=args.report_dir)
 
 
 def _cli_summary():

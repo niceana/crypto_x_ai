@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from common.event_context import EventHistory, build_current_record_input, build_relation_input
-from common.store import is_stored_relation_valid, validate_relation_history
+from round2.history import _stored_relation_error, validate_relation_history
 from common.time_rules import history_read_bounds, history_window_start, is_history_needed
 from initialization.event_records import expand_first_round
 from tests.event_support import source_posts
@@ -249,9 +249,84 @@ class HistoryIndexTests(unittest.TestCase):
                     frame.loc[old, ["event_id", "event_relation"]] = [old[1], "update"]
                 else:
                     frame.at[later, "round2_status"] = "1"
-                reason = "疑似历史补录" if problem == "backfill" else "手动补跑"
+                reason = {"backfill": "疑似历史补录", "old-gap": "手动补跑",
+                          "invalid-origin": "前史关联结果不合法"}[problem]
                 with self.assertRaisesRegex(ValueError, reason):
                     validate_relation_history(SimpleNamespace(df=frame), [current])
+
+    def test_completed_history_with_response_reports_invalid_relation_separately(self):
+        frame = completed_records([
+            ("2024-01-10", "history", "ETH"),
+            ("2024-02-01", "current", "ETH"),
+        ])
+        old, current = frame.index
+        frame.at[current, "round2_status"] = "0"
+        frame.at[old, "round2_ai_response"] = json.dumps({"ai_response_content": "saved answer"})
+        frame.at[old, "event_id"] = "wrong-id"
+        before = frame.copy(deep=True)
+        with self.assertRaises(ValueError) as caught:
+            validate_relation_history(SimpleNamespace(df=frame), [current])
+        message = str(caught.exception)
+        for expected in ("前史关联结果不合法", "asset=ETH", "2024-01-10", old[1],
+                         "round2_status='1'", "event_relation='new'", "event_id='wrong-id'",
+                         "2024-02-01", current[1], "new 的 event_id 必须等于自身 record_id"):
+            self.assertIn(expected, message)
+        self.assertNotIn("手动补跑", message)
+        pd.testing.assert_frame_equal(frame, before)
+
+    def test_saved_response_does_not_replace_success_status_in_history(self):
+        for status in ("0", "9", "-1", 1):
+            with self.subTest(status=status):
+                frame = completed_records([
+                    ("2024-01-10", "history", "ETH"),
+                    ("2024-02-01", "current", "ETH"),
+                ])
+                old, current = frame.index
+                frame.at[old, "round2_status"] = status
+                frame.at[old, "round2_ai_response"] = json.dumps({"ai_response_content": "saved answer"})
+                frame.at[current, "round2_status"] = "0"
+                with self.assertRaises(ValueError) as caught:
+                    validate_relation_history(SimpleNamespace(df=frame), [current])
+                message = str(caught.exception)
+                self.assertIn("所需前史未完成，请手动补跑", message)
+                self.assertIn("round2_status={!r}".format(status), message)
+                self.assertIn(old[1], message)
+                self.assertIn(current[1], message)
+
+    def test_invalid_history_reports_referenced_origin_fields_and_reason(self):
+        for problem, reason in (
+            ("status", "组起点第二轮状态未成功"),
+            ("relation", "引用记录不是 new 组起点"),
+            ("identity", "组起点的 event_id 不等于自身 record_id"),
+            ("asset", "组起点与当前前史资产不同"),
+            ("same-time", "组起点时间未严格早于当前前史"),
+            ("future", "组起点时间未严格早于当前前史"),
+        ):
+            with self.subTest(problem=problem):
+                frame = completed_records([
+                    ("2024-01-01", "origin", "ETH"),
+                    ("2024-01-10", "history", "ETH"),
+                    ("2024-02-01", "current", "ETH"),
+                ])
+                origin, old, current = frame.index
+                frame.loc[old, ["event_id", "event_relation"]] = [origin[1], "update"]
+                frame.at[current, "round2_status"] = "0"
+                if problem in ("status", "relation", "identity", "asset"):
+                    column, value = {"status": ("round2_status", "0"), "relation": ("event_relation", "repeat"),
+                                     "identity": ("event_id", "wrong"), "asset": ("asset", "BTC")}[problem]
+                    frame.at[origin, column] = value
+                else:
+                    stamp = old[0] if problem == "same-time" else old[0] + pd.Timedelta(seconds=1)
+                    frame.index = pd.MultiIndex.from_tuples(
+                        [(stamp, origin[1]), old, current], names=frame.index.names)
+                # 先检查 update，验证报错能定位它引用的起点，而不是只报告起点自身失败。
+                frame = frame.iloc[[1, 0, 2]]
+                with self.assertRaises(ValueError) as caught:
+                    validate_relation_history(SimpleNamespace(df=frame), [current])
+                message = str(caught.exception)
+                for expected in ("前史关联结果不合法", reason, "引用记录=", origin[1], old[1], current[1]):
+                    self.assertIn(expected, message)
+                self.assertNotIn("手动补跑", message)
 
     def test_calendar_month_start_keeps_month_end_timezone_and_nanoseconds(self):
         for current, months, expected in (
@@ -328,7 +403,7 @@ class HistoryIndexTests(unittest.TestCase):
                     frame.index = pd.MultiIndex.from_tuples([(stamp, origin[1]), update], names=frame.index.names)
                 positions = {key[1]: position for position, key in enumerate(frame.index)}
                 row = frame.loc[update]
-                self.assertEqual(is_stored_relation_valid(update, row, frame, record_positions=positions),
+                self.assertEqual(_stored_relation_error(update, row, frame, record_positions=positions) is None,
                                  problem is None)
 
 

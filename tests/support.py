@@ -1,5 +1,6 @@
 import json
 import logging
+import queue
 import tempfile
 import threading
 from datetime import date, timedelta
@@ -95,6 +96,30 @@ class FakeCli:
 
 
 class Fixture:
+    def add_memory_ready_queue(self, network):
+        """同步网络替身也通过真实的准备线程消费就绪队列。"""
+        network.stopped = threading.Event()
+        network.request_stop = lambda reason="": network.stopped.set()
+        if not hasattr(network, "http_snapshot"):
+            network.http_snapshot = lambda: (0, 0, 0.0)
+
+        def bind(requests, on_take):
+            network.ready_requests = requests
+            network.on_take = on_take
+            network.completions = queue.Queue()
+
+        def notify():
+            while not network.stopped.is_set():
+                try:
+                    job = network.ready_requests.get_nowait()
+                except queue.Empty:
+                    return
+                network.on_take()
+                network.submit(job)
+
+        network.bind_ready_queue, network.notify_ready = bind, notify
+        return network
+
     def setUp(self):
         # 记录摘要核对次数，同时执行真实读取入口，列查询由模拟客户端处理。
         self.hash_reads = []
@@ -111,6 +136,7 @@ class Fixture:
                 "model": "test", "messages": [{"role": "system", "content": "{{prompts.system}}"},
                                                {"role": "user", "content": "{{prompts.user}}"}], "stream": False}},
             "run": {"concurrency": 3, "batch_size": 200, "result_buffer_size": 200, "storage_max_attempts": 3,
+                    "max_attempts": 3,
                     "flush_interval_seconds": 0.01, "backoff_base_seconds": 0.001,
                     "backoff_max_seconds": 0.001, "storage_retry_seconds": 0.001,
                     "progress_every": 100000},

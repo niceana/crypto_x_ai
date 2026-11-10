@@ -29,13 +29,23 @@ def load_retriever(reference):
     return function
 
 
-def validate_retrieval_selection(selection, available_groups):
+def select_all_groups(current, searchable):
+    """提交窗口内全部不同事件组；空历史也交给 AI，不按分数自动判新。"""
+    return RetrievalSelection(tuple(sorted({record["event_id"] for record in searchable})))
+
+
+def validate_retrieval_selection(selection, available_groups, max_groups=10):
     """只检查检索接口结果，检索实现自身错误不作为 AI 输出重试。"""
     if not isinstance(selection, RetrievalSelection):
         raise ValueError("检索函数须返回 RetrievalSelection")
     ids = selection.event_ids
-    if not isinstance(ids, tuple) or len(ids) > 10 or len(set(ids)) != len(ids):
-        raise ValueError("检索结果须为最多 10 个不同事件组的 ID 元组")
+    if max_groups is not None and (type(max_groups) is not int or max_groups <= 0):
+        raise ValueError("候选组数量上限须为正整数或 None")
+    if (not isinstance(ids, tuple) or len(set(ids)) != len(ids)
+            or (max_groups is not None and len(ids) > max_groups)):
+        if max_groups == 10:
+            raise ValueError("检索结果须为最多 10 个不同事件组的 ID 元组")
+        raise ValueError("检索结果须为数量不超过配置上限的不同事件组 ID 元组")
     if type(selection.auto_new) is not bool or not isinstance(selection.reason, str):
         raise ValueError("检索自动判新标记或原因不合法")
     if any(not isinstance(value, str) or value not in available_groups for value in ids):

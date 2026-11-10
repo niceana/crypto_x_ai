@@ -11,7 +11,7 @@ def run_stage(cli, settings):
 
 
 def main():
-    return run_entrypoint(run_stage)
+    return run_entrypoint(run_stage, stage="vectors")
 
 
 if __name__ == "__main__":

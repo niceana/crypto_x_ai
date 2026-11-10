@@ -171,3 +171,4 @@ def build_impact_input(store, key):
     if information and information.strip():
         current["new_information"] = information
     return json.dumps(current, ensure_ascii=False, allow_nan=False)
+

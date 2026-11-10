@@ -10,8 +10,10 @@ from tests.event_support import EventFixture
 
 class EventEntryPointTests(EventFixture, unittest.TestCase):
     def test_entrypoints_import_without_xdata_client(self):
-        for name in ("import_events", "run_round2", "run_round3"):
+        for name, stage in (("import_events", "import_events"), ("prepare_vectors", "vectors"),
+                            ("run_round2", "round2"), ("run_round3", "round3")):
             module = importlib.import_module("entrypoints." + name)
             with patch.object(module, "run_entrypoint", return_value="summary") as start:
                 self.assertEqual(module.main(), "summary")
                 start.assert_called_once()
+                self.assertEqual(start.call_args.kwargs, {"stage": stage})

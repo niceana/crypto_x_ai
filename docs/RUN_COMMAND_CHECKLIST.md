@@ -1,6 +1,17 @@
 # 每个命令运行前的配置检查清单
 
-按当前代码和配置核对，更新日期：2026-10-26。本文覆盖 `entrypoints/` 下全部 13 个可执行入口，重点说明三轮 AI 处理。日常按“第一轮 → 确认自动导入 → 第二轮 → 第三轮 → 权重”推进；初始化、独立导入和重置按需要单独运行。
+按当前代码和配置核对，更新日期：2026-10-28。本文覆盖 `entrypoints/` 下的可执行入口，重点说明三轮 AI 处理。日常按“第一轮 → 确认自动导入 → 独立向量计算 → 第二轮 → 第三轮 → 权重”推进；初始化、独立导入和重置按需要单独运行。
+
+## 独立阶段入口（Windows / Linux）
+
+已初始化第一轮任务表后，按第一轮及自动导入、独立向量准备、第二轮、第三轮分别启动。Linux 单行 nohup 命令、日志查看、交接、恢复和跨年份扩展见 [独立阶段运行说明](INDEPENDENT_STAGES.md)。
+
+- 第一轮使用 post_extraction_config.yaml 的日期；向量及第二、三轮使用 event_processing_config.yaml 的日期。确认第一轮任务表已经包含范围内的帖子，运行入口不会自动从源帖子表补任务。
+- 三轮分别使用自己的密钥和 run.concurrency；向量阶段独立使用 Embedding 配置。
+- 中断后重新执行对应独立命令，按数据库状态恢复并跳过成功结果；不使用 --resume 或运行清单目录。
+- 向量及第二、三轮各自在启动时读取公司目标资产名单，允许名单随公司数据更新；已有成功结果保留。
+- 向量及第二轮要求配置范围内第一轮全部成功；第三轮沿用 round3_skip_incomplete_round2 配置。各入口不会自动等待上游或启动下游。
+- 不要对已有成功结果的任务表再次运行首次初始化入口；权重生成仍单独执行。
 
 ## 1. 先看：当前仓库还缺哪些配置
 
@@ -11,7 +22,7 @@
 | `post_extraction_config.yaml` 的 `source_path`、`task_path` | 仍为“填写……”占位文本 | 填写真实源帖子表、第一轮任务表路径 |
 | `post_extraction_config.yaml` 的日期 | `2021-01-01` 至 `2021-12-31` | 确认确实要处理这一整年，首次接入可先选小范围 |
 | `event_processing_config.yaml` 的 `first_round_task_path`、`result_path` | 仍为占位文本 | 填写第一轮任务表、事件去重分析表的真实路径 |
-| `event_processing_config.yaml` 的日期 | 两端均为 `null` | 第二轮、第三轮、备份、重置、实际写权重前必须填写 |
+| `event_processing_config.yaml` 的日期 | 两端均为 `null` | 第二轮、第三轮及实际写权重前必须填写 |
 | 三份 `round*_ai_config.yaml` 的 `api.url` | 均为空 | 分别填写完整 AI 请求地址 |
 | 第二、三轮 `api.payload.model` | 均为空 | 填写对应接口实际支持的模型 |
 | 第一轮 `api.payload` | 模型为 `glm-5.3-flash`，含 `provider_options: "max"`、`max_completion_tokens: 512` | 核对服务是否支持这些参数，输出额度是否足够容纳事件 JSON |
@@ -107,7 +118,7 @@ $py = (Resolve-Path ".\.python38\venv\Scripts\python.exe").Path
 | `concurrency` | 100 | 5 | 10 | 第一轮接入前尤其要核对限流额度 |
 | `requests_per_second` | 0 | 0 | 0 | 0 表示不主动限制起发速率，不表示不发请求 |
 | `timeout_seconds` | 120 | 300 | 120 | 与服务实际响应耗时配套 |
-| `max_attempts` | 3 | 3 | 3 | 包含第一次请求，网络、429、5xx、无效输出共用预算 |
+| `max_attempts` | 10 | 10 | 10 | 包含第一次请求，网络、429、5xx、无效输出共用预算 |
 | `batch_size` | 200 | 未显式配置，默认 200 | 200 | 第二轮结果即时合批保存；不要将它理解为每批 AI 请求数 |
 | `result_buffer_size` | 200 | 未显式配置，默认 200 | 200 | 不得小于 `batch_size` |
 | `ready_request_buffer_size` | 默认 20 | 20 | 默认 20 | 主要用于第二轮提前准备请求 |
@@ -177,9 +188,10 @@ python -X utf8 -m entrypoints.prepare_vectors
 - [ ] `event_processing_config.yaml.result_path` 已存在，第一轮成功结果已导入。
 - [ ] **事件配置的** `start_time/end_time` 都已填写；不会沿用第一轮配置日期，也不允许两端均空。
 - [ ] `round2_asset_list_path` 指向本次资产名单，客户端能读取 JSON 的 `InstrumentList`。每项取第一个 `.` 前的部分、去首尾空白、转大写并去重，再与表内 `asset` 匹配；确认表内资产值也符合预期。
-- [ ] 若有意处理全资产，将 `round2_asset_list_path` 设为 `""`；这会同时影响第三轮，以及使用该字段的备份、重置和相似度观察。
+- [ ] 若有意处理全资产，将 `round2_asset_list_path` 设为 `""`；这会同时影响第三轮和相似度观察。
 - [ ] `history_lookback_months` 符合本次口径，当前为 3 个日历月；旧键 `history_lookback_years` 不再使用。
 - [ ] 所需窗口内同币较早记录已完成归组。第二轮不会自动补跑配置范围外的前史。
+- [ ] 已成功前史的 event_id 直接指向同币、更早的 new 组起点；发现链式引用时先核查数据，普通续跑不会改写成功结果。
 - [ ] 未在更晚同币记录已成功的情况下插入或重跑较早任务；否则会触发“历史补录或历史状态缺口”检查。
 - [ ] `round2_ai_config_path` 对应的模型、接口、密钥、提示词、并发、超时和摘要都已核对。
 
@@ -262,75 +274,7 @@ AI 正文必须是恰好五个字段的 JSON，值均为非空字符串：
 
 此入口不调用 AI。明确缺表时自动注册并首次写入，已有目标校验后仅追加缺失行；已有第二、三轮结果保留。历史回答中的部分未转义引号会尝试在内存修复，截断或字段缺失等问题仍会在写入前报错。日常第一轮自动导入成功后，通常不必额外运行此命令。
 
-## 8. 备份和重置：先确认会影响哪些记录
-
-### 8.1 只读备份事件表
-
-```powershell
-& $py -X utf8 -m entrypoints.backup_events
-```
-
-- [ ] 核对事件配置 `result_path`、必填日期和 `round2_asset_list_path`；有名单时只备份名单内资产，不一定是该日期范围的全部数据。
-- [ ] 默认包含所有状态。只有确实只要第二轮成功记录时，才追加 `--completed-only`。
-- [ ] 可用 `--expected-records 预期条数` 检查数量；不符时停止，不会截取或补足。
-- [ ] 可用 `--config` 切换事件配置，`--output-dir` 必须是尚不存在的新目录。
-
-默认输出 `reports/events_backup_北京时间/`，包含完整 `events.pkl`、便于查看的 CSV 和完成清单；成功清单最后写入。它只读数据库，不改变任务状态。
-
-### 8.2 按日期和资产重跑第二、三轮
-
-先预览：
-
-```powershell
-& $py -X utf8 -m entrypoints.reset_round2
-```
-
-运行前检查：
-
-- [ ] 已停止相关处理进程。
-- [ ] 事件配置的 `result_path`、必填日期、`round2_asset_list_path` 正确；这次会选中范围内所有状态的记录。
-- [ ] 若范围之后还有同币第二轮成功记录，已把 `end_time` 扩大到工具要求的日期，避免保留依赖旧分组的后续结果。
-- [ ] 已核对预览的记录数、资产、第二三轮完成数，确实要重算这些结果。
-- [ ] 没有把状态重置当作解决提示词 / 模型摘要冲突的方法。
-
-需要实际重置时执行：
-
-```powershell
-& $py -X utf8 -m entrypoints.reset_round2 --apply
-```
-
-`--apply` 先把选中完整记录备份到新的本地目录，再把两轮状态都设为字符串 `"0"`。保留旧回答、配置摘要、向量和其他字段；之后按第二轮 → 第三轮顺序重跑。可用 `--backup-dir` 指定尚不存在的新目录，或用 `--config` 指定事件配置。
-
-### 8.3 LINK 专用重置：范围会延伸到配置结束日之后
-
-```powershell
-& $py -X utf8 -m entrypoints.reset_link_status
-```
-
-- [ ] 已停止相关处理进程，并先备份实际影响范围。
-- [ ] 事件配置 `result_path` 和必填日期正确。
-- [ ] 已确认只需要处理 `asset == "LINK"`。
-- [ ] 明白本命令在配置范围内找出最早未完成 LINK 的时间，然后重置**该时点及之后全表所有 LINK** 的第二、三轮状态，包含 `end_time` 之后。
-- [ ] 明白它没有预览、没有 `--apply`、没有自动备份，也不使用资产名单筛选；直接执行就可能写数据库。
-
-若要做一般范围重跑，优先使用上一节带预览和备份的 `reset_round2`。LINK 命令只重置两轮状态，不清除配置摘要或旧回答。
-
-## 9. 只读统计和相似度观察
-
-### 9.1 资产频数图
-
-```powershell
-& $py -X utf8 -m entrypoints.plot_asset_frequency
-```
-
-- [ ] 事件配置的 `result_path` 和可选日期正确；两端为 `null` 时统计全表。
-- [ ] 已安装 `matplotlib`；`--top-n` 为正整数，默认 40。
-- [ ] 确认 `--output-dir` 保存位置；默认 `reports/asset_frequency/`，同名输出会覆盖。
-- [ ] 需要弹窗时才加 `--show`；可用 `--config` 切换事件配置。
-
-只统计 `asset` 原值的行数，不检查第二、三轮状态，不按事件组去重，也不应用 `round2_asset_list_path`。它可以在第二、三轮运行前使用，不需要 AI / Embedding 密钥。
-
-### 9.2 相似度只读观察
+## 8. 相似度只读观察
 
 ```powershell
 & $py -X utf8 -m entrypoints.audit_similarity
@@ -345,9 +289,9 @@ AI 正文必须是恰好五个字段的 JSON，值均为非空字符串：
 
 默认输出到新的 `reports/similarity_audit_北京时间/`。只比较第二轮成功记录，无需等待整轮完成；`--top-k` 只影响导出条数。观察阈值不会修改正式阈值、分组或数据库，也不能完全预测重跑第二轮后的结果。详情见 [相似度观察说明](SIMILARITY_AUDIT.md)。
 
-## 10. 小时权重和诊断
+## 9. 小时权重和诊断
 
-### 10.1 权重参数预览
+### 9.1 权重参数预览
 
 ```powershell
 & $py -X utf8 -m entrypoints.write_weight_data --dry-run
@@ -355,41 +299,42 @@ AI 正文必须是恰好五个字段的 JSON，值均为非空字符串：
 
 - [ ] 事件配置 `result_path`、`weight_path` 正确，`weight_path` 已填写为基础路径。
 - [ ] 核对 `weight_grid.coefficients` 的 B/C/D 和各字段枚举映射候选数组。
-- [ ] 核对组合数、`max_combinations`、`table_name_template` 和每个完整目标表名；模板必须包含 `{param_id}`。
+- [ ] 核对 `weight_grid.aggregation_methods`：`[sum]` 求和，`[max_abs]` 取同资产同小时绝对值最大的原信号，`[sum, max_abs]` 分别生成独立表。
+- [ ] 核对组合数、`max_combinations`、`table_name_template` 和每个完整目标表名；模板必须包含 `{aggregation_method}` 和 `{param_id}`，默认目标为 `{weight_path}/{aggregation_method}__B{B}_C{C}_D{D}__{param_id}`。
 
 此预览不连接数据库、不创建权重表、不生成运行清单，也不要求填写日期。它不能替代实际写入前的日期、数据和权限检查。可用 `--config` 指向其他事件配置。
 
-### 10.2 实际生成或更新权重表
+### 9.2 实际生成或更新权重表
 
 ```powershell
 & $py -X utf8 -m entrypoints.write_weight_data
 ```
 
 - [ ] 已完成上一节预览，所有目标路径和参数组合正确。
-- [ ] 事件配置 `start_time/end_time` 都已填写，且是**源事件日期范围**。
+- [ ] 事件配置 `start_time/end_time` 都已填写，且按源时间轴填写；程序为首尾完整窗口补读相邻日，输出延伸到结束日次日 `01:00`（写库后 `09:00`）。
 - [ ] 检查第二、三轮均成功的记录数量；未完成记录会跳过，若有意要求完整样本，应先补齐三轮。
 - [ ] 成功记录都有可解析的第三轮响应，评分字段有正确映射。当前 YAML 中“重要性 / 执行阶段=不确定”映射为 2，不能想当然按程序缺省值理解。
 - [ ] 明白 `round2_asset_list_path` 不筛选此入口；其他资产已有的成功结果也可能进入权重。
 - [ ] 明白每个有效参数组合对应一张表；重复运行会对齐并替换重叠小时、追加新小时，可能更新已有数据。
 - [ ] 可用 `--report-dir` 指定尚不存在的新运行清单目录，默认在 `reports/weight_grid/北京时间/`。
 
-当前公式为 `direction × (B × materiality) × (C × execution_stage) × (D × event_relation)`，`persistence` 不参与计分和组合展开。事件先归入下一小时整点，写库前时间索引再整体加 8 小时；不要预先把源读取日期平移一遍。
+当前公式为 `direction × (B × materiality) × (C × execution_stage) × (D × event_relation)`，`persistence` 不参与计分和组合展开。整点 T 聚合 `[T-75分钟, T-15分钟)`，即 `(发布时间 + 15分钟).floor("h") + 1小时`；写库前时间索引再整体加 8 小时，不要预先把配置日期平移一遍。
 
 权重数据写入数据库，本地目录保存参数及执行清单。检查各组合是否 `completed`，不能只看第一张表已写入。详情见 [权重说明](data/WEIGHT_DATA.md)。
 
-### 10.3 核对已有权重表列名
+### 9.3 核对已有权重表列名
 
 ```powershell
 & $py -X utf8 -m entrypoints.audit_weight_columns
 ```
 
 - [ ] 事件配置 `result_path`、`weight_path`、必填日期和 `weight_grid` 与待核对权重一致。
-- [ ] 存在多个组合时追加 `--param-id "实际参数标识"`，标识从 `write_weight_data --dry-run` 中查看。
+- [ ] 存在多个评分组合时追加 `--param-id "实际参数标识"`；存在多个聚合模式时追加 `--aggregation-method sum` 或 `--aggregation-method max_abs`。标识与模式从 `write_weight_data --dry-run` 中查看。
 - [ ] 已理解 `unexpected_columns` 也可能是其他日期批次保留的合法历史资产列。
 
 此入口支持 `--config`，只读数据库，不生成权重、不调用 AI。
 
-### 10.4 信号与事件诊断图：配置在脚本顶部
+### 9.4 信号与事件诊断图：配置在脚本顶部
 
 ```powershell
 & $py -X utf8 -m entrypoints.plot_signal_diagnostics
@@ -402,13 +347,51 @@ AI 正文必须是恰好五个字段的 JSON，值均为非空字符串：
 - [ ] `ASSET_COLUMNS` 使用实际完整合约列名；`None` 表示全部列，不读取第二轮资产名单来筛选。
 - [ ] 核对 `WEIGHT_EPSILON`、`TOP_N`、`OUTPUT_DIR` 和 `SHOW`，且已安装 `matplotlib`。
 - [ ] 只做 weight 诊断时，`RESULT_PATH` 可留空；需要事件解释时，填写真实结果表路径。
-- [ ] 做事件解释时，`SCORING_CONFIG`、`PARAM_ID` 对应生成该 weight 的实际评分参数；多个组合必须指定标识。
-- [ ] 当前表用 `EVENT_TIME_OFFSET_HOURS = 8`；旧版未平移表用 0。该参数用于事件对齐，已有 weight 本身不再平移。
+- [ ] 做事件解释时，`SCORING_CONFIG`、`PARAM_ID` 对应生成该 weight 的实际评分参数；多个评分组合必须指定标识，多种聚合模式必须填写 `AGGREGATION_METHOD`。
+- [ ] 当前表用 `EVENT_TIME_OFFSET_HOURS = 8`；当前事件对齐采用 v3 的 45 分钟窗口，旧版整点分桶表需使用对应旧版诊断代码。该参数用于事件对齐，已有 weight 本身不再平移。
 - [ ] 核对 `CANCELLATION_EPSILON`；它影响完全抵消的诊断判断。
 
 此入口只读数据库、输出图和 CSV，不调用 AI。默认 `reports/signal_diagnostics/` 同名报告会覆盖；`--config` 等参数不会覆盖顶部变量。详情见 [诊断说明](SIGNAL_DIAGNOSTICS.md)。
 
-## 11. 每轮结束后，再决定下一步
+### 9.4.1 归一化小时持仓的月度收益贡献
+
+```powershell
+& $py -X utf8 -m entrypoints.audit_return_contribution
+```
+
+- [ ] 修改 [audit_return_contribution.py](../entrypoints/audit_return_contribution.py) 顶部 `WEIGHT_PATH`、`PRICE_PATH`、`START_TIME`、`END_TIME`；`WEIGHT_PATH` 是完整表路径，`PRICE_PATH` 默认 `close_price_60min`。
+- [ ] 先取资产列交集，再按当前起点报价过滤 0、负数、NaN 和无穷价格对应的小时权重，最后逐小时归一化；核对终端或 `method.json` 的剔除名单和无效报价统计。
+- [ ] 保留方向，有效资产全零的小时保持空仓；两表索引代表相同实际价格时点。
+- [ ] 已有时间行中的 NaN 权重按 0 处理，全 NaN 行按空仓计入统计；数量见 `method.json` 的 `nan_weight_cells_filled`。缺少整条时间行仍会停止。
+- [ ] 日期包含首尾日，按收益区间起点归属；价格会多读至结束日次日，以取得最后的 `00:00` 端点。
+- [ ] 持仓应已在该时点生效；有额外执行延迟或持有规则时，先按回测规则转换。
+- [ ] 价格 NaN 用同一资产此前最近的非空值前向填充，填充数量见 `nan_price_cells_filled`；没有历史值的首部 NaN 保留。缺少整个价格时点或持仓小时仍会停止，填充后已持仓资产仍缺有效结束价也会停止。
+- [ ] 理解三张月度报告和 `asset_summary.csv` 中的策略贡献为费用前小时加总、不复利链接；资产全期价格回报使用审计首末端点的处理后价格。
+- [ ] 同一入口读取数据库并返回四张表；`asset_summary.csv` 的全期平均仓位直接对小时仓位求平均，重仓月按最大月均绝对仓位选择。
+- [ ] 核对顶部 `OUTPUT_DIR`、`TOP_N`、`NET_RETURN_EPSILON`；默认输出 `reports/return_contribution/`，同名文件会覆盖。命令行参数可临时覆盖顶部配置。
+- [ ] 已安装 matplotlib；顶部 `FIGURE_DIR` 默认是项目根目录，三张 PNG 直接写入该目录，使用 Agg 画布，不弹出窗口。
+
+只读数据库，不调用 AI；详细字段与比例定义见 [收益贡献方案](RETURN_CONTRIBUTION.md)。
+
+### 9.5 标签贡献实验仓位表
+
+```powershell
+& $py -X utf8 -m entrypoints.write_label_experiments --dry-run
+& $py -X utf8 -m entrypoints.write_label_experiments
+```
+
+- [ ] 已填写事件配置的 `result_path`、`weight_path` 和源事件起止日期；核对预览中的完整目标路径。
+- [ ] `weight_path` 是 root，地址为 `root/聚合模式__labels__方案名__B…_C…_D…__param_id`；评分标识与 `write_weight_data` 共用，模式和分组由表名区分，旧表不会自动迁移。
+- [ ] 已选定一套固定评分；多套候选时用 `--param-id` 指定，实验 B/C/D 固定为 1。
+- [ ] 已确认回测如何将原始信号变成下单数量：直接买币，或按资金占比除以价格换算。
+- [ ] `--signal-scale`（旧名 `--unit-position`）只是信号倍率，默认 1，不能把 0.01 当作 1% 资金。
+- [ ] 理解等级分组固定的是每条事件的信号绝对值；直接按币数下单时，并不保证等金额。
+- [ ] 源事件的分组等级（包括 persistence）完整且已配置；方向为零不交易。
+- [ ] 按 `tables.csv` 的完整表路径逐组回测，确认 `manifest.json` 中全部方案均完成。
+
+默认生成 8 组固定评分对照及 17 组等级组合，沿用现有小时归属、加 8 小时及续写口径。新入口只生成原始信号，不读取价格或计算收益。真正的等金额研究需按实际下单接口作价格换算。详情见 [标签贡献实验](LABEL_EXPERIMENTS.md)。
+
+## 10. 每轮结束后，再决定下一步
 
 | 看到的情况 | 下一步 |
 | --- | --- |

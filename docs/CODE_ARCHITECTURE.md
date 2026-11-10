@@ -2,19 +2,23 @@
 
 2026-10-16 按用户确认方案将公共目录收拢为 9 个功能模块。项目独立运行，代码目录直接位于根目录，不增加顶层包、src 布局或安装步骤。目标与数据流见 [项目总览](../project_overview.md)，实际规则见 [round1事件提取规则](rules/KEY_RULES.md) 和 [事件规则](rules/EVENT_RULES.md)。
 
+2026-11-09 新增媒体配置适配 `common.media_config` 和五个薄入口，复用现有三轮 runner、Store 与线程。`common.config.event_config_from_mapping` 共用配置校验；runtime 支持指定加载函数；第二轮候选校验通过可选上限支持全量组，默认官方上限仍为 10。媒体不新增执行器或表结构，详见 [媒体处理说明](MEDIA_PIPELINE.md)。
+
 ## 1. 目录及依赖方向
 
 ```text
 项目根目录/
 ├─ configs/                      两份任务配置、三份 AI 配置、Embedding 配置及 .env.example
-├─ common/                       9 个功能模块，另有 __init__.py
+├─ common/                       公共功能模块，另有 __init__.py
 │  ├─ config.py                  配置加载、对象、模板检查和摘要
 │  ├─ ai_protocol.py             大模型请求体构造、响应解析及答复类型
 │  ├─ validation.py              表字段、结构检查和三轮输出校验
 │  ├─ event_context.py           业务输入、第二轮候选及组内时间线
 │  ├─ time_rules.py              时间解析、历史补读范围和窗口判断
+│  ├─ stage_gates.py             独立入口的第一轮完成检查
 │  ├─ store.py                   历史读取检查、三类 Store 及汇总
 │  ├─ network.py                 作业、限速、重试、完成消息和线程关闭
+│  ├─ preparation.py             三轮共用请求准备、就绪队列补货和停止收尾
 │  ├─ execution.py               round1事件提取与round3事件影响分析共用分段并发执行
 │  └─ persistence.py             排序、按列更新和存储重试
 ├─ initialization/
@@ -25,7 +29,7 @@
 ├─ vectorization/                独立向量计算、保存和格式校验
 ├─ round2/                       round2事件去重归组：runner 调度、preparation 异步准备及向量检索
 ├─ round3/runner.py              round3事件影响分析前提检查、事件输入和执行
-├─ entrypoints/                  五种独立任务入口及 runtime.py
+├─ entrypoints/                  各独立任务入口及 runtime.py
 ├─ tests/                        common、initialization、各轮及 entrypoints
 └─ docs/                         规则、字段、研究计划及历史方案
 ```
@@ -42,7 +46,7 @@ common.config 按配置类别提供加载入口：load_job_config 读取帖子�
 
 common.event_context 的 build_current_record_input 供第二轮内部检索组织固定 event 和定位字段。build_relation_input 在检索后返回 `(text, candidate_event_ids)`：text 仅含 current.published_at、current.event 和各候选组的 candidate_id、history 事件列表，每条历史包含 published_at、event；每条 published_at 为对应 df 的 date 索引值的字符串，保留完整精度和时区。按候选顺序使用 E1、E2 等编号；candidate_event_ids 为短编号到真实 event_id 的映射。同一披露只发送一次。第三轮的 build_impact_input(store, key) 在认领后仅从本条事件记录组织 asset、event 两个必填字段，new_information 有内容才附带，空值或纯空白时省略该字段，不读取原帖或历史。第一轮使用 build_extraction_input 组织 user_name、text 及可选 account_tickers；账号背景在启动时固定，空币种事件在导入时跳过，不再兜底。
 
-EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_months 定位左闭右开窗口，默认 3 个日历月。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。common.store.validate_relation_history 继续按第二轮配置期限检查前史，向量评分方式保留。
+EventHistory 仅供第二轮维护已完成记录索引。add_frame 和 add_records 共用批量登记，再按币、发布时间和 record_id 排序；运行中新确认的记录仍通过追加或二分定位插入。get_searchable_records 按 history_lookback_months 定位左闭右开窗口，默认 3 个日历月。第二轮启用 truncate_group_history，缺起点时保留 first_disclosure=null、history_trimmed=true 和 first_available_disclosure；发送前转换成 published_at、event 对象。第三轮不建立或读取 EventHistory。round2.history.validate_relation_history 继续按第二轮配置期限检查前史，统一通过 record_id 位置索引校验组引用，不保留扫描 DataFrame 的备用查找路径；状态未完成、关联不合法及具体引用错误的提示保留。common.store 负责工作表状态和结果保存，向量评分方式保留。
 
 common.time_rules.history_read_bounds(current_times, scope_start, months) 为第二轮计算所需较早历史的首尾日期；is_history_needed(history_time, current_times, months) 筛选落在任一待处理窗口内的历史。月末截断时继续检查后续日期的窗口，避免只看第一个未来任务而漏掉历史。第三轮不调用这两个函数。分组、状态和组起点合法性仍由第二轮负责。
 
@@ -86,9 +90,11 @@ write_columns 的可选 prepare_write 回调只用于两轮回答保存，在每
 
 三轮共用网络将 HTTP 429 纳入原任务的 run.max_attempts（含首次），与网络故障、5xx 和无效输出共用预算。429 在预算内按指数随机退避重试，_RequestGate 暂停全部后续起发；有效 Retry-After 与本地退避取较长等待，缺少或非法时也使用本地退避暂停。原请求输入和候选映射复用，等待可被停止中断；最终仍为 429 时保存失败并停止整轮。Embedding 的串行批次同样在原独立预算内重试 429。
 
-common.network.NetworkWorker 处理 RequestJob，在网络线程内完成该作业的请求尝试并返回 CompletionMessage。每次 HTTP 尝试通过 asyncio.Semaphore 限制并发，请求返回或抛错后释放，响应校验和退避在名额外执行；起发限速及全局暂停仍由 _RequestGate 负责。第一、三轮继续通过 submit 提交，完成队列容量为 concurrency。第二轮在启动前通过 bind_ready_queue 接入就绪队列与取走通知，使用无容量背压的共用结果队列；_pump_ready 先获取起发名额再取出请求，把预留名额交给首次尝试，重试重新获取名额。取走即唤醒准备线程，notify_ready 则在新请求准备完成时唤醒网络循环。RequestJob 可携带准备好的 body 字节，第二轮直接发送并在重试时复用，第一、三轮仍在网络作业内渲染。数据操作仍在调用线程。
+common.network.NetworkWorker 处理 RequestJob，在网络线程内完成该作业的请求尝试并返回 CompletionMessage。每次 HTTP 尝试通过 asyncio.Semaphore 限制并发，请求返回或抛错后释放，响应校验和退避在名额外执行；起发限速及全局暂停仍由 _RequestGate 负责。三轮均在启动前通过 bind_ready_queue 接入就绪队列与取走通知，使用无容量背压的完成队列；_pump_ready 先获取起发名额再取出请求，把预留名额交给首次尝试，重试重新获取名额。取走即唤醒准备线程，notify_ready 则在新请求准备完成时唤醒网络循环。common.preparation.RequestPreparer 从已认领输入持续准备最多 ready_request_buffer_size 条完整请求，统一渲染及 UTF-8 JSON 编码、构造失败交付、线程检查和停止；RequestJob.body 在全部尝试中复用。第二轮 RelationPreparer 继承此组件，保留历史更新优先和按币轮转的业务选择。数据操作仍在调用线程。
 
-round1事件提取与round3事件影响分析使用 common.execution.run_segments 和 SegmentCoordinator，共用分段加载、网络名额、结果缓冲、批量保存和停止收尾。各轮提供任务选择、输入、校验及汇总。
+round1事件提取与round3事件影响分析使用 common.execution.run_segments 和 SegmentCoordinator，共用分段加载、提前认领、独立请求准备、结果缓冲、批量保存和停止收尾。待准备输入不足 batch_size 时按 batch_size 补一批，不再按 concurrency 减未结束任务数认领；数据库写入确认并再次检查停止后才交出固定 RequestJob，准备线程不读取工作表。收取完成消息使用当前队列快照，避免持续产出拖延认领；提交缓冲按数量、时间和结束保存，完成队列可积压，不因写库阻塞网络补货。请求准备、网络线程和客户端跨月复用，本月全部保存及状态检查通过后才读下一月。各轮提供任务选择、输入、校验及汇总。
+
+三轮的进度汇报节流、认领与结果保存批次耗时、HTTP 和存储瓶颈日志统一复用 common.execution.ProgressStats；HTTP 实际并发均读取 NetworkWorker.http_snapshot。第一轮和第三轮由 SegmentCoordinator 统计当前分段的待执行 AI 任务，写库确认后更新进度，跨月只保留标量统计；第二轮保留检索准备、自动判新和币种推进的专用队列指标。
 
 round2事件去重归组保留独立调度：runner 轮流登记各币当前时点并批量认领，交给 preparation.RelationPreparer 的常驻生产线程。准备线程独占 EventHistory，通过 Condition 和按币轮转的候选队列持续补足最多 ready_request_buffer_size（默认 20）条完整就绪请求；队列取走后立即补货。自动判新、构造失败和 HTTP 答复进入同一完成队列，主线程按队列快照取出当前已有结果，通过 EventRecordStore.save_relation_batch 一次保存；仅一条时立即单条提交，不等待未来结果或定时器，不按结果积压限制 HTTP。混合批中的 repeat 和失败保留原第三轮状态，保存失败保留当前整批原消息。删除未落库总窗口、逐条提交的执行器及第二个完成队列。准备线程不接触 cli 或 DataFrame，只接收固定 current 字典和已保存字段副本。同币当前时点全部保存后，先登记历史更新，再共同认领已解锁任务并提交下一时点输入；历史更新优先执行，同刻仍共享此前历史。普通最终失败暂停该币，其他币继续。
 
@@ -108,6 +114,6 @@ entrypoints.runtime 维护共用默认日志配置和后续阶段的配置、客
 
 上述 255 项及模块迁移对照属于公共目录收拢时的历史验证。此后已完成两轮回答合列、服务单位向量原值保存和按列摘要接口接入，当时完整 267 项模拟测试通过；内存索引优化新增 7 项，当时完整 274 项测试通过，覆盖时间边界、按币隔离、乱序载入与加入、返回副本、完整组前史及起点合法性。事件去重分析表仍为 14 个普通列，向量保存在 embedding 列，不使用 SQLite；实施依据见 [表内向量与阈值方案](plans/EMBEDDING_TABLE_STORAGE_PLAN.md)。测试未调用真实 AI 或数据库，不代表真实服务与数据规模已验收。
 
-此前内存索引优化使用上一版代码和相同模拟数据对比：4,000 条同币历史的前史校验从约 8.12 秒降至 0.31 秒；2 万条历史、180 条窗口记录连续检索 100 次，结果一致，耗时从约 0.089 秒降至 0.004 秒。这是本机单次模拟观测，只衡量内存校验和窗口查询，不含数据库、Embedding 或 AI 请求；现版本已加入按资产矩阵缓存，规则见按月流水线说明。
+此前内存索引优化使用上一版代码和相同模拟数据对比：4,000 条同币历史的前史校验从约 8.12 秒降至 0.31 秒；2 万条历史、180 条窗口记录连续检索 100 次，结果一致，耗时从约 0.089 秒降至 0.004 秒。这是本机单次模拟观测，只衡量内存校验和窗口查询，不含数据库、Embedding 或 AI 请求；现版本已加入按资产矩阵缓存，向量职责见第 2 节，运行方式见 [独立阶段运行说明](INDEPENDENT_STAGES.md)。
 
 任务和事件配置的重复键修复新增 4 项测试，覆盖根层、嵌套账号与日志键、重复值相同、不同字典同名键、单账号多代币，以及配置出错时不创建数据客户端。当时完整 278 项测试通过；仓库 6 份 YAML 在新旧加载器下解析值一致，50 组账号映射保留。

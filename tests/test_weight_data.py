@@ -80,12 +80,54 @@ class WeightDataTests(unittest.TestCase):
         original = source.copy(deep=True)
         basic = build_basic_df(source)
         self.assertEqual(list(basic["data"]), [6, 6, -3, 1.5, -2, -0.5])
-        expected = pd.DataFrame({"BTC" + ASSET_SUFFIX: [0.0, 4.5, 0.0, 0.0],
+        expected = pd.DataFrame({"BTC" + ASSET_SUFFIX: [0.0, 6.0, -1.5, 0.0],
                                  "ETH" + ASSET_SUFFIX: [0.0, 0.0, 0.0, -2.5],
-                                 "OLD" + ASSET_SUFFIX: [6.0, 0.0, 0.0, 0.0]},
+                                  "OLD" + ASSET_SUFFIX: [0.0, 6.0, 0.0, 0.0]},
                                 index=pd.date_range("2017-12-31 00:00:00", periods=4, freq="h", name="date"))
         assert_frame_equal(build_weight_data(basic, start_time="2017-12-31"), expected)
         assert_frame_equal(source, original)
+
+    def test_max_abs_selects_signed_signal_per_asset_hour_and_fills_zeros(self):
+        basic = pd.DataFrame({
+            "date": ["2017-12-31 00:10:00", "2017-12-31 00:20:00", "2017-12-31 00:30:00",
+                     "2017-12-31 00:15:00", "2017-12-31 00:45:00", "2017-12-31 02:00:00",
+                     "2017-12-31 02:15:00"],
+            "asset": ["BTC", "BTC", "BTC", "ETH", "ETH", "BTC", "ZERO"],
+            "data": [3.0, -8.0, 7.0, -2.0, 5.0, 4.0, 0.0],
+        }, index=[7] * 7)
+        original = basic.copy(deep=True)
+        expected = pd.DataFrame({"BTC" + ASSET_SUFFIX: [0.0, -8.0, 0.0, 4.0],
+                                  "ETH" + ASSET_SUFFIX: [0.0, -2.0, 5.0, 0.0],
+                                 "ZERO" + ASSET_SUFFIX: [0.0] * 4},
+                                index=pd.date_range("2017-12-31", periods=4, freq="h", name="date"))
+        actual = build_weight_data(basic, start_time="2017-12-31", aggregation_method="max_abs")
+        assert_frame_equal(actual, expected)
+        assert_frame_equal(basic, original)
+
+    def test_max_abs_ties_choose_earliest_timestamp_then_source_order(self):
+        basic = pd.DataFrame({
+            "date": ["2017-12-31 00:40:00", "2017-12-31 00:10:00", "2017-12-31 00:10:00",
+                     "2017-12-31 01:00:00", "2017-12-31 23:59:59"],
+            "asset": ["BTC"] * 5, "data": [5.0, -5.0, 5.0, 2.0, -3.0],
+        })
+        actual = build_weight_data(basic, start_time="2017-12-31", end_time="2017-12-31",
+                                   aggregation_method="max_abs")
+        self.assertEqual(actual.loc["2017-12-31 01:00:00", "BTC" + ASSET_SUFFIX], -5.0)
+        self.assertEqual(actual.loc["2017-12-31 02:00:00", "BTC" + ASSET_SUFFIX], 2.0)
+        self.assertEqual(actual.loc["2018-01-01 01:00:00", "BTC" + ASSET_SUFFIX], -3.0)
+        self.assertEqual(len(actual), 26)
+
+    def test_max_abs_avoids_sum_overflow_but_rejects_nonfinite_signals(self):
+        basic = pd.DataFrame({"date": ["2017-12-31 00:10:00"] * 2,
+                              "asset": ["BTC"] * 2, "data": [1e308, 1e308]})
+        actual = build_weight_data(basic, start_time="2017-12-31", aggregation_method="max_abs")
+        self.assertEqual(actual.iloc[1, 0], 1e308)
+        for value in (float("inf"), float("-inf"), float("nan")):
+            basic.loc[0, "data"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "非有限"):
+                build_weight_data(basic, start_time="2017-12-31", aggregation_method="max_abs")
+        with self.assertRaisesRegex(ValueError, "aggregation_method"):
+            build_weight_data(basic, start_time="2017-12-31", aggregation_method="unknown")
 
     def test_timestamp_input_and_next_day(self):
         source = result_frame([(pd.Timestamp("2018-01-01 00:00:00"), "BTC", "new", "利好", "低")])
@@ -99,7 +141,7 @@ class WeightDataTests(unittest.TestCase):
         source = result_frame([("2017-08-17 15:20:10", "BTC", "new", "利好", "高")])
         weight = build_weight_data(build_basic_df(source), start_time="2017-08-17", end_time="2017-08-17")
         self.assertEqual(weight.index[0], pd.Timestamp("2017-08-17 00:00:00"))
-        self.assertEqual(weight.index[-1], pd.Timestamp("2017-08-18 00:00:00"))
+        self.assertEqual(weight.index[-1], pd.Timestamp("2017-08-18 01:00:00"))
         self.assertEqual(weight.iloc[0, 0], 0.0)
         self.assertEqual(weight.loc["2017-08-17 16:00:00"].iloc[0], 6.0)
 
@@ -112,7 +154,7 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(weight.iloc[0, 0], 0.0)
         self.assertEqual(weight.iloc[1, 0], 6.0)
 
-    def test_forward_hour_alignment_for_minutes_exact_hours_and_day_boundary(self):
+    def test_45_minute_alignment_for_minutes_exact_hours_and_day_boundary(self):
         basic = pd.DataFrame({
             "date": ["2017-12-31 15:00:00", "2017-12-31 15:20:10",
                      "2017-12-31 15:59:59.999999999", "2017-12-31 16:00:00",
@@ -122,11 +164,77 @@ class WeightDataTests(unittest.TestCase):
         weight = build_weight_data(basic, start_time="2017-12-31")
         column = "BTC.USDT.UFUTURE.BINANCE"
         self.assertEqual(weight.loc["2017-12-31 15:00:00", column], 0.0)
-        self.assertEqual(weight.loc["2017-12-31 16:00:00", column], 4.5)
-        self.assertEqual(weight.loc["2017-12-31 17:00:00", column], 5.0)
-        self.assertEqual(weight.loc["2018-01-01 00:00:00", column], 6.0)
-        self.assertEqual(weight.index[-1], pd.Timestamp("2018-01-01 00:00:00"))
+        self.assertEqual(weight.loc["2017-12-31 16:00:00", column], 5.0)
+        self.assertEqual(weight.loc["2017-12-31 17:00:00", column], 4.5)
+        self.assertEqual(weight.loc["2018-01-01 01:00:00", column], 6.0)
+        self.assertEqual(weight.index[-1], pd.Timestamp("2018-01-01 01:00:00"))
         self.assertEqual(weight[column].sum(), 15.5)
+
+    def test_exact_45_minute_window_boundaries_for_both_aggregations(self):
+        basic = pd.DataFrame({
+            "date": ["2017-12-31 16:44:59.999999999", "2017-12-31 16:45:00",
+                     "2017-12-31 17:00:00", "2017-12-31 17:44:59.999999999",
+                     "2017-12-31 17:45:00", "2017-12-31 23:44:59.999999999",
+                     "2017-12-31 23:45:00"],
+            "asset": ["BTC"] * 7, "data": [99.0, 3.0, -8.0, 7.0, 5.0, 11.0, -13.0],
+        })
+        column = "BTC" + ASSET_SUFFIX
+        for method, expected in (("sum", 2.0), ("max_abs", -8.0)):
+            with self.subTest(method=method):
+                result = build_weight_data(basic, start_time="2017-12-31", end_time="2017-12-31",
+                                           aggregation_method=method)
+                self.assertEqual(result.loc["2017-12-31 17:00:00", column], 99.0)
+                self.assertEqual(result.loc["2017-12-31 18:00:00", column], expected)
+                self.assertEqual(result.loc["2017-12-31 19:00:00", column], 5.0)
+                self.assertEqual(result.loc["2018-01-01 00:00:00", column], 11.0)
+                self.assertEqual(result.loc["2018-01-01 01:00:00", column], -13.0)
+
+    def test_user_window_example_writes_to_next_day_02_for_both_aggregations(self):
+        source = result_frame([
+            ("2017-12-31 16:45:00", "BTC", "new", "利好", "高"),
+            ("2017-12-31 17:15:00", "BTC", "new", "利空", "中"),
+            ("2017-12-31 17:44:59", "BTC", "new", "利好", "低"),
+            ("2017-12-31 17:45:00", "BTC", "new", "利空", "高"),
+        ])
+        from postprocessing.weight_parameters import WeightParameters
+        for method, expected in (("sum", 4.0), ("max_abs", 6.0)):
+            with self.subTest(method=method):
+                saved = write_weight_data(Tables(pd.DataFrame(), source), "result", "weights",
+                                          start_time="2017-12-31", end_time="2017-12-31",
+                                          parameters=WeightParameters(aggregation_method=method))
+                self.assertEqual(saved.loc["2018-01-01 02:00:00", "BTC" + ASSET_SUFFIX], expected)
+                self.assertEqual(saved.loc["2018-01-01 03:00:00", "BTC" + ASSET_SUFFIX], -6.0)
+
+    def test_complete_cross_day_windows_match_one_run_in_both_batch_orders(self):
+        source = result_frame([
+            ("2017-12-31 22:44:59", "OUTSIDE", "new", "利好", "高"),
+            ("2017-12-31 22:45:00", "BTC", "new", "利好", "低"),
+            ("2017-12-31 23:44:59", "BTC", "new", "利好", "高"),
+            ("2017-12-31 23:45:00", "BTC", "new", "利空", "中"),
+            ("2018-01-01 00:44:59", "BTC", "new", "利好", "低"),
+            ("2018-01-01 00:45:00", "BTC", "new", "利好", "高"),
+            ("2018-01-01 23:44:59", "BTC", "new", "利好", "高"),
+            ("2018-01-01 23:45:00", "BTC", "new", "利好", "高"),
+            ("2018-01-02 00:44:59", "BTC", "new", "利空", "低"),
+            ("2018-01-02 00:45:00", "BTC", "new", "利空", "高"),
+            ("2018-01-02 23:45:00", "BTC", "new", "利空", "低"),
+            ("2018-01-03 00:44:59", "BTC", "new", "利好", "高"),
+            ("2018-01-03 00:45:00", "OUTSIDE", "new", "利好", "高"),
+        ])
+        from postprocessing.weight_parameters import WeightParameters
+        for method, expected in (("sum", 4.0), ("max_abs", 6.0)):
+            parameters = WeightParameters(aggregation_method=method)
+            combined = write_weight_data(Tables(pd.DataFrame(), source), "result", "weights",
+                                         start_time="2018-01-01", end_time="2018-01-02", parameters=parameters)
+            self.assertEqual(list(combined.columns), ["BTC" + ASSET_SUFFIX])
+            self.assertEqual(combined.loc["2018-01-02 09:00:00", "BTC" + ASSET_SUFFIX], expected)
+            for days in (("2018-01-01", "2018-01-02"), ("2018-01-02", "2018-01-01")):
+                with self.subTest(method=method, days=days):
+                    backend = Tables(pd.DataFrame(), source)
+                    for day in days + days:
+                        write_weight_data(backend, "result", "weights", start_time=day, end_time=day,
+                                          parameters=parameters)
+                    assert_frame_equal(backend.tables["weights"], combined, check_freq=False)
 
     def test_repeats_use_own_response_and_keep_source_order(self):
         source = result_frame([
@@ -251,7 +359,7 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(report["source_assets"], ["BTC", "ETH", "OLD"])
         self.assertEqual(report["unexpected_columns"], ["C20.USDT.UFUTURE.BINANCE", "CSS.USDT.UFUTURE.BINANCE"])
         self.assertEqual(report["missing_columns"], ["OLD.USDT.UFUTURE.BINANCE"])
-        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2017-12-31", ["asset"])])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-29", "2018-01-01", ["asset"])])
         self.assertEqual(backend.reads, [("weights", "2017-12-30", "2017-12-31")])
         self.assertFalse(backend.registers or backend.writes or backend.updates or backend.appends)
 
@@ -278,10 +386,25 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(report["unexpected_columns"], [])
         self.assertFalse(backend.registers or backend.writes)
 
+    def test_audit_entrypoint_selects_mode_for_shared_parameter_id(self):
+        module = importlib.import_module("entrypoints.audit_weight_columns")
+        grid = {"aggregation_methods": ["sum", "max_abs"]}
+        variant = prepare_weight_grid("weights", grid).variants[1]
+        backend = Tables(pd.DataFrame(), sample_results())
+        backend.tables[variant.table_path] = build_weight_data(build_basic_df(sample_results()), start_time="2017-12-31")
+        settings = EventConfig("first", "result", "round2.yaml", "round3.yaml",
+                               weight_path="weights", weight_grid=grid, **READ_RANGE)
+        with patch.object(module, "load_event_config", return_value=settings), patch("builtins.print"):
+            report = module.main(["--param-id", variant.parameters.param_id,
+                                  "--aggregation-method", "max_abs"], cli=backend)
+        self.assertEqual(report["weight_path"], variant.table_path)
+        self.assertEqual(report["unexpected_columns"], [])
+        self.assertFalse(backend.registers or backend.writes)
+
     def test_reads_only_required_columns_and_writes_new_table(self):
         backend = Tables(pd.DataFrame(), sample_results())
         weight = write_weight_data(backend, "result", "weights", **READ_RANGE)
-        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2017-12-31", SOURCE_COLUMNS)])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-29", "2018-01-01", SOURCE_COLUMNS)])
         self.assertEqual(backend.reads, [("weights", None, None)])
         self.assertEqual(backend.registers, ["weights"])
         self.assertEqual(len(backend.writes), 1)
@@ -293,9 +416,9 @@ class WeightDataTests(unittest.TestCase):
         self.assertTrue(submitted.index.equals(submitted.index.floor("h")))
         self.assertTrue(submitted.dtypes.eq("float64").all())
         self.assertEqual(submitted.index[0], pd.Timestamp("2017-12-30 08:00:00"))
-        self.assertEqual(submitted.index[-1], pd.Timestamp("2018-01-01 08:00:00"))
+        self.assertEqual(submitted.index[-1], pd.Timestamp("2018-01-01 09:00:00"))
         self.assertEqual(submitted.loc[pd.Timestamp("2017-12-31 08:00:00"), "BTC" + ASSET_SUFFIX], 0.0)
-        self.assertEqual(submitted.loc[pd.Timestamp("2017-12-31 09:00:00"), "BTC" + ASSET_SUFFIX], 4.5)
+        self.assertEqual(submitted.loc[pd.Timestamp("2017-12-31 09:00:00"), "BTC" + ASSET_SUFFIX], 6.0)
         assert_frame_equal(backend.tables["weights"], weight)
 
     def test_source_path_cannot_be_used_as_weight_target(self):
@@ -368,7 +491,7 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(backend.registers, ["weights"])
         self.assertEqual(len(backend.writes), RunConfig().storage_max_attempts)
 
-    def test_updates_overlap_appends_hours_and_preserves_outside_rows_and_boundary(self):
+    def test_updates_overlap_including_complete_first_window_and_preserves_outside_rows(self):
         source = result_frame([
             ("2018-01-01 00:20:00", "BTC", "new", "利好", "低"),
             ("2018-01-01 01:10:00", "BTC", "new", "利好", "高"),
@@ -381,13 +504,13 @@ class WeightDataTests(unittest.TestCase):
         saved = write_weight_data(backend, "result", "weights", start_time="2018-01-01", end_time="2018-01-01")
         actual = backend.tables["weights"]
         self.assertEqual(saved.index[0], pd.Timestamp("2018-01-01 08:00:00"))
-        self.assertEqual(saved.iloc[0, 0], 3.0)
+        self.assertEqual(saved.iloc[0, 0], 0.0)
         self.assertEqual(actual.loc["2018-01-01 07:00:00", column], 7.0)
         self.assertEqual(actual.loc["2018-01-01 09:00:00", column], 2.0)
         self.assertEqual(actual.loc["2018-01-01 10:00:00", column], 6.0)
         self.assertEqual(actual.loc["2018-01-02 10:00:00", column], 8.0)
-        self.assertEqual(list(backend.updates[0].index), [pd.Timestamp("2018-01-01 09:00:00")])
-        self.assertEqual(len(backend.appends[0]), 23)
+        self.assertEqual(list(backend.updates[0].index), list(pd.date_range("2018-01-01 08:00:00", periods=2, freq="h")))
+        self.assertEqual(len(backend.appends[0]), 24)
         self.assertFalse(backend.registers or backend.writes)
         original = actual.copy(deep=True)
         write_weight_data(backend, "result", "weights", start_time="2018-01-01", end_time="2018-01-01")
@@ -406,7 +529,7 @@ class WeightDataTests(unittest.TestCase):
         actual = backend.tables["weights"]
         self.assertEqual(actual.loc["2018-01-01 08:00:00", column], 6.0)
         self.assertEqual(actual.loc["2018-01-01 09:00:00", column], -2.0)
-        self.assertEqual(len(actual), 49)
+        self.assertEqual(len(actual), 50)
         self.assertTrue(actual.index.is_unique)
         self.assertEqual((len(backend.registers), len(backend.writes), len(backend.appends)), (1, 1, 1))
 
@@ -424,8 +547,8 @@ class WeightDataTests(unittest.TestCase):
         saved = write_weight_data(backend, "result", "weights", start_time="2018-01-01", end_time="2018-01-01")
         actual = backend.tables["weights"]
         self.assertTrue(saved.dtypes.eq("float64").all())
-        self.assertEqual(saved.iloc[0, 0], 3.5)
-        self.assertEqual(actual.loc["2018-01-01 08:00:00", column], 3.5)
+        self.assertEqual(saved.iloc[0, 0], 0.0)
+        self.assertEqual(actual.loc["2018-01-01 08:00:00", column], 0.0)
         self.assertEqual(actual.loc["2018-01-01 09:00:00", column], 0.5)
         self.assertEqual(actual.loc["2018-01-01 10:00:00", column], -1.5)
         self.assertEqual(actual.loc["2018-01-01 07:00:00", column], "7.0")
@@ -452,7 +575,7 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(list(saved.columns), [btc, eth])
         self.assertEqual(actual.loc["2018-01-01 07:00:00", btc], 5.0)
         self.assertEqual(actual.loc["2018-01-01 07:00:00", eth], 0.0)
-        self.assertEqual(actual.loc["2018-01-01 08:00:00", btc], 4.0)
+        self.assertEqual(actual.loc["2018-01-01 08:00:00", btc], 0.0)
         self.assertEqual(actual.loc["2018-01-01 09:00:00", btc], 0.0)
         self.assertEqual(actual.loc["2018-01-01 09:00:00", eth], 2.0)
         self.assertTrue(actual.dtypes.eq("float64").all())
@@ -477,7 +600,7 @@ class WeightDataTests(unittest.TestCase):
             write_weight_data(backend, "result", "weights", start_time="2018-01-01", end_time="2018-01-01")
         self.assertEqual(len(backend.appends), 2)
         assert_frame_equal(backend.appends[0], backend.appends[1])
-        self.assertEqual(len(backend.tables["weights"]), 25)
+        self.assertEqual(len(backend.tables["weights"]), 26)
         self.assertFalse(backend.registers or backend.writes or backend.updates)
 
     def test_failed_overlap_update_stops_before_appending_new_hours(self):
@@ -515,9 +638,9 @@ class WeightDataTests(unittest.TestCase):
             with patch.object(module, "load_event_config", return_value=settings) as load:
                 summary = module.main(["--report-dir", str(Path(temporary) / "run")], cli=backend)
         self.assertTrue(load.call_args.args[0].endswith("event_processing_config.yaml"))
-        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2017-12-31", SOURCE_COLUMNS)])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-29", "2018-01-01", SOURCE_COLUMNS)])
         self.assertEqual(summary["combination_count"], 1)
-        self.assertEqual(summary["tables"][0]["hours"], 49)
+        self.assertEqual(summary["tables"][0]["hours"], 50)
         self.assertEqual(summary["tables"][0]["assets"], 3)
         self.assertEqual(summary["tables"][0]["table_path"], prepare_weight_grid("weights").variants[0].table_path)
         self.assertNotIn("weights", backend.tables)
@@ -533,7 +656,7 @@ class WeightDataTests(unittest.TestCase):
                         module.main([], cli=backend)
                 self.assertFalse(backend.column_reads or backend.meta_reads or backend.registers or backend.writes)
 
-    def test_only_requested_dates_contribute_assets_and_scores(self):
+    def test_only_successful_events_in_complete_windows_contribute_assets_and_scores(self):
         source = result_frame([
             ("2017-12-30 23:59:59", "OUTSIDE", "new", "利好", "高"),
             ("2017-12-31 00:00:00", "BTC", "new", "利好", "高"),
@@ -545,13 +668,13 @@ class WeightDataTests(unittest.TestCase):
         backend = Tables(pd.DataFrame(), source)
         weight = write_weight_data(backend, "result", "weights", start_time="2017-12-31", end_time="2017-12-31")
         self.assertEqual(list(weight.columns), ["BTC" + ASSET_SUFFIX])
-        self.assertEqual(len(weight), 25)
+        self.assertEqual(len(weight), 26)
         self.assertEqual(weight.iloc[0, 0], 0.0)
         self.assertEqual(weight.iloc[1, 0], 6.0)
         self.assertEqual(weight.iloc[-1, 0], -3.0)
-        self.assertEqual(backend.column_reads, [("result", "2017-12-31", "2017-12-31", SOURCE_COLUMNS)])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2018-01-01", SOURCE_COLUMNS)])
 
-    def test_repeat_cannot_trigger_an_outside_range_history_read(self):
+    def test_repeat_requires_own_response_even_when_window_reads_adjacent_dates(self):
         source = result_frame([
             ("2017-12-30 23:59:59", "BTC", "new", "利好", "高"),
             ("2017-12-31 00:00:00", "BTC", "repeat", None, None),
@@ -559,7 +682,7 @@ class WeightDataTests(unittest.TestCase):
         backend = Tables(pd.DataFrame(), source)
         with self.assertRaisesRegex(ValueError, "record1.*无法计算权重"):
             write_weight_data(backend, "result", "weights", start_time="2017-12-31", end_time="2017-12-31")
-        self.assertEqual(backend.column_reads, [("result", "2017-12-31", "2017-12-31", SOURCE_COLUMNS)])
+        self.assertEqual(backend.column_reads, [("result", "2017-12-30", "2018-01-01", SOURCE_COLUMNS)])
         self.assertFalse(backend.registers or backend.writes)
 
     def test_invalid_read_dates_stop_before_database_access(self):
@@ -573,7 +696,8 @@ class WeightDataTests(unittest.TestCase):
 
     def test_outside_range_returned_by_client_stops_before_register(self):
         backend = Tables(pd.DataFrame(), sample_results())
-        with patch.object(backend, "read", return_value=sample_results()):
+        outside = result_frame([("2017-12-29 23:00:00", "BTC", "new", "利好", "高")])
+        with patch.object(backend, "read", return_value=outside):
             with self.assertRaisesRegex(ValueError, "日期以外"):
                 write_weight_data(backend, "result", "weights", start_time="2017-12-31", end_time="2017-12-31")
         self.assertFalse(backend.registers or backend.writes)

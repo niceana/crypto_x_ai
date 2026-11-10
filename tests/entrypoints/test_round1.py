@@ -21,8 +21,9 @@ from tests.support import (
     success as raw_success,
 )
 from round1.runner import ExtractionSummary
-from common.config import ConfigError, ai_config_hash
+from common.config import ConfigError, RunConfig, ai_config_hash
 from common.persistence import BatchPersistenceError
+from common.process_lock import ProcessLockBusy, stage_guard
 from initialization.event_records import import_event_records_from_posts
 from tests.event_support import Tables
 
@@ -49,6 +50,9 @@ class EntryPointTests(Fixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.root = self.path.parent
+        environment = patch.dict(os.environ, {"CRYPTO_X_AI_LOCK_DIR": str(self.root / "locks")})
+        environment.start()
+        self.addCleanup(environment.stop)
         (self.root / "configs").mkdir()
         ai_path = self.root / "configs" / "round1_ai_config.yaml"
         self.path.rename(ai_path)
@@ -97,6 +101,40 @@ class EntryPointTests(Fixture, unittest.TestCase):
 
     def write_job(self, settings):
         self.job_path.write_text(yaml.safe_dump(settings), encoding="utf-8")
+
+    def test_duplicate_stops_before_client_recovery_or_ai(self):
+        with stage_guard("round1", self.settings["task_path"]):
+            with patch.object(self.module, "run_extraction") as worker:
+                with self.assertRaises(ProcessLockBusy):
+                    self.module.main()
+                self.get_client.assert_not_called()
+                worker.assert_not_called()
+                self.import_events.assert_not_called()
+
+    def test_lock_includes_automatic_import_and_releases_afterwards(self):
+        def import_events(*args, **kwargs):
+            for stage, target in (("round1", self.settings["task_path"]),
+                                   ("import_events", self.event_settings["result_path"])):
+                with self.assertRaises(ProcessLockBusy):
+                    with stage_guard(stage, target):
+                        self.fail("自动导入结束以前不能释放阶段锁")
+            return 1
+
+        self.import_events.side_effect = import_events
+        with patch.object(self.module, "run_extraction", return_value=ExtractionSummary(new_succeeded=1)):
+            self.module.main()
+        with stage_guard("round1", self.settings["task_path"]), \
+                stage_guard("import_events", self.event_settings["result_path"]):
+            pass
+
+    def test_busy_launcher_exits_with_code_two_without_error_traceback(self):
+        with patch.object(self.module, "main", side_effect=ProcessLockBusy("重复运行 PID=456")):
+            with self.assertLogs(self.module.__name__, level="WARNING") as captured:
+                with self.assertRaises(SystemExit) as caught:
+                    self.module.execute_round1()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("PID=456", captured.output[0])
+        self.assertIsNone(captured.records[0].exc_info)
 
     def test_duplicate_job_or_event_keys_stop_before_client_creation(self):
         for path, suffix in (
@@ -349,7 +387,7 @@ class EntryPointTests(Fixture, unittest.TestCase):
             with self.assertRaises(BatchPersistenceError):
                 self.module.main()
             self.assertTrue(backend.tables["first"]["status"].eq("1").all())
-            self.assertEqual(len(backend.writes), 3)
+            self.assertEqual(len(backend.writes), RunConfig().storage_max_attempts)
             backend.write_hook = None
             resumed = self.module.main()
         self.assertEqual((resumed.already_succeeded, resumed.http_attempts_started), (1, 0))

@@ -513,6 +513,74 @@ class EventImportTests(EventFixture, unittest.TestCase):
         self.assertFalse(backend.writes or backend.updates or backend.appends)
         pd.testing.assert_frame_equal(backend.tables["result"], old)
 
+    def test_extra_input_diagnostics_are_scoped_bounded_and_never_write(self):
+        source = source_posts([("2021-01-02", "private event {}".format(i), ["ETH"], "a")
+                               for i in range(7)] + [("2021-01-01", "outside", ["ETH"], "a"),
+                                                    ("2021-01-02", "pending append", ["ETH"], "a")])
+        existing = expand_first_round(source.iloc[:8])
+        current = source.iloc[[0, 8]].copy(deep=True)
+        current.loc[current.index[0], "ai_response_content"] = json.dumps(
+            {"events": [{"event": "private changed event", "tickers": ["BTC"]}]})
+        settings = self.settings(start_time="2021-01-02", end_time="2021-01-02")
+        for successful_only, extra_count, sample_count in ((False, 7, 5), (True, 1, 1)):
+            with self.subTest(successful_only=successful_only):
+                backend = Tables(current, existing)
+                with self.assertRaisesRegex(ValueError, "固定第一轮输入之外") as caught:
+                    import_event_records_from_table(backend, settings, successful_only=successful_only)
+                message = str(caught.exception)
+                for detail in ("多出={}".format(extra_count), "本次第一轮帖子=2", "展开事件=2",
+                               "first_round_task_path='first'", "result_path='result'",
+                               "日期=2021-01-02~2021-01-02", "date='2021-01-02 00:00:00'",
+                               "record_id='100:0:ETH'", "source_post_id='100'", "asset='ETH'",
+                               "source_post_in_scope=True", "record_id_expected=False",
+                               "100:0:BTC", "异常日期数=1", "本批尚未写入"):
+                    self.assertIn(detail, message)
+                self.assertEqual(message.count("record_id="), sample_count)
+                self.assertNotIn("107:0:ETH", message)
+                self.assertNotIn("private", message)
+                self.assertFalse(backend.registers or backend.writes or backend.appends or backend.updates)
+                self.assertEqual(len(backend.reads), 2)
+                pd.testing.assert_frame_equal(backend.tables["result"], existing)
+
+    def test_extra_input_diagnostics_show_same_record_id_with_different_date_or_type(self):
+        source = source_posts([("2021-01-02 10:00:00.123456789", "private fact", ["ETH"], "a"),
+                               ("2021-01-02 11:00:00", "pending append", ["ETH"], "a")])
+        expected = expand_first_round(source)
+        stamp, record_id = expected.index[0]
+        for old_date in (stamp + pd.Timedelta(seconds=1), str(stamp)):
+            with self.subTest(old_date=old_date):
+                existing = expected.iloc[:1].copy(deep=True)
+                existing.index = pd.MultiIndex.from_tuples([(old_date, record_id)], names=expected.index.names)
+                backend = Tables(source, existing)
+                with self.assertRaisesRegex(ValueError, "固定第一轮输入之外") as caught:
+                    import_event_records_from_table(backend, self.settings(
+                        start_time="2021-01-02", end_time="2021-01-02"))
+                message = str(caught.exception)
+                self.assertIn("record_id_expected=True", message)
+                self.assertIn("expected_event_count=1", message)
+                self.assertIn("source_date={!r}".format(stamp), message)
+                self.assertIn("date_type={!r}".format(type(old_date).__name__), message)
+                self.assertNotIn("private fact", message)
+                self.assertEqual(len(backend.reads), 2)
+                self.assertFalse(backend.registers or backend.writes or backend.appends or backend.updates)
+                pd.testing.assert_frame_equal(backend.tables["result"], existing)
+
+    def test_extra_input_date_summary_covers_more_than_the_first_five_samples(self):
+        old_source = source_posts([("2021-01-02", "old", ["ETH"], "a")] * 6 +
+                                  [("2021-01-03", "later", ["ETH"], "a")])
+        source = source_posts([("2021-01-04", "pending append", ["ETH"], "a")])
+        existing = expand_first_round(old_source)
+        backend = Tables(source, existing)
+        with self.assertRaisesRegex(ValueError, "固定第一轮输入之外") as caught:
+            import_event_records_from_table(backend, self.settings())
+        message = str(caught.exception)
+        self.assertIn("多出=7", message)
+        self.assertIn("异常日期数=2", message)
+        self.assertIn("('2021-01-02', 6)", message)
+        self.assertIn("('2021-01-03', 1)", message)
+        self.assertEqual(message.count("record_id="), 5)
+        self.assertFalse(backend.registers or backend.writes or backend.appends or backend.updates)
+
     def test_initialize_scoped_append_preserves_rows_outside_scope(self):
         source = source_posts([("2021-01-01", "one", ["ETH"], "a"), ("2021-01-02", "two", ["ETH"], "a")])
         expected = expand_first_round(source)

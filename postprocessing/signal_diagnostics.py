@@ -8,6 +8,7 @@ import pandas as pd
 from common.validation import validate_index
 from postprocessing.weight_data import ASSET_SUFFIX, parse_weight_features, score_weight_features
 from postprocessing.weight_parameters import ACTIVE_MAPPINGS, OUTPUT_TIME_OFFSET_HOURS, WeightParameters
+from postprocessing.weight_time import event_target_hours
 
 
 EVENT_COLUMNS = ["asset", "event_relation", "round2_ai_response", "round3_ai_response",
@@ -128,7 +129,7 @@ def analyze_events(results, *, parameters=None, assets=None, epsilon=1e-10,
         distributions += _distribution(features.loc[features["event_relation"].ne("repeat"), field], field, "new_update")
     detail = features.copy()
     detail["score"] = score_weight_features(features, parameters)["data"]
-    detail["target_hour"] = detail["date"].dt.floor("h") + pd.Timedelta(hours=1 + output_time_offset_hours)
+    detail["target_hour"] = event_target_hours(detail["date"]) + pd.Timedelta(hours=output_time_offset_hours)
     reasons = [[] for _ in range(len(detail))]
     for field in ACTIVE_MAPPINGS:
         mapped = detail[field].map(dict(parameters.mappings[field]))

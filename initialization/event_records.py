@@ -187,8 +187,44 @@ def import_event_records_from_table(cli, settings, *, successful_only=False):
             # 同日其他帖子可能尚未成功，不把它们的已有记录当成本批多余输入。
             post_ids = {str(raw_id) for raw_id in source.index.get_level_values("id")}
             actual_scope = actual_scope.loc[actual_scope["source_post_id"].isin(post_ids)]
-        if set(actual_scope.index) - set(expected.index):
-            raise ValueError("已有结果包含固定第一轮输入之外的记录")
+        extra = set(actual_scope.index) - set(expected.index)
+        if extra:
+            sample_keys = sorted(extra, key=lambda item: (str(item[0]), str(item[1])))[:5]
+            sample_post_ids = {actual_scope.at[key, "source_post_id"] for key in sample_keys
+                               if isinstance(actual_scope.at[key, "source_post_id"], str)}
+            source_dates = {str(raw_id): raw_date for raw_date, raw_id in source.index
+                            if str(raw_id) in sample_post_ids}
+            expected_by_post = {post_id: [] for post_id in sample_post_ids}
+            for expected_key, post_id in expected["source_post_id"].items():
+                if post_id in expected_by_post:
+                    expected_by_post[post_id].append(expected_key)
+            date_counts = {}
+            for raw_date, _ in extra:
+                day = str(raw_date)[:10]
+                date_counts[day] = date_counts.get(day, 0) + 1
+            samples = []
+            for key in sample_keys:
+                row = actual_scope.loc[key]
+                post_id = row["source_post_id"] if isinstance(row["source_post_id"], str) else None
+                current_keys = expected_by_post.get(post_id, [])
+                samples.append("date={!r}, record_id={!r}, source_post_id={!r}, asset={!r}, "
+                               "source_post_in_scope={}, date_type={!r}, source_date={!r}, "
+                               "record_id_expected={}, expected_event_count={}, "
+                               "expected_keys_first3={!r}".format(
+                                   str(key[0]), key[1], row["source_post_id"], row["asset"],
+                                   post_id in source_dates, type(key[0]).__name__, source_dates.get(post_id),
+                                   any(item[1] == key[1] for item in current_keys), len(current_keys),
+                                   sorted(current_keys, key=lambda item: (str(item[0]), str(item[1])))[:3]))
+            raise ValueError(
+                "已有结果包含固定第一轮输入之外的记录：多出={}，本次第一轮帖子={}，"
+                "展开事件={}，参与比较的已有事件={}；first_round_task_path={!r}，"
+                "result_path={!r}，日期={}~{}；异常日期数={}，按日期前5项统计={!r}；"
+                "最多5条样例（按时间排序）：[{}]；本批尚未写入。"
+                "请核对来源表、日期以及第一轮回答的事件顺序和币种".format(
+                    len(extra), len(source), len(expected), len(actual_scope),
+                    settings.first_round_task_path, settings.result_path,
+                    settings.start_time, settings.end_time, len(date_counts),
+                    sorted(date_counts.items())[:5], "; ".join(samples)))
         for key in set(expected.index) & set(existing.index):
             if any(existing.loc[key, name] != expected.loc[key, name] for name in INPUT_COLUMNS):
                 raise ValueError("已有记录与固定输入不一致：{}".format(key[1]))

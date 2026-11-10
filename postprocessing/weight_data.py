@@ -13,7 +13,10 @@ from common.store import read_event_history
 from common.time_rules import published_time
 from common.validation import validate_index
 from initialization.event_records import _is_data_not_found
-from postprocessing.weight_parameters import ACTIVE_MAPPINGS, OUTPUT_TIME_OFFSET_HOURS, WeightParameters
+from postprocessing.weight_parameters import (
+    ACTIVE_MAPPINGS, OUTPUT_TIME_OFFSET_HOURS, WeightParameters, validate_aggregation_method,
+)
+from postprocessing.weight_time import event_target_hours, event_window_bounds, weight_output_bounds
 
 
 logger = logging.getLogger(__name__)
@@ -104,22 +107,33 @@ def build_basic_df(results, parameters=None):
     return score_weight_features(parse_weight_features(results), parameters)
 
 
-def build_weight_data(basic_df, *, start_time, end_time=None):
-    """在源时间轴归入下一小时并求和补零；写库入口最后再将索引加 8 小时。"""
+def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method="sum"):
+    """按 [T-75分钟, T-15分钟) 聚合到整点 T，补零；并列取最早发布、同刻取首条。"""
+    validate_aggregation_method(aggregation_method)
     if basic_df.empty:
         raise ValueError("结果表没有事件，无法确定权重表的资产列及结束时间")
     assets = sorted(basic_df["asset"].unique())
-    # [15:00, 16:00) 的事件统一计入 16:00，整点事件也顺延一小时。
-    target_hours = pd.to_datetime(basic_df["date"], format="ISO8601").dt.floor("h") + pd.Timedelta(hours=1)
+    # [16:45, 17:45) 的事件统一计入 18:00；17:45 归入 19:00。
+    published_at = pd.to_datetime(basic_df["date"], format="ISO8601")
+    target_hours = event_target_hours(published_at)
     begin = pd.Timestamp(start_time)
-    end = pd.Timestamp(end_time) + pd.Timedelta(days=1) if end_time is not None else max(begin, target_hours.max())
+    end = weight_output_bounds(start_time, end_time)[1] if end_time is not None else max(begin, target_hours.max())
     if begin > end:
         raise ValueError("权重时间轴起点不能晚于终点")
     hours = pd.date_range(begin, end, freq="h", name="date")
     data = basic_df["data"].astype("float64", copy=False)
     if not np.isfinite(data.to_numpy()).all():
         raise ValueError("basic_df.data 包含非有限值")
-    hourly = data.groupby([target_hours.rename("date"), basic_df["asset"]], sort=True).sum().unstack("asset", fill_value=0.0)
+    if aggregation_method == "sum":
+        aggregated = data.groupby([target_hours.rename("date"), basic_df["asset"]], sort=True).sum()
+    else:
+        # 使用独立的位置索引，兼容 basic_df 的重复行标签；稳定排序使并列规则可复现。
+        events = pd.DataFrame({"date": target_hours.to_numpy(), "asset": basic_df["asset"].to_numpy(),
+                               "data": data.to_numpy(), "published_at": published_at.to_numpy()})
+        events = events.sort_values("published_at", kind="stable").reset_index(drop=True)
+        selected = events["data"].abs().groupby([events["date"], events["asset"]], sort=True).idxmax()
+        aggregated = events.loc[selected].set_index(["date", "asset"])["data"]
+    hourly = aggregated.unstack("asset", fill_value=0.0)
     # 聚合、补零及写库均保留 float64；date 单独保留为 DatetimeIndex。
     weight_data = hourly.reindex(index=hours, columns=assets, fill_value=0.0).astype("float64")
     if not np.isfinite(weight_data.to_numpy()).all():
@@ -155,11 +169,22 @@ def _column_comparison(results, columns):
             "columns_unique": columns.is_unique}
 
 
+def read_weight_events(cli, result_path, start_time, end_time, *, columns, label):
+    """补读首尾窗口所需日期，再按精确事件范围筛选，避免跨日批次漏算或覆盖。"""
+    begin, end = event_window_bounds(*weight_output_bounds(start_time, end_time))
+    results = read_event_history(cli, result_path, begin.date().isoformat(), end.date().isoformat(),
+                                 columns=columns, label=label)
+    dates = pd.to_datetime(results.index.get_level_values("date"), format="ISO8601")
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    return results.loc[(dates >= begin) & (dates < end)].copy()
+
+
 def audit_weight_columns(cli, result_path, weight_path, *, start_time, end_time):
     """只读比较配置范围内源表 asset 与已有权重表列名，不解析回答或写库。"""
     _validate_weight_request(result_path, weight_path, start_time, end_time)
-    results = read_event_history(cli, result_path, start_time, end_time,
-                                 columns=["asset"], label="权重列名核对来源读取")
+    results = read_weight_events(cli, result_path, start_time, end_time,
+                                columns=["asset"], label="权重列名核对来源读取")
     if any(not isinstance(asset, str) or not asset.strip() for asset in results["asset"]):
         raise ValueError("asset 必须为非空字符串")
     stored = cli.read(weight_path, start_time=start_time, end_time=end_time)
@@ -170,7 +195,7 @@ def audit_weight_columns(cli, result_path, weight_path, *, start_time, end_time)
 
 
 def _save_weight_data(cli, weight_path, weight_data):
-    """首次建表；已有表更新重叠行并追加新索引，保留范围外数据及批次起点边界。"""
+    """首次建表；已有表更新重叠行并追加新索引，保留范围外数据。"""
     missing = False
     try:
         existing = cli.read(weight_path)
@@ -201,11 +226,6 @@ def _save_weight_data(cli, weight_path, weight_data):
     columns = existing.columns.union(weight_data.columns, sort=False).sort_values()
     batch = weight_data.reindex(columns=columns, fill_value=0.0)
     existing = existing.reindex(columns=columns, fill_value=0.0)
-    boundary = batch.index[0]
-    if boundary in existing.index:
-        # 起点已整体加 8 小时；该时刻的已有值属于上一批，不能用补零覆盖。
-        batch.loc[boundary] = existing.loc[boundary].astype("float64")
-
     # 新资产历史上没有列，先按列补浮点零，避免历史行因扩列出现空值。
     if len(new_columns) and not existing.empty:
         save(cli.update_by_column, existing[new_columns], "weight_data_add_columns")
@@ -223,18 +243,20 @@ def _save_weight_data(cli, weight_path, weight_data):
 def _write_weight_features(cli, features, result_path, weight_path, *, start_time, end_time, parameters):
     """保存一个组合，网格调用方复用同一份已解析特征。"""
     basic_df = score_weight_features(features, parameters)
-    weight_data = build_weight_data(basic_df, start_time=start_time, end_time=end_time)
+    weight_data = build_weight_data(basic_df, start_time=start_time, end_time=end_time,
+                                    aggregation_method=parameters.aggregation_method)
     comparison = _column_comparison(features, weight_data.columns)
     if comparison["unexpected_columns"] or comparison["missing_columns"] or not comparison["columns_unique"]:
         raise ValueError("权重列名与源表 asset 不一致：多出={}，缺少={}，列名唯一={}".format(
             comparison["unexpected_columns"], comparison["missing_columns"], comparison["columns_unique"]))
     logger.info("权重列名来源核对通过：result_path=%s，weight_path=%s，asset去重原值=%s",
                 result_path, weight_path, comparison["source_assets"])
-    # 完成评分、聚合和补零后，仅平移最终索引，不改变源数据读取范围。
+    # 完成评分、聚合和补零后，仅平移最终索引。
     # 先平移再与已有表对齐，避免续写重复加时或破坏上一批边界值。
     weight_data.index = weight_data.index + pd.Timedelta(hours=OUTPUT_TIME_OFFSET_HOURS)
-    logger.info("权重表计算完成：小时=%d，资产=%d，起点=%s，终点=%s",
-                len(weight_data), len(weight_data.columns), weight_data.index[0], weight_data.index[-1])
+    logger.info("权重表计算完成：聚合=%s，小时=%d，资产=%d，起点=%s，终点=%s",
+                parameters.aggregation_method, len(weight_data), len(weight_data.columns),
+                weight_data.index[0], weight_data.index[-1])
     saved = _save_weight_data(cli, weight_path, weight_data)
     logger.info("权重表已保存：%s", weight_path)
     return saved
@@ -244,8 +266,8 @@ def write_weight_data(cli, result_path, weight_path, *, start_time, end_time, pa
     """单组合读取及续写接口；网格入口为每个组合自动分配独立表路径。"""
     _validate_weight_request(result_path, weight_path, start_time, end_time)
     logger.info("权重来源读取：起点=%s，终点=%s", start_time, end_time)
-    results = read_event_history(cli, result_path, start_time, end_time,
-                                 columns=SOURCE_COLUMNS, label="权重来源读取")
+    results = read_weight_events(cli, result_path, start_time, end_time,
+                                columns=SOURCE_COLUMNS, label="权重来源读取")
     features = parse_weight_features(results)
     parameters = WeightParameters() if parameters is None else parameters
     return _write_weight_features(cli, features, result_path, weight_path, start_time=start_time,

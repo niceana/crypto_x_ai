@@ -100,7 +100,10 @@ api:
     temperature: 0
     stream: false
 run:
+  # 仅限制同时执行的 HTTP 请求；退避、请求准备和写库不占 HTTP 名额。
   concurrency: 10
+  # HTTP 并发之外的备用请求，取走即由准备线程补货。
+  ready_request_buffer_size: 20
   batch_size: 200
   result_buffer_size: 200
   flush_interval_seconds: 1

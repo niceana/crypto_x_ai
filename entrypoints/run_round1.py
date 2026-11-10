@@ -8,6 +8,7 @@ import pandas as pd
 from xdata.client import get_client
 
 from common.config import load_event_config, load_job_config
+from common.process_lock import ProcessLockBusy, stage_guard
 from entrypoints.runtime import DEFAULT_LOGGING
 from initialization.event_records import import_event_records_from_posts
 from round1.runner import run_extraction
@@ -21,12 +22,21 @@ def main():
     """
     project_root = Path(__file__).resolve().parent.parent
     settings = load_job_config(project_root / "configs" / "post_extraction_config.yaml", ("task_path", "ai_config_path"))
+    return run_round1_job(
+        settings, lambda: load_event_config(project_root / "configs" / "event_processing_config.yaml"),
+        config_directory=project_root / "configs",
+    )
+
+
+def run_round1_job(settings, event_config_loader, *, config_directory):
+    """官方和媒体入口共用第一轮启动、锁与成功帖自动导入。"""
+    settings = dict(settings)
     if "logging" in settings and not isinstance(settings["logging"], dict):
         raise ValueError("任务配置的 logging 必须为字典")
 
     ai_config_path = Path(settings["ai_config_path"])
     if not ai_config_path.is_absolute():
-        ai_config_path = project_root / "configs" / ai_config_path
+        ai_config_path = Path(config_directory) / ai_config_path
     ai_config_path = ai_config_path.resolve()
     if not ai_config_path.is_file():
         raise FileNotFoundError("AI 配置文件不存在")
@@ -34,17 +44,26 @@ def main():
 
     # 后续任务沿用round1事件提取的实际来源和范围，不要求两份配置手工同步日期。
     event_settings = replace(
-        load_event_config(project_root / "configs" / "event_processing_config.yaml"),
+        event_config_loader(),
         first_round_task_path=settings["task_path"],
         start_time=settings.get("start_time"), end_time=settings.get("end_time"),
     )
     if event_settings.result_path == settings["task_path"]:
         raise ValueError("第一轮表与结果表路径必须不同")
+    if settings.get("source_path") == event_settings.result_path:
+        raise ValueError("源帖子表与事件结果表路径必须不同")
 
     logging.basicConfig(**settings.get("logging", DEFAULT_LOGGING))
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+    with stage_guard("round1", settings["task_path"],
+                     start_time=settings.get("start_time"), end_time=settings.get("end_time")):
+        return _run_locked(settings, event_settings)
+
+
+def _run_locked(settings, event_settings):
+    """从创建客户端到自动导入结束始终持有第一轮锁。"""
     # 客户端始终在当前调用线程使用，整轮处理复用同一个对象。
     cli = get_client()
     new_successes, previous_successes = [], []
@@ -67,13 +86,15 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("round1事件提取已结束，开始将本次范围内已成功保存的帖子自动导入事件去重分析表")
     try:
-        imported = import_event_records_from_posts(
-            cli, event_settings,
-            new_posts=pd.concat(new_successes).sort_index() if new_successes else None,
-            previous_posts=pd.concat(previous_successes).sort_index() if previous_successes else None,
-        )
+        with stage_guard("import_events", event_settings.result_path,
+                         start_time=settings.get("start_time"), end_time=settings.get("end_time")):
+            imported = import_event_records_from_posts(
+                cli, event_settings,
+                new_posts=pd.concat(new_successes).sort_index() if new_successes else None,
+                previous_posts=pd.concat(previous_successes).sort_index() if previous_successes else None,
+            )
     except Exception:
-        logger.error("事件去重分析表自动导入未完成，round1帖子事件提取表已保存结果保留；重新运行同一范围的 python -m entrypoints.run_round1 可继续补导")
+        logger.error("事件去重分析表自动导入未完成，round1帖子事件提取表已保存结果保留；重新运行同一范围的第一轮入口可继续补导")
         raise
     logger.info("事件去重分析表自动导入完成：新增=%d", imported)
     return summary
@@ -85,6 +106,9 @@ def execute_round1():
         main()
     except KeyboardInterrupt:
         raise SystemExit(130) from None
+    except ProcessLockBusy as exc:
+        logging.getLogger(__name__).warning("%s", exc)
+        raise SystemExit(2) from None
     except Exception:
         logging.getLogger(__name__).exception("round1事件提取未完成")
         raise SystemExit(1) from None

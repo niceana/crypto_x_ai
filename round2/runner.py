@@ -14,11 +14,13 @@ from common.event_context import (
 )
 from common.network import BatchRunError, NetworkWorker
 from common.persistence import BatchPersistenceError
-from common.store import EventRecordStore, read_event_history, validate_relation_history, summarize
+from common.execution import ProgressStats
+from common.store import EventRecordStore, read_event_history, summarize
 from common.time_rules import history_read_bounds, is_history_needed, published_time, table_date_bounds
 from round2.retrieval import load_retriever
 from round2.embedding import EmbeddingRetriever
 from round2.preparation import AutoNewResult, RelationPreparer
+from round2.history import validate_relation_history
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +45,17 @@ def _load_relation_history(store, pending_keys):
 
 
 def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker, *,
-                 embedding_config=None, target_assets=None):
+                 embedding_config=None, target_assets=None, max_candidate_groups=10,
+                 max_input_characters=None):
     """读取已有任务，恢复状态，按币协调检索、请求与即时保存。
 
     调用线程独占 cli；同币下一时点必须等当前时间全部结果保存确认。相同
     时间共享此前历史，普通失败只暂停该币，输入和候选不会额外落库。
     """
+    for name, value in (("max_candidate_groups", max_candidate_groups),
+                        ("max_input_characters", max_input_characters)):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError("{} 必须为正整数或 None".format(name))
     if not settings.start_time or not settings.end_time:
         raise ValueError("第二轮必须配置 start_time/end_time，明确本次处理的事件日期范围")
     if date.fromisoformat(settings.start_time) > date.fromisoformat(settings.end_time):
@@ -119,22 +126,19 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     incomplete = defaultdict(int)
     ready_assets = deque(waves)
     network = network_factory(config)
-    preparer = RelationPreparer(history, retrieve, config, network)
+    preparer = RelationPreparer(history, retrieve, config, network,
+                               max_candidate_groups=max_candidate_groups,
+                               max_input_characters=max_input_characters)
     network.bind_ready_queue(preparer.ready_requests, preparer.wake)
     current_results = []
     succeeded = failed = auto_new = 0
-    save_calls = save_records = claim_calls = claim_records = 0
-    save_seconds = claim_seconds = 0.0
-    started_at = last_progress_at = time.monotonic()
-    next_progress = config.run.progress_every
+    progress = ProgressStats(config.run, logger, "round2事件去重归组")
 
     def report_progress(force=False, phase="处理中"):
-        nonlocal last_progress_at, next_progress
-        now = time.monotonic()
         processed = succeeded + failed
-        if not force and processed < next_progress and now - last_progress_at < 10:
+        if not progress.should_report(processed, force):
             return
-        elapsed = now - started_at
+        elapsed = progress.elapsed_seconds
         # 只读内存计数和队列快照，不为日志额外查库或扫描整表。
         with network.completions.mutex:
             waiting_results = list(network.completions.queue)
@@ -162,22 +166,11 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
             preparer.ready_requests.qsize(), config.run.ready_request_buffer_size,
             len(active), waiting_save, network.http_attempts_started, len(blocked),
             elapsed, processed / elapsed if elapsed > 0 else 0.0)
-        logger.info(
-            "round2事件去重归组瓶颈统计：HTTP平均并发=%.2f/%d，HTTP峰值=%d，"
-            "待写库AI=%d，自动判新=%d，其他=%d，有后续数据且前序待写库币种=%d，"
-            "未结束币种=%d，可认领币种=%d，结果保存平均每批耗时=%.3f秒，"
-            "结果保存平均批量=%.1f条，结果保存折合每条耗时=%.3f秒，"
-            "认领写库平均每批耗时=%.3f秒，认领平均批量=%.1f条，认领写库折合每条耗时=%.3f秒",
-            http_average, config.run.concurrency, http_peak, waiting_ai, waiting_auto,
-            waiting_save - waiting_ai - waiting_auto, waiting_frontiers, unfinished_assets, claimable_assets,
-            save_seconds / save_calls if save_calls else 0.0,
-            save_records / save_calls if save_calls else 0.0,
-            save_seconds / save_records if save_records else 0.0,
-            claim_seconds / claim_calls if claim_calls else 0.0,
-            claim_records / claim_calls if claim_calls else 0.0,
-            claim_seconds / claim_records if claim_records else 0.0)
-        last_progress_at = now
-        next_progress = (processed // config.run.progress_every + 1) * config.run.progress_every
+        progress.report_bottlenecks(
+            http_peak, http_average,
+            "待写库AI={}，自动判新={}，其他={}，有后续数据且前序待写库币种={}，未结束币种={}，可认领币种={}".format(
+                waiting_ai, waiting_auto, waiting_save - waiting_ai - waiting_auto,
+                waiting_frontiers, unfinished_assets, claimable_assets))
 
     def collect_results(include_unpublished=False):
         # 固定本次快照大小，准备线程持续产出也不会拖延开始写库。
@@ -193,7 +186,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         return bool(current_results)
 
     def consume():
-        nonlocal succeeded, failed, auto_new, save_calls, save_records, save_seconds
+        nonlocal succeeded, failed, auto_new
         items, stopped, seen = [], [], set()
         for message in current_results:
             if message.key not in active or message.key in seen:
@@ -219,9 +212,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         try:
             store.save_relation_batch(items)
         finally:
-            save_seconds += time.monotonic() - save_started
-            save_calls += 1
-            save_records += len(items)
+            progress.save.record(len(items), save_started)
         saved = current_results[:]
         for message in saved:
             asset = active.pop(message.key)
@@ -268,7 +259,6 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                     ready_assets.append(asset)
 
     def admit():
-        nonlocal claim_calls, claim_records, claim_seconds
         # 只限制一次认领调用的大小，不限制准备、请求和结果的总量。
         selected = []
         while ready_assets and len(selected) < 200:
@@ -285,9 +275,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         try:
             store.claim(selected, "round2", digest)
         finally:
-            claim_seconds += time.monotonic() - claim_started
-            claim_calls += 1
-            claim_records += len(selected)
+            progress.claim.record(len(selected), claim_started)
         records = [(key, build_current_record_input(key, store.df.loc[key])) for key in selected]
         for key, current in records:
             active[key] = current["asset"]
