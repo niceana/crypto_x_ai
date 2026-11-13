@@ -16,7 +16,68 @@ class NetworkTests(Fixture, unittest.TestCase):
         def create(config):
             return httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
 
-        return NetworkWorker(self.config(), client_factory=create)
+        config = self.config()
+        network = NetworkWorker(config, client_factory=create)
+        network.bind_ready_queue(queue.Queue(maxsize=config.run.ready_request_buffer_size), lambda: None)
+        return network
+
+    def enqueue(self, network, job):
+        network.ready_requests.put_nowait(self.prepare_request(network.config, job))
+        network.notify_ready()
+
+    def test_start_requires_ready_queue(self):
+        network = NetworkWorker(self.config())
+        with self.assertRaisesRegex(BatchRunError, "必须绑定就绪队列"):
+            network.start()
+        self.assertFalse(network.thread.is_alive())
+
+    def test_unencoded_ready_job_stops_before_http_and_returns_slot(self):
+        for body in (None, "not encoded"):
+            with self.subTest(body=body):
+                calls = []
+                network = self.make_network(lambda request: calls.append(request) or success())
+                try:
+                    network.start()
+                    network.ready_requests.put_nowait(RequestJob(("2021-01-01", "invalid"), "text", body=body))
+                    network.notify_ready()
+                    network.thread.join(2)
+                    self.assertFalse(network.thread.is_alive())
+                    message = network.completions.get_nowait()
+                    self.assertIs(message.error, network.failure)
+                    self.assertIsInstance(message.error, BatchRunError)
+                    self.assertEqual(message.http_attempts_started, 0)
+                    self.assertEqual(network.http_attempts_started, 0)
+                    self.assertEqual(network.http_slots._value, network.config.run.concurrency)
+                    self.assertFalse(calls)
+                    self.assertTrue(network.completions.empty())
+                finally:
+                    network.shutdown()
+
+    def test_preencoded_body_and_content_type_are_preserved_during_retry(self):
+        encoded = b'{ "already_prepared" : true }\n'
+        for content_type in ("application/json", "application/custom+json"):
+            with self.subTest(content_type=content_type):
+                self.document["api"]["headers"] = (
+                    {} if content_type == "application/json" else {"content-type": content_type})
+                calls = []
+
+                def handler(request):
+                    calls.append((request.content, request.headers["Content-Type"]))
+                    if len(calls) == 1:
+                        raise httpx.ReadTimeout("temporary", request=request)
+                    return success()
+
+                network = self.make_network(handler)
+                try:
+                    network.start()
+                    self.enqueue(network, RequestJob(("2021-01-01", "encoded"), "original input", body=encoded))
+                    message = network.completions.get(timeout=3)
+                    network.check()
+                    self.assertTrue(message.response.success)
+                    self.assertEqual(message.http_attempts_started, 2)
+                    self.assertEqual(calls, [(encoded, content_type), (encoded, content_type)])
+                finally:
+                    network.shutdown()
 
     def test_queued_jobs_obey_http_concurrency_and_keep_all_completed_results(self):
         self.document["run"]["concurrency"] = 2
@@ -47,7 +108,7 @@ class NetworkTests(Fixture, unittest.TestCase):
 
         try:
             for index in range(4):
-                ready.put_nowait(RequestJob(("2021-01-01", str(index)), str(index)))
+                self.enqueue(network, RequestJob(("2021-01-01", str(index)), str(index)))
             network.start()
             self.assertTrue(entered.wait(2))
             # 给所有已提交协程运行机会；慢调用线程不收取结果，也不额外起发 HTTP。
@@ -62,7 +123,6 @@ class NetworkTests(Fixture, unittest.TestCase):
             messages = [network.completions.get_nowait() for _ in range(4)]
             self.assertEqual({message.key[1] for message in messages}, {"0", "1", "2", "3"})
             self.assertTrue(all(message.response.success for message in messages))
-            self.assertFalse(network.unpublished)
         finally:
             release.set()
             network.shutdown()
@@ -82,8 +142,8 @@ class NetworkTests(Fixture, unittest.TestCase):
         try:
             with patch("common.network.retry_backoff", return_value=0.05):
                 network.start()
-                network.submit(RequestJob(("2021-01-01", "retry"), "retry"))
-                network.submit(RequestJob(("2021-01-01", "next"), "next"))
+                self.enqueue(network, RequestJob(("2021-01-01", "retry"), "retry"))
+                self.enqueue(network, RequestJob(("2021-01-01", "next"), "next"))
                 messages = [network.completions.get(timeout=3) for _ in range(2)]
             self.assertEqual(calls, ["retry", "next", "retry"])
             self.assertEqual({message.key[1]: message.http_attempts_started for message in messages},
@@ -107,8 +167,8 @@ class NetworkTests(Fixture, unittest.TestCase):
         ready = queue.Queue(maxsize=2)
         network.bind_ready_queue(ready, lambda: None)
         try:
-            ready.put_nowait(RequestJob(("2021-01-01", "active"), "active"))
-            ready.put_nowait(RequestJob(("2021-01-01", "waiting"), "waiting"))
+            self.enqueue(network, RequestJob(("2021-01-01", "active"), "active"))
+            self.enqueue(network, RequestJob(("2021-01-01", "waiting"), "waiting"))
             network.start()
             self.assertTrue(started.wait(2))
             network.request_stop()
@@ -126,61 +186,49 @@ class NetworkTests(Fixture, unittest.TestCase):
             network.shutdown()
 
     def test_429_pauses_all_starts_and_recovers_with_same_input(self):
-        for queued in (False, True):
-            for retry_after in (None, "invalid", "0", "1"):
-                with self.subTest(queued=queued, retry_after=retry_after):
-                    self.document["run"]["concurrency"] = 2
-                    paused = threading.Event()
-                    calls, deadlines, waits = [], [], []
+        for retry_after in (None, "invalid", "0", "1"):
+            with self.subTest(retry_after=retry_after):
+                self.document["run"]["concurrency"] = 2
+                paused = threading.Event()
+                calls, deadlines, waits = [], [], []
 
-                    def handler(request):
-                        text = request_text(request)
-                        calls.append((text, time.monotonic(), request.content))
-                        if len(calls) == 1:
-                            headers = {} if retry_after is None else {"Retry-After": retry_after}
-                            return httpx.Response(429, headers=headers)
-                        return success()
+                def handler(request):
+                    text = request_text(request)
+                    calls.append((text, time.monotonic(), request.content))
+                    if len(calls) == 1:
+                        headers = {} if retry_after is None else {"Retry-After": retry_after}
+                        return httpx.Response(429, headers=headers)
+                    return success()
 
-                    network = self.make_network(handler)
-                    ready = queue.Queue()
-                    if queued:
-                        network.bind_ready_queue(ready, lambda: None)
+                network = self.make_network(handler)
 
-                    def submit(text):
-                        job = RequestJob(("2021-01-01", text), text)
-                        if queued:
-                            ready.put_nowait(job)
-                            network.notify_ready()
-                        else:
-                            network.submit(job)
+                def pause(seconds):
+                    original_pause(seconds)
+                    waits.append(seconds)
+                    deadlines.append(network.gate.pause_until)
+                    paused.set()
 
-                    def pause(seconds):
-                        original_pause(seconds)
-                        waits.append(seconds)
-                        deadlines.append(network.gate.pause_until)
-                        paused.set()
-
-                    try:
-                        network.start()
-                        original_pause = network.gate.pause
-                        with patch("common.network.retry_backoff", return_value=0.04), \
-                                patch.object(network.gate, "pause", side_effect=pause):
-                            submit("limited")
-                            self.assertTrue(paused.wait(2))
-                            submit("next")
-                            messages = [network.completions.get(timeout=3) for _ in range(2)]
-                        network.check()
-                        self.assertEqual(waits, [1.0 if retry_after == "1" else 0.04])
-                        self.assertEqual(len(calls), 3)
-                        self.assertTrue(all(start >= deadlines[0] for _, start, _ in calls[1:]))
-                        limited = [body for text, _, body in calls if text == "limited"]
-                        self.assertEqual(limited, [calls[0][2], calls[0][2]])
-                        self.assertEqual({msg.key[1]: msg.http_attempts_started for msg in messages},
-                                         {"limited": 2, "next": 1})
-                        self.assertTrue(all(msg.response.success for msg in messages))
-                        self.assertEqual(network.http_attempts_started, 3)
-                    finally:
-                        network.shutdown()
+                try:
+                    network.start()
+                    original_pause = network.gate.pause
+                    with patch("common.network.retry_backoff", return_value=0.04), \
+                            patch.object(network.gate, "pause", side_effect=pause):
+                        self.enqueue(network, RequestJob(("2021-01-01", "limited"), "limited"))
+                        self.assertTrue(paused.wait(2))
+                        self.enqueue(network, RequestJob(("2021-01-01", "next"), "next"))
+                        messages = [network.completions.get(timeout=3) for _ in range(2)]
+                    network.check()
+                    self.assertEqual(waits, [1.0 if retry_after == "1" else 0.04])
+                    self.assertEqual(len(calls), 3)
+                    self.assertTrue(all(start >= deadlines[0] for _, start, _ in calls[1:]))
+                    limited = [body for text, _, body in calls if text == "limited"]
+                    self.assertEqual(limited, [calls[0][2], calls[0][2]])
+                    self.assertEqual({msg.key[1]: msg.http_attempts_started for msg in messages},
+                                     {"limited": 2, "next": 1})
+                    self.assertTrue(all(msg.response.success for msg in messages))
+                    self.assertEqual(network.http_attempts_started, 3)
+                finally:
+                    network.shutdown()
 
     def test_stop_during_429_pause_cancels_wait_and_releases_http_slot(self):
         self.document["run"]["concurrency"] = 1
@@ -201,7 +249,7 @@ class NetworkTests(Fixture, unittest.TestCase):
                 paused.set()
 
             with patch.object(network.gate, "pause", side_effect=pause):
-                network.submit(RequestJob(("2021-01-01", "limited"), "limited"))
+                self.enqueue(network, RequestJob(("2021-01-01", "limited"), "limited"))
                 self.assertTrue(paused.wait(2))
                 network.request_stop("external stop during rate limit")
                 network.thread.join(2)
@@ -214,6 +262,38 @@ class NetworkTests(Fixture, unittest.TestCase):
             self.assertEqual(network.http_slots._value, 1)
             self.assertIsNone(network.failure)
             self.assertTrue(network.completions.empty())
+        finally:
+            network.shutdown()
+
+    def test_stop_waiting_for_gate_does_not_count_http_or_leak_slot(self):
+        waiting = threading.Event()
+        calls = []
+
+        async def wait_for_gate():
+            waiting.set()
+            await asyncio.sleep(60)
+
+        def handler(request):
+            calls.append(request)
+            return success()
+
+        network = self.make_network(handler)
+        try:
+            network.start()
+            with patch.object(network.gate, "acquire", side_effect=wait_for_gate):
+                self.enqueue(network, RequestJob(("2021-01-01", "waiting"), "waiting"))
+                self.assertTrue(waiting.wait(2))
+                network.request_stop()
+                network.thread.join(2)
+            self.assertFalse(network.thread.is_alive())
+            message = network.completions.get_nowait()
+            self.assertTrue(message.stopped)
+            self.assertEqual(message.http_attempts_started, 0)
+            self.assertEqual(network.http_attempts_started, 0)
+            self.assertEqual(network.http_slots._value, network.config.run.concurrency)
+            self.assertFalse(calls)
+            self.assertTrue(network.completions.empty())
+            self.assertIsNone(network.failure)
         finally:
             network.shutdown()
 
@@ -236,7 +316,7 @@ class NetworkTests(Fixture, unittest.TestCase):
                 network = self.make_network(handler)
                 try:
                     network.start()
-                    network.submit(RequestJob(("2021-01-01", "limited"), "limited", lambda content: content))
+                    self.enqueue(network, RequestJob(("2021-01-01", "limited"), "limited", lambda content: content))
                     network.thread.join(2)
                     self.assertFalse(network.thread.is_alive())
                     message = network.completions.get_nowait()
@@ -267,7 +347,7 @@ class NetworkTests(Fixture, unittest.TestCase):
         try:
             with self.assertLogs("common.network", level="WARNING") as logs:
                 network.start()
-                network.submit(RequestJob(("2021-01-01", "one"), "private input", lambda content: content))
+                self.enqueue(network, RequestJob(("2021-01-01", "one"), "private input", lambda content: content))
                 message = network.completions.get(timeout=2)
             self.assertTrue(message.response.success)
             self.assertEqual(message.http_attempts_started, 2)
@@ -309,10 +389,10 @@ class NetworkTests(Fixture, unittest.TestCase):
                 with self.assertLogs("common.network", level="ERROR"):
                     try:
                         network.start()
-                        network.submit(RequestJob(("2021-01-01", "done"), "done"))
+                        self.enqueue(network, RequestJob(("2021-01-01", "done"), "done"))
                         validator = invalid_code if failure_kind == "code" else None
-                        network.submit(RequestJob(("2021-01-01", "fatal"), "fatal", validator))
-                        network.submit(RequestJob(("2021-01-01", "pending"), "pending"))
+                        self.enqueue(network, RequestJob(("2021-01-01", "fatal"), "fatal", validator))
+                        self.enqueue(network, RequestJob(("2021-01-01", "pending"), "pending"))
                         # 此前不调用 check、request_stop 或 shutdown，证明后台自行退出。
                         network.thread.join(2)
                         self.assertFalse(network.thread.is_alive())
@@ -333,11 +413,10 @@ class NetworkTests(Fixture, unittest.TestCase):
                             self.assertIsInstance(network.failure, RuntimeError)
                         self.assertTrue(network.completions.empty())
                         self.assertFalse(network.tasks)
-                        self.assertFalse(network.unpublished)
                     finally:
                         network.shutdown()
 
-    def test_external_stop_closes_and_late_submit_returns_one_stop_message(self):
+    def test_external_stop_closes_and_leaves_late_ready_job_without_http(self):
         started = threading.Event()
         requested = []
 
@@ -350,7 +429,7 @@ class NetworkTests(Fixture, unittest.TestCase):
         network = self.make_network(handler)
         try:
             network.start()
-            network.submit(RequestJob(("2021-01-01", "pending"), "pending"))
+            self.enqueue(network, RequestJob(("2021-01-01", "pending"), "pending"))
             self.assertTrue(started.wait(2))
             network.request_stop("first reason")
             network.request_stop("second reason")
@@ -358,20 +437,20 @@ class NetworkTests(Fixture, unittest.TestCase):
             self.assertFalse(network.thread.is_alive())
             self.assertTrue(network.client.is_closed)
             self.assertEqual(network.stop_reason, "first reason")
-            # 循环已经关闭，提交仍须交付一次停止消息，释放调用方的提交名额。
-            network.submit(RequestJob(("2021-01-01", "late"), "late"))
-            messages = [network.completions.get_nowait() for _ in range(2)]
-            self.assertEqual({message.key[1] for message in messages}, {"pending", "late"})
-            self.assertTrue(all(message.stopped for message in messages))
-            late = next(message for message in messages if message.key[1] == "late")
-            self.assertEqual(late.http_attempts_started, 0)
+            # 循环已关闭，新就绪任务仍留在队列中，沿用未取走任务的停止语义。
+            self.enqueue(network, RequestJob(("2021-01-01", "late"), "late"))
+            message = network.completions.get_nowait()
+            self.assertEqual(message.key[1], "pending")
+            self.assertTrue(message.stopped)
+            self.assertEqual(message.http_attempts_started, 1)
+            self.assertEqual(network.ready_requests.get_nowait().key[1], "late")
             self.assertEqual(requested, ["pending"])
             self.assertTrue(network.completions.empty())
             self.assertIsNone(network.failure)
         finally:
             network.shutdown()
 
-    def test_queued_submit_before_stop_is_reported_without_http(self):
+    def test_stop_before_queue_consumption_leaves_job_without_http(self):
         loop_blocked = threading.Event()
         release_loop = threading.Event()
         requested = []
@@ -389,15 +468,12 @@ class NetworkTests(Fixture, unittest.TestCase):
             network.start()
             network.loop.call_soon_threadsafe(block_loop)
             self.assertTrue(loop_blocked.wait(2))
-            network.submit(RequestJob(("2021-01-01", "queued"), "queued"))
+            self.enqueue(network, RequestJob(("2021-01-01", "queued"), "queued"))
             network.request_stop()
             release_loop.set()
             network.thread.join(2)
             self.assertFalse(network.thread.is_alive())
-            message = network.completions.get_nowait()
-            self.assertEqual(message.key[1], "queued")
-            self.assertTrue(message.stopped)
-            self.assertEqual(message.http_attempts_started, 0)
+            self.assertEqual(network.ready_requests.get_nowait().key[1], "queued")
             self.assertFalse(requested)
             self.assertTrue(network.completions.empty())
             self.assertIsNone(network.failure)
@@ -430,15 +506,18 @@ class NetworkTests(Fixture, unittest.TestCase):
         network = self.make_network(handler)
         job = RequestJob(("2021-01-01", "not_started"), "not_started")
 
-        def launch_and_cancel():
-            network._launch(job)
+        launch = network._launch
+
+        def launch_and_cancel(ready_job):
+            launch(ready_job)
             next(iter(network.tasks)).cancel()
             network.request_stop()
 
         try:
-            network.start()
-            network.loop.call_soon_threadsafe(launch_and_cancel)
-            network.thread.join(2)
+            with patch.object(network, "_launch", side_effect=launch_and_cancel):
+                network.start()
+                self.enqueue(network, job)
+                network.thread.join(2)
             self.assertFalse(network.thread.is_alive())
             message = network.completions.get_nowait()
             self.assertEqual(message.key, job.key)
@@ -448,6 +527,7 @@ class NetworkTests(Fixture, unittest.TestCase):
                 network.completions.get_nowait()
             self.assertFalse(requested)
             self.assertFalse(network.tasks)
+            self.assertEqual(network.http_slots._value, network.config.run.concurrency)
             self.assertIsNone(network.failure)
         finally:
             network.shutdown()

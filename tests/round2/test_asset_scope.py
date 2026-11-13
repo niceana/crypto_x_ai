@@ -29,7 +29,7 @@ class AssetScopeTests(EventFixture, unittest.TestCase):
         """用完成队列替代网络，保留请求正文校验与实际结果保存。"""
         def factory(config):
             network = SimpleNamespace(completions=queue.Queue(maxsize=config.run.concurrency),
-                                      unpublished=[], failure=None, http_attempts_started=0,
+                                      failure=None, http_attempts_started=0,
                                       start=Mock(), check=Mock(), shutdown=Mock())
 
             def submit(job):

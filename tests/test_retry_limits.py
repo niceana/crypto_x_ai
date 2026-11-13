@@ -41,9 +41,12 @@ class RetryLimitTests(Fixture, unittest.TestCase):
         network.gate = SimpleNamespace(acquire=acquire, wait_until=wait_until, pause=lambda value: None)
         network.http_slots = SimpleNamespace(acquire=acquire, release=lambda: None)
         network._record_http = lambda delta: None
-        coroutine = network._execute(RequestJob(("2021-01-01 00:00:00", "id"), "post", validate_extraction_output))
+        job = self.prepare_request(config, RequestJob(("2021-01-01 00:00:00", "id"), "post", validate_extraction_output))
+        coroutine = network._execute(job)
         try:
-            coroutine.send(None)
+            # 本测试直接驱动协程；生产中的首次名额由就绪队列调度协程预留。
+            with patch("common.network.asyncio.current_task", return_value=None):
+                coroutine.send(None)
         except StopIteration as complete:
             return complete.value, network, calls, waits
         finally:

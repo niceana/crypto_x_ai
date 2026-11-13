@@ -5,6 +5,7 @@ import tempfile
 import threading
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -13,6 +14,7 @@ import yaml
 
 from round1.runner import run_extraction
 from common.config import load_ai_config
+from common.preparation import RequestPreparer
 from common.store import read_stage_hashes
 from common.validation import TASK_COLUMNS
 
@@ -96,6 +98,13 @@ class FakeCli:
 
 
 class Fixture:
+    def prepare_request(self, config, job):
+        """用真实准备逻辑创建已编码任务，不启动线程或连接服务。"""
+        network = SimpleNamespace(stopped=threading.Event(), completions=queue.Queue(), notify_ready=lambda: None)
+        preparer = RequestPreparer(config, network)
+        preparer._prepare_request(job)
+        return preparer.ready_requests.get_nowait()
+
     def add_memory_ready_queue(self, network):
         """同步网络替身也通过真实的准备线程消费就绪队列。"""
         network.stopped = threading.Event()
@@ -106,7 +115,6 @@ class Fixture:
         def bind(requests, on_take):
             network.ready_requests = requests
             network.on_take = on_take
-            network.completions = queue.Queue()
 
         def notify():
             while not network.stopped.is_set():

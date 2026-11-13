@@ -15,8 +15,6 @@ from typing import Any, Callable, Optional, Tuple
 import httpx
 
 from common.ai_protocol import (
-    TaskRenderError,
-    render_payload,
     ParsedResponse,
     parse_response,
     request_failure,
@@ -33,7 +31,7 @@ class BatchRunError(RuntimeError):
 
 @dataclass(frozen=True)
 class RequestJob:
-    """认领确认后的不可变输入快照；原键只用于内部关联。"""
+    """认领确认后的输入快照；body 由准备线程编码，进入就绪队列时必须为 bytes。"""
 
     key: TaskKey
     text: str
@@ -50,6 +48,24 @@ class CompletionMessage:
     http_attempts_started: int = 0
     stopped: bool = False
     error: Optional[BaseException] = None
+    value: Any = None
+
+
+@dataclass
+class _JobState:
+    """记录实际起发次数及当前持有的 HTTP 名额；首次名额由调度协程预留。"""
+
+    attempts_started: int = 0
+    slot_held: bool = True
+
+
+@dataclass(frozen=True)
+class _AttemptResult:
+    """单次尝试的解析结果及后续动作，不保留原始 HTTP 响应。"""
+
+    response: ParsedResponse
+    retry: bool = False
+    delay: Optional[float] = None
     value: Any = None
 
 
@@ -139,20 +155,22 @@ class _RequestGate:
 
 
 class NetworkWorker:
-    """网络线程独占事件循环和客户端，可选从独立就绪队列按 HTTP 名额取任务。"""
+    """网络线程独占事件循环和客户端，统一从就绪队列按 HTTP 名额取任务。"""
 
     def __init__(self, config, client_factory=None, retry_after=None, log=None):
         # round1事件提取传入本轮日志对象，使共用请求日志仍归属本轮。
         self.logger = log or logger
         self.config = config
+        self._headers = httpx.Headers(config.api.headers)
+        self._headers.setdefault("Content-Type", "application/json")
         self._client_factory = client_factory or _create_client
         self._retry_after = retry_after or parse_retry_after
-        self.completions = queue.Queue(maxsize=config.run.concurrency)
+        self.completions = queue.Queue()
         self.ready_requests = None
         self._on_ready_taken = None
         self._ready_available = None
         self._reserved_slots = set()
-        self._submission_lock = threading.Lock()
+        self._control_lock = threading.Lock()
         self.stopped = threading.Event()
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._thread_main, name="ai-batch-network")
@@ -171,7 +189,6 @@ class NetworkWorker:
         self._http_changed_at = None
         self._http_occupied_seconds = 0.0
         self._http_peak = 0
-        self.unpublished = []
 
     def _record_http(self, change):
         with self._http_stats_lock:
@@ -198,11 +215,10 @@ class NetworkWorker:
             raise BatchRunError("就绪队列必须在网络启动前绑定")
         self.ready_requests = requests
         self._on_ready_taken = on_take
-        self.completions = queue.Queue()
 
     def notify_ready(self):
         """准备线程发布新请求后唤醒网络循环；启动前发布的请求由循环直接检查。"""
-        with self._submission_lock:
+        with self._control_lock:
             if (not self.stopped.is_set() and self.loop is not None
                     and self.loop.is_running() and self._ready_available is not None):
                 try:
@@ -212,8 +228,8 @@ class NetworkWorker:
 
     def request_stop(self, reason="worker 停止"):
         """阻止新起发并通知网络线程收尾；不等待线程退出。"""
-        # 与提交共用短锁，确保已接受的回调排在关闭通知之前。
-        with self._submission_lock:
+        # 与就绪通知共用短锁，确保已接受的唤醒排在关闭通知之前。
+        with self._control_lock:
             if self.stopped.is_set():
                 return
             self.stop_reason = reason
@@ -226,6 +242,8 @@ class NetworkWorker:
 
     def start(self):
         """等待客户端就绪，同时检查线程是否提前退出。"""
+        if self.ready_requests is None:
+            raise BatchRunError("网络启动前必须绑定就绪队列")
         with self._http_stats_lock:
             self._http_started_at = self._http_changed_at = time.monotonic()
         self.thread.start()
@@ -243,25 +261,17 @@ class NetworkWorker:
         if not self.thread.is_alive():
             raise BatchRunError("网络线程意外退出")
 
-    def submit(self, job):
-        # 调用线程不直接操作 asyncio.Task；实际创建发生在网络循环。
-        with self._submission_lock:
-            if not self.stopped.is_set():
-                self.loop.call_soon_threadsafe(self._launch, job)
-                return
-        # 停止后循环可能已经关闭，直接回报；发布失败时可能再次申请停止，不能持锁。
-        self._publish(CompletionMessage(job.key, stopped=True))
-
-    def _launch(self, job, first_slot=False):
+    def _launch(self, job):
+        # 仅由调度协程调用，首次 HTTP 名额已取得。
         if self.stopped.is_set():
-            if first_slot:
-                self.http_slots.release()
-            self._publish(CompletionMessage(job.key, stopped=True))
+            self.http_slots.release()
+            self.completions.put_nowait(CompletionMessage(job.key, stopped=True))
             return
-        task = self.loop.create_task(self._execute(job, first_slot))
+        if not isinstance(job.body, bytes):
+            raise BatchRunError("就绪队列只接受已编码为 bytes 的请求体")
+        task = self.loop.create_task(self._execute(job))
         self.tasks[task] = job
-        if first_slot:
-            self._reserved_slots.add(task)
+        self._reserved_slots.add(task)
         task.add_done_callback(self._completed)
 
     async def _pump_ready(self):
@@ -284,7 +294,7 @@ class NetworkWorker:
                     held = False
                     continue
                 self._on_ready_taken()
-                self._launch(job, first_slot=True)
+                self._launch(job)
                 held, job = False, None
         except asyncio.CancelledError:
             raise
@@ -292,20 +302,10 @@ class NetworkWorker:
             self.failure = error
             self.request_stop("就绪请求调度异常")
             if job is not None:
-                self._publish(CompletionMessage(job.key, error=error))
+                self.completions.put_nowait(CompletionMessage(job.key, error=error))
         finally:
             if held:
                 self.http_slots.release()
-
-    def _publish(self, message):
-        """发布一次完成消息；队列异常满时保留结果并停止，不能丢弃。"""
-        try:
-            self.completions.put_nowait(message)
-        except queue.Full:
-            self.unpublished.append(message)
-            self.failure = RuntimeError("完成队列容量不变量被破坏，结果已保留")
-            self.logger.error("完成队列容量不变量被破坏：任务=%r，未发布结果已保留", message.key)
-            self.request_stop()
 
     def _completed(self, task):
         # 协程开始前就被取消也必须发布停止消息，以释放 submitted 名额。
@@ -324,147 +324,140 @@ class NetworkWorker:
                 self.failure = exc
                 self.request_stop()
                 message = CompletionMessage(job.key, error=exc)
-        self._publish(message)
+        self.completions.put_nowait(message)
 
-    async def _execute(self, job, first_slot=False):
-        """一个作业内完成全部尝试；中间失败不发布消息或写入终态。"""
-        count = 0
-        slot_held = first_slot
-        if first_slot:
-            self._reserved_slots.discard(asyncio.current_task())
+    async def _send_once(self, job, state):
+        """仅在实际起发时计数，HTTP 结束即归还名额，校验和退避不占用。"""
+        if not state.slot_held:
+            await self.http_slots.acquire()
+            state.slot_held = True
         try:
+            await self.gate.acquire()
+            if self.stopped.is_set():
+                raise asyncio.CancelledError()
+            state.attempts_started += 1
+            self.http_attempts_started += 1
+            self.logger.debug("开始 HTTP 请求：任务=%r，尝试=%d/%d",
+                              job.key, state.attempts_started, self.config.run.max_attempts)
+            self._record_http(1)
             try:
-                headers = self.config.api.headers
-                if job.body is None:
-                    request_body = {"json": render_payload(self.config, job.text)}
-                else:
-                    headers = httpx.Headers(headers)
-                    headers.setdefault("Content-Type", "application/json")
-                    request_body = {"content": job.body}
-            except TaskRenderError as exc:
-                self.logger.warning("单任务请求构造失败：任务=%r，异常类型=%s；不发送 HTTP", job.key, type(exc).__name__)
-                return CompletionMessage(job.key, request_failure(_exception_reason(exc)))
-            while True:
-                retry = False
-                delay = None
-                value = None
+                return await self.client.post(self.config.api.url, headers=self._headers, content=job.body)
+            finally:
+                self._record_http(-1)
+        finally:
+            state.slot_held = False
+            self.http_slots.release()
+
+    async def _attempt(self, job, state):
+        """执行一次发送，将传输异常或 HTTP 响应统一为尝试结果。"""
+        try:
+            response = await self._send_once(job, state)
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            reason = _exception_reason(exc)
+            timeout_detail = ""
+            if isinstance(exc, httpx.ReadTimeout):
+                # text 已是组装好的业务输入，直接复用，不反解析 HTTP 请求体。
+                if reason != "ReadTimeout":
+                    reason = "ReadTimeout: " + reason
+                parsed = request_failure(reason, user_content=job.text)
+                timeout_detail = "，user=" + job.text
+            else:
+                parsed = request_failure(reason)
+            retry = state.attempts_started < self.config.run.max_attempts
+            self.logger.warning("网络传输故障：任务=%r，尝试=%d/%d，异常类型=%s，允许继续尝试=%s%s",
+                                job.key, state.attempts_started, self.config.run.max_attempts,
+                                type(exc).__name__, "是" if retry else "否", timeout_detail)
+            return _AttemptResult(parsed, retry=retry)
+        except _STOP_REQUEST as exc:
+            parsed = request_failure(_exception_reason(exc))
+            self.logger.error("请求异常触发整个 worker 停止：任务=%r，异常类型=%s；需要人工排查",
+                              job.key, type(exc).__name__)
+            self.request_stop(parsed.error_message)
+            return _AttemptResult(parsed)
+        except httpx.RequestError as exc:
+            self.logger.warning("单任务请求异常：任务=%r，异常类型=%s；不自动重试", job.key, type(exc).__name__)
+            return _AttemptResult(request_failure(_exception_reason(exc)))
+        # 返回前只保留解析字段，长时间退避不会保留完整 HTTP 响应。
+        return self._evaluate_response(job, response, state.attempts_started)
+
+    def _evaluate_response(self, job, response, count):
+        """解析和校验响应，沿用共用重试预算及全局暂停、停止规则。"""
+        status = response.status_code
+        is_server_failure = 500 <= status <= 599
+        is_retryable_http = status == 429 or is_server_failure
+        must_stop = (not 200 <= status < 300 and not is_retryable_http) or (
+            is_retryable_http and count >= self.config.run.max_attempts
+        )
+        if must_stop:
+            self.request_stop("HTTP {}：需要人工排查后重启".format(status))
+            self.logger.error("HTTP 失败触发整个 worker 停止：任务=%r，HTTP状态=%d，尝试=%d/%d；需要人工排查",
+                              job.key, status, count, self.config.run.max_attempts)
+        parsed = parse_response(status, response.text)
+        retry = is_retryable_http and count < self.config.run.max_attempts
+        value, delay = None, None
+        if job.validate_output is not None and 200 <= status < 300:
+            if parsed.success:
                 try:
-                    # 每次起发单独取名额，HTTP 返回或抛错即释放；校验、退避和写库不占用。
-                    if not slot_held:
-                        await self.http_slots.acquire()
-                        slot_held = True
-                    try:
-                        await self.gate.acquire()
-                        if self.stopped.is_set():
-                            raise asyncio.CancelledError()
-                        # 网络故障、429 与 5xx 共用实际起发计数，不按错误类型拆分预算。
-                        count += 1
-                        self.http_attempts_started += 1
-                        self.logger.debug("开始 HTTP 请求：任务=%r，尝试=%d/%d", job.key, count, self.config.run.max_attempts)
-                        self._record_http(1)
-                        try:
-                            response = await self.client.post(self.config.api.url, headers=headers, **request_body)
-                        finally:
-                            self._record_http(-1)
-                    finally:
-                        slot_held = False
-                        self.http_slots.release()
-                except RETRYABLE_NETWORK_ERRORS as exc:
-                    reason = _exception_reason(exc)
-                    timeout_detail = ""
-                    if isinstance(exc, httpx.ReadTimeout):
-                        # text 已是组装好的业务输入，直接复用，不反解析 HTTP 请求体。
-                        user_content = job.text
-                        if reason != "ReadTimeout":
-                            reason = "ReadTimeout: " + reason
-                        parsed = request_failure(reason, user_content=user_content)
-                        timeout_detail = "，user=" + user_content
-                    else:
-                        parsed = request_failure(reason)
-                    retry = count < self.config.run.max_attempts
-                    self.logger.warning("网络传输故障：任务=%r，尝试=%d/%d，异常类型=%s，允许继续尝试=%s%s",
-                                   job.key, count, self.config.run.max_attempts, type(exc).__name__,
-                                   "是" if retry else "否", timeout_detail)
-                except _STOP_REQUEST as exc:
-                    parsed = request_failure(_exception_reason(exc))
-                    self.logger.error("请求异常触发整个 worker 停止：任务=%r，异常类型=%s；需要人工排查",
-                                 job.key, type(exc).__name__)
-                    self.request_stop(parsed.error_message)
-                except httpx.RequestError as exc:
-                    self.logger.warning("单任务请求异常：任务=%r，异常类型=%s；不自动重试", job.key, type(exc).__name__)
-                    parsed = request_failure(_exception_reason(exc))
-                else:
-                    status = response.status_code
-                    is_server_failure = 500 <= status <= 599
-                    is_retryable_http = status == 429 or is_server_failure
-                    must_stop = (not 200 <= status < 300 and not is_retryable_http) or (
-                        is_retryable_http and count >= self.config.run.max_attempts
-                    )
-                    if must_stop:
-                        self.request_stop("HTTP {}：需要人工排查后重启".format(status))
-                        self.logger.error("HTTP 失败触发整个 worker 停止：任务=%r，HTTP状态=%d，尝试=%d/%d；需要人工排查",
-                                     job.key, status, count, self.config.run.max_attempts)
-                    parsed = parse_response(status, response.text)
-                    retry = is_retryable_http and count < self.config.run.max_attempts
-                    # 三轮都提供各自的正文校验；无效输出与网络重试共用本任务预算。
-                    if job.validate_output is not None and 200 <= status < 300:
-                        if parsed.success:
-                            try:
-                                value = job.validate_output(parsed.ai_response_content)
-                            except OutputValidationError as exc:
-                                parsed = replace(parsed, success=False,
-                                                 error_message=str(exc)[:512])
-                        if not parsed.success:
-                            retry = count < self.config.run.max_attempts
-                    if retry and not self.stopped.is_set():
-                        if status == 429:
-                            delay = retry_backoff(self.config.run, count)
-                            waiting = self._retry_after(response.headers.get("Retry-After"))
-                            # 没有有效服务端等待时也暂停全部起发，避免新任务继续冲击限流。
-                            waiting = max(delay, waiting or 0)
-                            self.logger.warning("接口返回 429 限流，准备重试：任务=%r，尝试=%d/%d，全局等待=%.3f秒",
-                                                job.key, count, self.config.run.max_attempts, waiting)
-                            self.gate.pause(waiting)
-                        elif is_server_failure:
-                            self.logger.warning("接口返回 5xx，准备重试：任务=%r，HTTP状态=%d，尝试=%d/%d",
-                                           job.key, status, count, self.config.run.max_attempts)
-                            waiting = self._retry_after(response.headers.get("Retry-After"))
-                            if waiting is not None:
-                                self.gate.pause(waiting)
-                        else:
-                            self.logger.warning("业务输出无效，准备重试：任务=%r，尝试=%d/%d，原因=%s",
-                                           job.key, count, self.config.run.max_attempts, parsed.error_message)
-                    # 退避可能较长，等待前释放完整响应，仅保留必要解析字段。
-                    del response
-                if parsed.success or not retry:
+                    value = job.validate_output(parsed.ai_response_content)
+                except OutputValidationError as exc:
+                    parsed = replace(parsed, success=False, error_message=str(exc)[:512])
+            if not parsed.success:
+                retry = count < self.config.run.max_attempts
+        if retry and not self.stopped.is_set():
+            if status == 429:
+                delay = retry_backoff(self.config.run, count)
+                waiting = self._retry_after(response.headers.get("Retry-After"))
+                # 没有有效服务端等待时也暂停全部起发，避免新任务继续冲击限流。
+                waiting = max(delay, waiting or 0)
+                self.logger.warning("接口返回 429 限流，准备重试：任务=%r，尝试=%d/%d，全局等待=%.3f秒",
+                                    job.key, count, self.config.run.max_attempts, waiting)
+                self.gate.pause(waiting)
+            elif is_server_failure:
+                self.logger.warning("接口返回 5xx，准备重试：任务=%r，HTTP状态=%d，尝试=%d/%d",
+                                    job.key, status, count, self.config.run.max_attempts)
+                waiting = self._retry_after(response.headers.get("Retry-After"))
+                if waiting is not None:
+                    self.gate.pause(waiting)
+            else:
+                self.logger.warning("业务输出无效，准备重试：任务=%r，尝试=%d/%d，原因=%s",
+                                    job.key, count, self.config.run.max_attempts, parsed.error_message)
+        return _AttemptResult(parsed, retry=retry, delay=delay, value=value)
+
+    async def _execute(self, job):
+        """管理一个作业的尝试预算和退避；仅返回一次最终完成消息。"""
+        state = _JobState()
+        self._reserved_slots.discard(asyncio.current_task())
+        try:
+            while True:
+                result = await self._attempt(job, state)
+                parsed, count = result.response, state.attempts_started
+                if parsed.success or not result.retry:
                     if parsed.success:
                         self.logger.debug("单任务请求成功：任务=%r，实际尝试=%d", job.key, count)
                     else:
-                        # 2xx 下的响应与正文校验失败提供具体原因；HTTP 或传输错误
-                        # 仍沿用原日志口径，外部接口和网络异常说明保存在任务表。
                         detail = ("，原因=" + parsed.error_message
                                   if parsed.http_status is not None and 200 <= parsed.http_status < 300 else "")
                         self.logger.warning("单任务请求最终失败：任务=%r，HTTP状态=%s，实际尝试=%d%s",
-                                       job.key, parsed.http_status, count, detail)
-                    return CompletionMessage(job.key, parsed, count, value=value)
+                                            job.key, parsed.http_status, count, detail)
+                    return CompletionMessage(job.key, parsed, count, value=result.value)
                 if self.stopped.is_set():
                     raise asyncio.CancelledError()
-                if delay is None:
-                    delay = retry_backoff(self.config.run, count)
+                delay = result.delay if result.delay is not None else retry_backoff(self.config.run, count)
                 self.logger.warning("请求重试退避：任务=%r，下次尝试=%d/%d，本地等待=%.3f秒",
-                               job.key, count + 1, self.config.run.max_attempts, delay)
+                                    job.key, count + 1, self.config.run.max_attempts, delay)
                 await self.gate.wait_until(time.monotonic() + delay)
         except asyncio.CancelledError:
-            self.logger.debug("作业因整个 worker 停止而结束：任务=%r，已起发=%d；无最终响应时保留状态 9", job.key, count)
-            return CompletionMessage(job.key, http_attempts_started=count, stopped=True)
+            self.logger.debug("作业因整个 worker 停止而结束：任务=%r，已起发=%d；无最终响应时保留状态 9",
+                              job.key, state.attempts_started)
+            return CompletionMessage(job.key, http_attempts_started=state.attempts_started, stopped=True)
         except Exception as exc:
             self.failure = exc
             self.request_stop()
             self.logger.error("网络作业发生批次异常：任务=%r，异常类型=%s", job.key, type(exc).__name__)
-            return CompletionMessage(job.key, http_attempts_started=count, error=exc)
+            return CompletionMessage(job.key, http_attempts_started=state.attempts_started, error=exc)
         finally:
-            # 构造失败、停止或首次起发前取消都必须释放已预留的名额。
-            if slot_held:
+            # 首次起发前取消或异常时，归还已接管的预留名额。
+            if state.slot_held:
                 self.http_slots.release()
 
     async def _serve(self):
@@ -480,8 +473,7 @@ class NetworkWorker:
             try:
                 # 初始化前收到停止时，通知可能还无法投递，直接进入收尾。
                 if not self.stopped.is_set():
-                    if self.ready_requests is not None:
-                        pump = self.loop.create_task(self._pump_ready())
+                    pump = self.loop.create_task(self._pump_ready())
                     await self.shutdown_event.wait()
             finally:
                 if pump is not None:

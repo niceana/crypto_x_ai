@@ -18,7 +18,7 @@ from common.persistence import BatchPersistenceError, TaskValidationError
 from common.network import BatchRunError, CompletionMessage
 from round1.runner import run_extraction, _month_ranges, _NetworkWorker, _retry_after
 from common.config import ai_config_hash
-from common.ai_protocol import parse_response, render_payload
+from common.ai_protocol import parse_response
 from common.execution import SegmentCoordinator as _MonthCoordinator
 from common.store import PostTaskStore
 from tests.support import (
@@ -49,7 +49,6 @@ class RunnerTests(Fixture, unittest.TestCase):
             def __init__(self, config, **kwargs):
                 self.config = config
                 self.completions = queue.Queue()
-                self.unpublished = []
                 self.failure = None
                 self.http_attempts_started = 0
 
@@ -66,8 +65,7 @@ class RunnerTests(Fixture, unittest.TestCase):
                 return 0, 0, 0.0
 
             def submit(self, job):
-                request = httpx.Request("POST", self.config.api.url,
-                                        json=render_payload(self.config, job.text))
+                request = httpx.Request("POST", self.config.api.url, content=job.body)
                 response = parse_response(200, handler(request).text)
                 job.validate_output(response.ai_response_content)
                 self.http_attempts_started += 1
@@ -989,7 +987,7 @@ class RunnerTests(Fixture, unittest.TestCase):
             batch = store.select(20)
             store.claim(batch)
             keys.extend(batch)
-        network = SimpleNamespace(completions=queue.Queue(20), unpublished=[])
+        network = SimpleNamespace(completions=queue.Queue())
         coordinator = _MonthCoordinator(store.config.run, network, store.candidates,
                                         None, store.save_results)
         response = parse_response(200, success().text)
@@ -1045,7 +1043,7 @@ class RunnerTests(Fixture, unittest.TestCase):
         store.recover()
         keys = store.select(3)
         store.claim(keys)
-        network = SimpleNamespace(completions=queue.Queue(), unpublished=[])
+        network = SimpleNamespace(completions=queue.Queue())
         coordinator = _MonthCoordinator(store.config.run, network, store.candidates, None, store.save_results)
         response = parse_response(200, success().text)
         coordinator.buffer = [(key, response) for key in keys[:2]]
@@ -1137,6 +1135,7 @@ class RunnerTests(Fixture, unittest.TestCase):
 
     def test_real_client_startup_and_close_without_http_request(self):
         network = _NetworkWorker(self.config())
+        network.bind_ready_queue(queue.Queue(), lambda: None)
         try:
             network.start()
         finally:

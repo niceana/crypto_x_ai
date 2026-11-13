@@ -381,7 +381,7 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                                 ("2021-01-02", "bbb-next", ["BBB"], "a"),
                                 ("2021-01-02", "ccc-next", ["CCC"], "a")])
         keys = {row["event"]: key for key, row in backend.tables["result"].iterrows()}
-        network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+        network = SimpleNamespace(completions=queue.Queue(), failure=None,
                                   http_attempts_started=0, start=lambda: None, shutdown=lambda: None)
         first_ready = threading.Event()
         claims, saves, histories = [], [], {}
@@ -534,25 +534,29 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
         self.assertEqual([response["attempts"] for response in responses], [2, 1])
 
     def test_relation_storage_failure_retains_current_and_other_answers_without_more_writes(self):
-        for remaining_location in ("queue", "unpublished"):
+        for remaining_location in ("batch", "queue"):
             with self.subTest(remaining_location=remaining_location):
                 backend = self.backend([("2021-01-01", "one", ["ETH"], "a"),
                                         ("2021-01-01", "two", ["ETH"], "a"),
                                         ("2021-01-02", "later", ["ETH"], "a")])
-                network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+                network = SimpleNamespace(completions=queue.Queue(), failure=None,
                                           http_attempts_started=0, start=lambda: None, check=lambda: None)
                 all_submitted = threading.Event()
+                finishing_results = []
                 def submit(job):
                     network.http_attempts_started += 1
                     message = CompletionMessage(job.key, parse_response(200, success(json.dumps(new_result())).text),
                                                 1, value=job.validate_output(json.dumps(new_result())))
-                    if remaining_location == "unpublished" and network.http_attempts_started == 2:
-                        network.unpublished.append(message)
+                    if remaining_location == "queue" and network.http_attempts_started == 2:
+                        finishing_results.append(message)
                     else:
                         network.completions.put_nowait(message)
                     if network.http_attempts_started == 2:
                         all_submitted.set()
                 def shutdown():
+                    # 模拟写库期间返回的答复，关闭后仍保留在同一个完成队列中。
+                    for message in finishing_results:
+                        network.completions.put_nowait(message)
                     network.failure = RuntimeError("close failed too")
                 network.submit, network.shutdown = submit, shutdown
                 self.add_memory_ready_queue(network)
@@ -581,13 +585,12 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(network.http_attempts_started, 2)
                 self.assertEqual(list(backend.tables["result"]["round2_status"]), ["9", "9", "0"])
                 current = caught.exception.unsaved_results
-                self.assertEqual(len(current), 2 if remaining_location == "queue" else 1)
+                self.assertEqual(len(current), 2 if remaining_location == "batch" else 1)
                 self.assertTrue(all(len(frame) == len(current) for frame in final_calls))
                 self.assertEqual(current[0].value,
                                  {"event_relation": "new", "matched_event_id": None, "new_information": None})
                 self.assertEqual(current[0].response.ai_response_content, json.dumps(new_result()))
-                self.assertEqual(caught.exception.completed_results.qsize()
-                                 + len(caught.exception.unpublished_results), 0 if remaining_location == "queue" else 1)
+                self.assertEqual(caught.exception.completed_results.qsize(), 0 if remaining_location == "batch" else 1)
                 self.assertEqual(len(backend.reads), 2)
                 expected_response = json.loads(final_calls[0].iloc[0]["round2_ai_response"])
                 expected_response.pop("created")
@@ -599,14 +602,15 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                     pd.testing.assert_frame_equal(frame.drop(columns="round2_ai_response"),
                                                   final_calls[0].drop(columns="round2_ai_response"))
 
-    def test_relation_stop_finishes_answers_and_preserves_failure_during_unpublished_save(self):
+    def test_relation_stop_finishes_queued_answers_and_preserves_save_failure(self):
         for fail_save in (False, True):
             with self.subTest(fail_save=fail_save):
                 backend = self.backend([("2021-01-01", "one", ["ETH"], "a"),
                                         ("2021-01-01", "two", ["ETH"], "a")])
-                network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+                network = SimpleNamespace(completions=queue.Queue(), failure=None,
                                           http_attempts_started=0, start=lambda: None, shutdown=lambda: None)
                 all_submitted = threading.Event()
+                finishing_results = []
                 stop = BatchRunError("network stopped")
                 def submit(job):
                     network.http_attempts_started += 1
@@ -615,13 +619,16 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                     if network.http_attempts_started == 1:
                         network.completions.put_nowait(message)
                     else:
-                        network.unpublished.append(message)
+                        finishing_results.append(message)
                     if network.http_attempts_started == 2:
                         all_submitted.set()
                 def check():
                     if network.http_attempts_started == 2 and final_calls:
                         raise stop
-                network.submit, network.check = submit, check
+                def shutdown():
+                    for message in finishing_results:
+                        network.completions.put_nowait(message)
+                network.submit, network.check, network.shutdown = submit, check, shutdown
                 self.add_memory_ready_queue(network)
                 final_calls = []
                 def update(path, frame):
@@ -639,7 +646,6 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(list(backend.tables["result"]["round2_status"]), ["1", "9" if fail_save else "1"])
                 self.assertEqual(len(caught.exception.unsaved_results), 1 if fail_save else 0)
                 self.assertEqual(caught.exception.completed_results.qsize(), 0)
-                self.assertEqual(caught.exception.unpublished_results, [])
                 if fail_save:
                     self.assertIs(caught.exception.__cause__, stop)
                     self.assertIn("second answer not written", str(caught.exception.__context__))

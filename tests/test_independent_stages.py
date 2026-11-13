@@ -34,7 +34,6 @@ class ImmediateNetwork:
     def __init__(self, captured):
         self.captured = captured
         self.completions = queue.Queue()
-        self.unpublished = []
         self.failure = None
         self.stopped = threading.Event()
         self.http_attempts_started = 0

@@ -22,7 +22,7 @@ from tests.support import FakeCli, event_content, success, tasks
 
 def memory_network(content, failed_keys=()):
     """请求仍执行真实响应解析与业务校验，不创建线程、事件循环或连接。"""
-    network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+    network = SimpleNamespace(completions=queue.Queue(), failure=None,
                               http_attempts_started=0, start=lambda: None,
                               shutdown=lambda: None, check=lambda: None,
                               http_snapshot=lambda: (0, 2, 1.25))
@@ -64,7 +64,7 @@ class ProgressTests(unittest.TestCase):
         coordinator.buffer = [(1, response)]
         network.completions.put_nowait(CompletionMessage(2, response, 1))
         network.completions.put_nowait(CompletionMessage(3, stopped=True))
-        network.unpublished.append(CompletionMessage(4, response, 1))
+        network.completions.put_nowait(CompletionMessage(4, response, 1))
         with self.assertLogs("test.progress", level="INFO") as logs:
             coordinator.report_progress(force=True)
         output = "\n".join(logs.output)

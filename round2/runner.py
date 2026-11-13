@@ -143,7 +143,6 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         with network.completions.mutex:
             waiting_results = list(network.completions.queue)
         waiting_results.extend(current_results)
-        waiting_results.extend(network.unpublished)
         waiting_save = len(waiting_results)
         waiting_auto = sum(isinstance(message, AutoNewResult) for message in waiting_results)
         waiting_ai = sum(not isinstance(message, AutoNewResult) and message.response is not None
@@ -172,7 +171,7 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                 waiting_ai, waiting_auto, waiting_save - waiting_ai - waiting_auto,
                 waiting_frontiers, unfinished_assets, claimable_assets))
 
-    def collect_results(include_unpublished=False):
+    def collect_results():
         # 固定本次快照大小，准备线程持续产出也不会拖延开始写库。
         # 出队后立即留在当前批中，失败或中断时保留整批原消息。
         for _ in range(network.completions.qsize()):
@@ -180,9 +179,6 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                 current_results.append(network.completions.get_nowait())
             except queue.Empty:
                 break
-        if include_unpublished:
-            current_results.extend(network.unpublished)
-            network.unpublished.clear()
         return bool(current_results)
 
     def consume():
@@ -235,13 +231,12 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                                store.df.at[message.key, "asset"], message.key[1])
 
     def finish():
-        if collect_results(include_unpublished=True):
+        if collect_results():
             consume()
 
     def retain_unsaved(error):
         error.unsaved_results = current_results
         error.completed_results = network.completions
-        error.unpublished_results = network.unpublished
 
     def advance():
         # 相同时间允许共同并发，全部落库后才加入历史，避免用同刻答复互相匹配。

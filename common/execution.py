@@ -123,7 +123,6 @@ class SegmentCoordinator:
             return
         with self.network.completions.mutex:
             waiting = sum(message.response is not None for message in self.network.completions.queue)
-        waiting += sum(message.response is not None for message in self.network.unpublished)
         waiting += len(self.buffer)
         http_in_flight, http_peak, http_average = self.network.http_snapshot()
         preparation_state, pending_preparation = self.preparer.snapshot() if self.preparer else ("未启动", 0)
@@ -253,8 +252,6 @@ class SegmentCoordinator:
             self.flush()
         while not self.network.completions.empty():
             self.consume(self.network.completions.get_nowait())
-        while self.network.unpublished:
-            self.consume(self.network.unpublished.pop(0))
         self.flush()
 
 
@@ -264,7 +261,6 @@ def _retain_unsaved(error, coordinator, network):
         error.unsaved_results = coordinator.buffer
     if network is not None:
         error.completed_results = network.completions
-        error.unpublished_results = network.unpublished
 
 
 def run_segments(ranges, load_segment, summary, network_factory,

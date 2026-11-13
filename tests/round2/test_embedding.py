@@ -20,7 +20,7 @@ from common.config import (
     load_event_config,
 )
 from common.event_context import EventHistory
-from common.ai_protocol import parse_response, render_payload
+from common.ai_protocol import parse_response
 from common.network import CompletionMessage
 from common.persistence import BatchPersistenceError
 from common.store import EventRecordStore
@@ -59,12 +59,11 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
     def factory(self, handler):
         """业务集成使用内存完成队列；HTTP 并发另由网络专用测试覆盖。"""
         def create(config):
-            network = SimpleNamespace(completions=queue.Queue(), unpublished=[], failure=None,
+            network = SimpleNamespace(completions=queue.Queue(), failure=None,
                                       http_attempts_started=0, start=lambda: None,
                                       shutdown=lambda: None, check=lambda: None)
             def submit(job):
-                body = job.body or json.dumps(render_payload(config, job.text)).encode("utf-8")
-                response = handler(httpx.Request("POST", config.api.url, content=body))
+                response = handler(httpx.Request("POST", config.api.url, content=job.body))
                 parsed = parse_response(response.status_code, response.text)
                 value = job.validate_output(parsed.ai_response_content) if job.validate_output else None
                 network.http_attempts_started += 1
