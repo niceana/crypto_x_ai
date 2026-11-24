@@ -26,6 +26,16 @@ EVENT_RELATIONS = ("new", "update", "repeat")
 SOURCE_COLUMNS = ["asset", "event_relation", "round3_ai_response", "round2_status", "round3_status"]
 
 
+def skipped_weight_events(results):
+    """返回权重跳过的原始事件；两轮状态必须同时为字符串 1 才参与评分。"""
+    validate_index(results, "record_id")
+    missing = {"asset", "round2_status", "round3_status"} - set(results.columns)
+    if missing:
+        raise ValueError("结果表缺少字段：{}".format(sorted(missing)))
+    successful = results["round2_status"].eq("1") & results["round3_status"].eq("1")
+    return results.loc[~successful.fillna(False)].copy()
+
+
 def _parse_impact(raw_response):
     envelope = json.loads(raw_response)
     if not isinstance(envelope, dict):
@@ -67,6 +77,11 @@ def parse_weight_features(results):
                                           "execution_stage", "persistence", "event_relation"])
     logger.info("权重特征解析完成：参与事件=%d，跳过未成功事件=%d，全部使用本条已保存响应",
                 len(features), len(results) - len(features))
+    if len(features) < len(results):
+        skipped = skipped_weight_events(results)
+        counts = (skipped.groupby(["asset", "round2_status", "round3_status"], dropna=False)
+                  .size().rename("events").reset_index())
+        logger.info("权重跳过事件按资产及两轮状态统计：%s", counts.to_dict(orient="records"))
     return features
 
 
@@ -107,12 +122,49 @@ def build_basic_df(results, parameters=None):
     return score_weight_features(parse_weight_features(results), parameters)
 
 
-def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method="sum"):
-    """按 [T-75分钟, T-15分钟) 聚合到整点 T，补零；并列取最早发布、同刻取首条。"""
+def normalize_weight_assets(assets):
+    """与实盘一致：接受币名或完整资产名，保留传入顺序，拒绝重复币名。"""
+    if isinstance(assets, (str, bytes, dict, set)):
+        raise ValueError("assets 必须为有序的资产数组")
+    try:
+        values = list(assets)
+    except TypeError as exc:
+        raise ValueError("assets 必须为有序的资产数组") from exc
+    columns = {}
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("assets 的每项必须为非空字符串")
+        column = value.strip().upper()
+        asset = column.split(".", 1)[0]
+        if not asset or asset in columns:
+            raise ValueError("assets 的币名不能为空或重复：{}".format(asset))
+        columns[asset] = column if "." in column else column + ASSET_SUFFIX
+    if not columns:
+        raise ValueError("assets 不能为空")
+    return columns
+
+
+def load_weight_assets(cli, asset_list_path):
+    """权重入口读取一次 InstrumentList，保留实盘宿主传入数组的顺序和列名。"""
+    if not isinstance(asset_list_path, str) or not asset_list_path.strip():
+        raise ValueError("权重入口必须配置 round2_asset_list_path，或显式传入 assets")
+    document = json.loads(cli.read_object(asset_list_path).decode("utf-8"))
+    if not isinstance(document, dict) or "InstrumentList" not in document:
+        raise ValueError("资产名单必须包含 InstrumentList")
+    return list(normalize_weight_assets(document["InstrumentList"]).values())
+
+
+def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method="sum", assets=None):
+    """按 [T-75分钟, T-15分钟) 聚合到整点 T；传 assets 时固定列及顺序，无信号补零。"""
     validate_aggregation_method(aggregation_method)
-    if basic_df.empty:
+    columns = normalize_weight_assets(assets) if assets is not None else None
+    if columns is not None:
+        basic_df = basic_df.loc[basic_df["asset"].isin(columns)]
+    if basic_df.empty and (columns is None or end_time is None):
         raise ValueError("结果表没有事件，无法确定权重表的资产列及结束时间")
-    assets = sorted(basic_df["asset"].unique())
+    output_assets = list(columns) if columns is not None else sorted(basic_df["asset"].unique())
+    if columns is None:
+        columns = {asset: asset + ASSET_SUFFIX for asset in output_assets}
     # [16:45, 17:45) 的事件统一计入 18:00；17:45 归入 19:00。
     published_at = pd.to_datetime(basic_df["date"], format="ISO8601")
     target_hours = event_target_hours(published_at)
@@ -121,6 +173,8 @@ def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method
     if begin > end:
         raise ValueError("权重时间轴起点不能晚于终点")
     hours = pd.date_range(begin, end, freq="h", name="date")
+    if basic_df.empty:
+        return pd.DataFrame(0.0, index=hours, columns=list(columns.values()))
     data = basic_df["data"].astype("float64", copy=False)
     if not np.isfinite(data.to_numpy()).all():
         raise ValueError("basic_df.data 包含非有限值")
@@ -135,10 +189,10 @@ def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method
         aggregated = events.loc[selected].set_index(["date", "asset"])["data"]
     hourly = aggregated.unstack("asset", fill_value=0.0)
     # 聚合、补零及写库均保留 float64；date 单独保留为 DatetimeIndex。
-    weight_data = hourly.reindex(index=hours, columns=assets, fill_value=0.0).astype("float64")
+    weight_data = hourly.reindex(index=hours, columns=output_assets, fill_value=0.0).astype("float64")
     if not np.isfinite(weight_data.to_numpy()).all():
         raise ValueError("小时权重聚合结果出现非有限值或数值溢出")
-    weight_data = weight_data.rename(columns={asset: asset + ASSET_SUFFIX for asset in assets})
+    weight_data = weight_data.rename(columns=columns)
     weight_data.columns.name = None
     return weight_data
 
@@ -158,15 +212,16 @@ def _validate_weight_request(result_path, weight_path, start_time, end_time):
         raise ValueError("start_time 不能晚于 end_time")
 
 
-def _column_comparison(results, columns):
-    """直接从源表 asset 原值生成预期列名，供写入检查和已有表核对。"""
-    assets = sorted(results["asset"].unique())
-    expected = [asset + ASSET_SUFFIX for asset in assets]
+def _column_comparison(results, columns, *, assets=None):
+    """优先按外部资产名单核对列名及顺序；兼容未传名单的内存调用。"""
+    source_assets = sorted(results["asset"].unique())
+    expected = (list(normalize_weight_assets(assets).values()) if assets is not None else
+                [asset + ASSET_SUFFIX for asset in source_assets])
     actual = list(columns)
-    return {"source_assets": assets, "expected_columns": expected, "actual_columns": actual,
+    return {"source_assets": source_assets, "expected_columns": expected, "actual_columns": actual,
             "unexpected_columns": sorted(set(actual) - set(expected), key=str),
             "missing_columns": sorted(set(expected) - set(actual)),
-            "columns_unique": columns.is_unique}
+            "columns_unique": columns.is_unique, "column_order_matches": actual == expected}
 
 
 def read_weight_events(cli, result_path, start_time, end_time, *, columns, label):
@@ -180,21 +235,7 @@ def read_weight_events(cli, result_path, start_time, end_time, *, columns, label
     return results.loc[(dates >= begin) & (dates < end)].copy()
 
 
-def audit_weight_columns(cli, result_path, weight_path, *, start_time, end_time):
-    """只读比较配置范围内源表 asset 与已有权重表列名，不解析回答或写库。"""
-    _validate_weight_request(result_path, weight_path, start_time, end_time)
-    results = read_weight_events(cli, result_path, start_time, end_time,
-                                columns=["asset"], label="权重列名核对来源读取")
-    if any(not isinstance(asset, str) or not asset.strip() for asset in results["asset"]):
-        raise ValueError("asset 必须为非空字符串")
-    stored = cli.read(weight_path, start_time=start_time, end_time=end_time)
-    if not isinstance(stored, pd.DataFrame):
-        raise ValueError("权重表读取结果必须为 DataFrame")
-    return dict(_column_comparison(results, stored.columns), result_path=result_path, weight_path=weight_path,
-                start_time=start_time, end_time=end_time, source_rows=len(results))
-
-
-def _save_weight_data(cli, weight_path, weight_data):
+def _save_weight_data(cli, weight_path, weight_data, *, fixed_columns=False):
     """首次建表；已有表更新重叠行并追加新索引，保留范围外数据。"""
     missing = False
     try:
@@ -223,7 +264,15 @@ def _save_weight_data(cli, weight_path, weight_data):
         raise ValueError("已有权重表必须为唯一的 date 整点 DatetimeIndex，列名也须唯一")
     existing = existing.sort_index()
     new_columns = weight_data.columns.difference(existing.columns, sort=False)
-    columns = existing.columns.union(weight_data.columns, sort=False).sort_values()
+    if fixed_columns:
+        unexpected_columns = existing.columns.difference(weight_data.columns, sort=False)
+        if len(unexpected_columns):
+            raise ValueError("已有权重表含 assets 名单外的资产列，请使用新的 weight_path；"
+                             "名单外列={}".format(list(unexpected_columns)))
+        # 按列名对齐即可；已有表保留原顺序，返回值按 assets 排列。
+        columns = weight_data.columns
+    else:
+        columns = existing.columns.union(weight_data.columns, sort=False).sort_values()
     batch = weight_data.reindex(columns=columns, fill_value=0.0)
     existing = existing.reindex(columns=columns, fill_value=0.0)
     # 新资产历史上没有列，先按列补浮点零，避免历史行因扩列出现空值。
@@ -240,35 +289,41 @@ def _save_weight_data(cli, weight_path, weight_data):
     return batch
 
 
-def _write_weight_features(cli, features, result_path, weight_path, *, start_time, end_time, parameters):
+def _write_weight_features(cli, features, result_path, weight_path, *, start_time, end_time, parameters, assets=None):
     """保存一个组合，网格调用方复用同一份已解析特征。"""
     basic_df = score_weight_features(features, parameters)
     weight_data = build_weight_data(basic_df, start_time=start_time, end_time=end_time,
-                                    aggregation_method=parameters.aggregation_method)
-    comparison = _column_comparison(features, weight_data.columns)
-    if comparison["unexpected_columns"] or comparison["missing_columns"] or not comparison["columns_unique"]:
-        raise ValueError("权重列名与源表 asset 不一致：多出={}，缺少={}，列名唯一={}".format(
-            comparison["unexpected_columns"], comparison["missing_columns"], comparison["columns_unique"]))
-    logger.info("权重列名来源核对通过：result_path=%s，weight_path=%s，asset去重原值=%s",
-                result_path, weight_path, comparison["source_assets"])
+                                    aggregation_method=parameters.aggregation_method, assets=assets)
+    comparison = _column_comparison(features, weight_data.columns, assets=assets)
+    if (comparison["unexpected_columns"] or comparison["missing_columns"] or not comparison["columns_unique"]
+            or not comparison["column_order_matches"]):
+        raise ValueError("权重列名或顺序与预期不一致：多出={}，缺少={}，列名唯一={}，顺序一致={}".format(
+            comparison["unexpected_columns"], comparison["missing_columns"], comparison["columns_unique"],
+            comparison["column_order_matches"]))
+    logger.info("权重列名来源核对通过：result_path=%s，weight_path=%s，asset去重原值=%s，输出列=%s",
+                result_path, weight_path, comparison["source_assets"], comparison["expected_columns"])
     # 完成评分、聚合和补零后，仅平移最终索引。
     # 先平移再与已有表对齐，避免续写重复加时或破坏上一批边界值。
     weight_data.index = weight_data.index + pd.Timedelta(hours=OUTPUT_TIME_OFFSET_HOURS)
     logger.info("权重表计算完成：聚合=%s，小时=%d，资产=%d，起点=%s，终点=%s",
                 parameters.aggregation_method, len(weight_data), len(weight_data.columns),
                 weight_data.index[0], weight_data.index[-1])
-    saved = _save_weight_data(cli, weight_path, weight_data)
+    saved = _save_weight_data(cli, weight_path, weight_data, fixed_columns=assets is not None)
     logger.info("权重表已保存：%s", weight_path)
     return saved
 
 
-def write_weight_data(cli, result_path, weight_path, *, start_time, end_time, parameters=None):
-    """单组合读取及续写接口；网格入口为每个组合自动分配独立表路径。"""
+def write_weight_data(cli, result_path, weight_path, *, start_time, end_time, parameters=None, assets=None):
+    """单组合读取及续写；传 assets 时在解析前筛选事件，并固定输出列及顺序。"""
     _validate_weight_request(result_path, weight_path, start_time, end_time)
+    if assets is not None:
+        assets = list(normalize_weight_assets(assets).values())
     logger.info("权重来源读取：起点=%s，终点=%s", start_time, end_time)
     results = read_weight_events(cli, result_path, start_time, end_time,
                                 columns=SOURCE_COLUMNS, label="权重来源读取")
+    if assets is not None:
+        results = results.loc[results["asset"].isin(normalize_weight_assets(assets))]
     features = parse_weight_features(results)
     parameters = WeightParameters() if parameters is None else parameters
     return _write_weight_features(cli, features, result_path, weight_path, start_time=start_time,
-                                  end_time=end_time, parameters=parameters)
+                                  end_time=end_time, parameters=parameters, assets=assets)

@@ -1,5 +1,10 @@
-# 媒体独立第一轮；所有路径填写完成后再运行。
+# 媒体独立第一轮；source_path 与 json_files 二选一，并填写新的 round1_result_path。
+# 数据库模式：规范化媒体原帖表，须为发布时间 date/id 双层索引，包含 text/user_name。
 source_path: ""
+# 本地文件模式：支持 JSONL、JSON 数组或单条 JSON 对象；多个文件合并校验。
+# 相对路径从本配置所在目录计算，例如 ["../media_posts.jsonl"]；也可填写绝对路径。
+# JSON 导入过滤正文以 "RT @" 或 "JUST IN" 开头的帖子（区分大小写，不去前导空格）；不按账号或日期过滤，不调用 AI。
+json_files: []
 round1_result_path: ""
 ai_config_path: "media_round1_ai_config.yaml"
 # 两端同时为空时第一轮处理全表；填写日期则包含首尾日。

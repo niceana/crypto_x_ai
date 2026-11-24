@@ -26,11 +26,19 @@ def _check_keys(document, allowed):
 def load_media_job_config(path, *, require_ai=True):
     """将公开的 round1_result_path 转为现有第一轮入口的内部 task_path。"""
     path = Path(path).absolute()
-    required = ("source_path", "round1_result_path") + (("ai_config_path",) if require_ai else ())
+    required = ("round1_result_path",) + (("ai_config_path",) if require_ai else ())
     document = load_job_config(path, required)
-    _check_keys(document, ("source_path", "round1_result_path", "ai_config_path",
+    _check_keys(document, ("source_path", "json_files", "round1_result_path", "ai_config_path",
                            "start_time", "end_time", "logging"))
-    if document["source_path"] == document["round1_result_path"]:
+    source_path = document.get("source_path", "")
+    files = document.get("json_files", [])
+    if not isinstance(source_path, str):
+        raise ConfigError("source_path 必须为字符串；使用本地 JSON 时留空")
+    if not isinstance(files, list) or any(not isinstance(value, str) or not value.strip() for value in files):
+        raise ConfigError("json_files 必须为文件路径字符串组成的列表")
+    if bool(source_path.strip()) == bool(files):
+        raise ConfigError("source_path 与 json_files 必须且只能填写一项")
+    if source_path == document["round1_result_path"]:
         raise ConfigError("媒体源帖子表与第一轮结果表路径必须不同")
     start, end = document.get("start_time"), document.get("end_time")
     if (start is None) != (end is None):
@@ -45,6 +53,9 @@ def load_media_job_config(path, *, require_ai=True):
     if not isinstance(document.get("logging", {}), dict):
         raise ConfigError("logging 必须为字典")
     values = dict(document)
+    values["source_path"] = source_path
+    if files:
+        values["json_files"] = [str((path.parent / Path(value).expanduser()).resolve()) for value in files]
     values["task_path"] = values.pop("round1_result_path")
     if require_ai:
         values["ai_config_path"] = str((path.parent / document["ai_config_path"]).absolute())

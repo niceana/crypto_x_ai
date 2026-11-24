@@ -1,9 +1,18 @@
 # 帖子提取配置：round1事件提取及 round1帖子事件提取表初始化。
 # source_path 是原始帖子来源；task_path 是 round1帖子事件提取表的实际路径。
+# append_tasks preview/apply 不带目录时，source_path 填爬虫结果表：单层采集时间 date 索引，
+# 普通列 id/created_at/text/username；username 映射为任务表 user_name，
+# 按 created_at（UTC 发布时间）和下方日期筛选后追加。
+# 先读取 task_path 全表，将 user_name 去重作为目标账号；仅保留 username 命中的原帖（忽略大小写和首尾空格）。
+# 爬虫表读取后在内存排除 username 为 WuBlockchain 的记录（忽略大小写和首尾空格），再检查冲突。
+# 同时排除 text 以 "RT @" 或 "JUST IN " 开头的记录，区分大小写、不去除正文前导空格。
+# 已有同索引任务仅 text 不同时：status=0 刷新 text，status=1 保留；其他状态或账号差异仍停止核对。
+# 首次 initialize_tasks 仍要求旧的发布时间 date/id 双层索引源表，不适用新爬虫表结构。
 # 本次仅统一称呼，保留现有路径值；首次初始化仍须使用尚未创建的目标。
 source_path: "填写现有帖子路径"
 task_path: "填写新任务表路径"
 ai_config_path: "round1_ai_config.yaml"
+# 直接从爬虫表追加时也使用此范围，含首尾日全天；两端同时为 null 时核对全部帖子。
 start_time: "2021-01-01"
 end_time: "2021-12-31"
 

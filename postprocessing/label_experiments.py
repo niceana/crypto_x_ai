@@ -11,7 +11,7 @@ import pandas as pd
 
 from postprocessing.weight_data import (
     SOURCE_COLUMNS, _save_weight_data, _validate_weight_request, build_weight_data,
-    parse_weight_features, read_weight_events, score_weight_features,
+    load_weight_assets, normalize_weight_assets, parse_weight_features, read_weight_events, score_weight_features,
 )
 from postprocessing.weight_grid import _now, _write_manifest
 from postprocessing.weight_parameters import (
@@ -131,7 +131,7 @@ def prepare_label_experiments(weight_path, grid_config=None, *, param_id=None, a
     }
 
 
-def build_label_positions(features, experiment, *, start_time, end_time):
+def build_label_positions(features, experiment, *, start_time, end_time, assets=None):
     """返回最终时间轴的 float64 仓位矩阵；所有分组保留相同资产列及零小时。"""
     if experiment.get("experiment_version") != EXPERIMENT_VERSION:
         raise ValueError("请用 prepare_label_experiments 重新生成当前版本的方案，不能直接复用旧版清单")
@@ -146,12 +146,13 @@ def build_label_positions(features, experiment, *, start_time, end_time):
     # 公共倍率已折入 parameters.B，不能在此重复相乘。
     basic["data"] = basic["data"].where(selected, 0.0)
     positions = build_weight_data(basic, start_time=start_time, end_time=end_time,
-                                 aggregation_method=parameters.aggregation_method)
+                                 aggregation_method=parameters.aggregation_method, assets=assets)
     positions.index = positions.index + pd.Timedelta(hours=OUTPUT_TIME_OFFSET_HOURS)
     return positions
 
 
-def run_label_experiments(cli, settings, *, param_id=None, aggregation_method=None, unit_position=1.0, report_dir=None):
+def run_label_experiments(cli, settings, *, param_id=None, aggregation_method=None, unit_position=1.0,
+                          report_dir=None, assets=None):
     """一次读源，逐表写库；清单列出名称、筛选条件、事件数和回测输入路径。"""
     _validate_weight_request(settings.result_path, settings.weight_path, settings.start_time, settings.end_time)
     manifest = prepare_label_experiments(settings.weight_path, settings.weight_grid, param_id=param_id,
@@ -170,13 +171,17 @@ def run_label_experiments(cli, settings, *, param_id=None, aggregation_method=No
     _save_manifest(manifest_path, manifest)
     current = None
     try:
+        manifest["asset_list_path"] = settings.round2_asset_list_path if assets is None else None
+        columns = normalize_weight_assets(load_weight_assets(cli, settings.round2_asset_list_path)
+                                         if assets is None else assets)
+        assets = list(columns.values())
+        manifest["output_columns"] = assets
         results = read_weight_events(cli, settings.result_path, settings.start_time, settings.end_time,
                                     columns=SOURCE_COLUMNS, label="标签实验来源读取")
+        results = results.loc[results["asset"].isin(columns)]
         features = parse_weight_features(results)
         manifest["source_rows"] = len(results)
         del results
-        if features.empty:
-            raise ValueError("范围内没有第二、三轮均成功的事件，无法生成标签实验")
         manifest["successful_events"] = len(features)
         manifest["source_assets"] = sorted(features["asset"].unique())
         for field, levels in manifest["group_levels"].items():
@@ -189,11 +194,12 @@ def run_label_experiments(cli, settings, *, param_id=None, aggregation_method=No
             current = entry
             entry["status"] = "running"
             _save_manifest(manifest_path, manifest)
-            positions = build_label_positions(features, entry, start_time=settings.start_time, end_time=settings.end_time)
+            positions = build_label_positions(features, entry, start_time=settings.start_time,
+                                              end_time=settings.end_time, assets=assets)
             selected = (features[entry["filter_field"]].eq(entry["filter_value"]) if entry["kind"] == "level"
                         else np.ones(len(features), dtype=bool))
             event_scores = score_weight_features(features, _parameters(entry))["data"]
-            saved = _save_weight_data(cli, entry["table_path"], positions)
+            saved = _save_weight_data(cli, entry["table_path"], positions, fixed_columns=True)
             entry.update(status="completed", selected_events=int(np.sum(selected)),
                          nonzero_events=int(np.sum(selected & event_scores.ne(0))),
                          hours=len(saved), assets=len(saved.columns),

@@ -15,9 +15,10 @@ from pandas.testing import assert_frame_equal
 from common.persistence import BatchPersistenceError
 from common.config import EventConfig, RunConfig
 from postprocessing.weight_data import (
-    ASSET_SUFFIX, SOURCE_COLUMNS, audit_weight_columns, build_basic_df, build_weight_data, write_weight_data,
+    ASSET_SUFFIX, SOURCE_COLUMNS, build_basic_df, build_weight_data, write_weight_data,
+    load_weight_assets, normalize_weight_assets,
 )
-from postprocessing.weight_parameters import prepare_weight_grid
+from postprocessing.weight_parameters import WeightParameters, prepare_weight_grid
 from tests.event_support import Tables
 
 
@@ -51,7 +52,135 @@ def sample_results():
     ])
 
 
+class AssetTables(Tables):
+    """带宿主资产对象的离线客户端；事件表不决定资产名单。"""
+    def __init__(self, source, result=None, *, assets=("BTC", "ETH", "LTC", "OLD")):
+        super().__init__(source, result)
+        self.assets = list(assets)
+        self.object_reads = []
+
+    def read_object(self, path):
+        self.object_reads.append(path)
+        if path != "assets.json":
+            raise FileNotFoundError(path)
+        return json.dumps({"InstrumentList": self.assets}).encode("utf-8")
+
+
 class WeightDataTests(unittest.TestCase):
+    def test_fixed_assets_keep_host_order_names_and_zero_columns_for_both_methods(self):
+        basic = build_basic_df(sample_results())
+        for method in ("sum", "max_abs"):
+            with self.subTest(method=method):
+                weight = build_weight_data(basic, **READ_RANGE, aggregation_method=method,
+                                           assets=[" sol ", "eth.usdt.custom", "BTC"])
+                self.assertEqual(list(weight.columns), ["SOL" + ASSET_SUFFIX, "ETH.USDT.CUSTOM", "BTC" + ASSET_SUFFIX])
+                self.assertTrue(weight["SOL" + ASSET_SUFFIX].eq(0).all())
+                self.assertEqual(weight.loc["2017-12-31 01:00:00", "BTC" + ASSET_SUFFIX], 6.0)
+                self.assertTrue(weight.dtypes.eq("float64").all())
+
+    def test_fixed_assets_ignore_unlisted_bad_responses_and_keep_empty_successful_windows(self):
+        source = sample_results()
+        source.loc[source["asset"].ne("BTC"), "round3_ai_response"] = "broken"
+        for method in ("sum", "max_abs"):
+            backend = Tables(pd.DataFrame(), source)
+            weight = write_weight_data(backend, "result", "weights", **READ_RANGE,
+                                       assets=["SOL", "BTC"], parameters=WeightParameters(aggregation_method=method))
+            self.assertEqual(list(weight.columns), ["SOL" + ASSET_SUFFIX, "BTC" + ASSET_SUFFIX])
+            self.assertEqual(weight.loc["2017-12-31 09:00:00", "BTC" + ASSET_SUFFIX], 6.0)
+            self.assertTrue(weight["SOL" + ASSET_SUFFIX].eq(0).all())
+        for source in (sample_results().iloc[:0], sample_results().assign(round3_status="-1")):
+            for method in ("sum", "max_abs"):
+                backend = Tables(pd.DataFrame(), source)
+                weight = write_weight_data(backend, "result", "weights", **READ_RANGE,
+                                           assets=["ETH", "BTC"], parameters=WeightParameters(aggregation_method=method))
+                self.assertEqual(weight.shape, (50, 2))
+                self.assertTrue(weight.eq(0).all().all())
+                self.assertTrue(weight.dtypes.eq("float64").all())
+
+    def test_fixed_assets_validate_before_source_read_and_match_live_duplicate_rules(self):
+        for assets in ([], "BTC", {"BTC"}, {"BTC": 1}, ["BTC", "btc.usdt.custom"],
+                       [""], [None], [".USDT"]):
+            with self.subTest(assets=assets):
+                backend = Tables(pd.DataFrame(), sample_results())
+                with self.assertRaises(ValueError):
+                    write_weight_data(backend, "result", "weights", **READ_RANGE, assets=assets)
+                self.assertFalse(backend.column_reads or backend.reads or backend.registers or backend.writes)
+        self.assertEqual(list(normalize_weight_assets([" eth ", "BTC"]).values()),
+                         ["ETH" + ASSET_SUFFIX, "BTC" + ASSET_SUFFIX])
+
+    def test_asset_object_requires_nonempty_valid_instrument_list(self):
+        backend = AssetTables(pd.DataFrame(), assets=["eth", "BTC.USDT.CUSTOM"])
+        self.assertEqual(load_weight_assets(backend, "assets.json"), ["ETH" + ASSET_SUFFIX, "BTC.USDT.CUSTOM"])
+        for document in ({}, [], {"InstrumentList": []}, {"InstrumentList": "BTC"},
+                         {"InstrumentList": ["BTC", "BTC.USDT.UFUTURE.BINANCE"]}):
+            with self.subTest(document=document), patch.object(backend, "read_object", return_value=json.dumps(document).encode()):
+                with self.assertRaises(ValueError):
+                    load_weight_assets(backend, "assets.json")
+        with self.assertRaisesRegex(ValueError, "round2_asset_list_path"):
+            load_weight_assets(backend, "")
+
+    def test_fixed_asset_save_rejects_legacy_extra_columns_before_mutation(self):
+        backend = Tables(pd.DataFrame(), sample_results())
+        old = pd.DataFrame(7.0, index=pd.DatetimeIndex(["2017-12-30 08:00"], name="date"),
+                           columns=[asset + ASSET_SUFFIX for asset in ("ETH", "OLD", "BTC")])
+        backend.tables["weights"] = old.copy()
+        with self.assertRaisesRegex(ValueError, "名单外.*新的 weight_path"):
+            write_weight_data(backend, "result", "weights", **READ_RANGE, assets=["BTC", "ETH"])
+        assert_frame_equal(backend.tables["weights"], old)
+        self.assertFalse(backend.updates or backend.appends or backend.registers or backend.writes)
+
+    def test_fixed_asset_save_aligns_reordered_and_new_columns_by_name(self):
+        source = result_frame([
+            ("2017-12-31 00:20:00", "BTC", "new", "利好", "高"),
+            ("2017-12-31 00:30:00", "BTC", "repeat", "利好", "低"),
+            ("2017-12-31 00:25:00", "ETH", "new", "利空", "低"),
+            ("2017-12-31 00:35:00", "ETH", "update", "利好", "低"),
+        ])
+        btc, eth, sol = [asset + ASSET_SUFFIX for asset in ("BTC", "ETH", "SOL")]
+        history_time, target_time = pd.Timestamp("2017-12-30 07:00"), pd.Timestamp("2017-12-31 09:00")
+        for method in ("sum", "max_abs"):
+            for assets in (["ETH", "BTC"], ["SOL", "ETH", "BTC"], ["ETH", "SOL", "BTC"]):
+                with self.subTest(method=method, assets=assets):
+                    backend = Tables(pd.DataFrame(), source)
+                    backend.tables["weights"] = pd.DataFrame({btc: [7.0, 99.0], eth: [11.0, 99.0]},
+                        index=pd.DatetimeIndex([history_time, target_time], name="date"))
+                    parameters = WeightParameters(aggregation_method=method)
+                    saved = write_weight_data(backend, "result", "weights", assets=assets, parameters=parameters,
+                                              start_time="2017-12-31", end_time="2017-12-31")
+                    self.assertEqual(list(saved.columns), [asset + ASSET_SUFFIX for asset in assets])
+                    actual = backend.tables["weights"]
+                    self.assertEqual(list(actual.columns), [btc, eth] + ([sol] if "SOL" in assets else []))
+                    self.assertEqual(actual.at[history_time, btc], 7.0)
+                    self.assertEqual(actual.at[history_time, eth], 11.0)
+                    self.assertEqual(actual.at[target_time, btc], 6.5 if method == "sum" else 6.0)
+                    self.assertEqual(actual.at[target_time, eth], -0.5 if method == "sum" else -2.0)
+                    self.assertEqual(actual.at[pd.Timestamp("2017-12-31 10:00"), btc], 0.0)
+                    self.assertEqual(actual.at[pd.Timestamp("2017-12-31 10:00"), eth], 0.0)
+                    if "SOL" in assets:
+                        self.assertTrue(actual[sol].eq(0).all())
+                    assert_frame_equal(actual.loc[saved.index, saved.columns], saved, check_freq=False)
+                    before = actual.copy(deep=True)
+                    counts = (len(backend.updates), len(backend.appends))
+                    rerun = write_weight_data(backend, "result", "weights", assets=assets[::-1], parameters=parameters,
+                                              start_time="2017-12-31", end_time="2017-12-31")
+                    assert_frame_equal(backend.tables["weights"], before)
+                    assert_frame_equal(rerun, saved.loc[:, rerun.columns])
+                    self.assertEqual(counts, (len(backend.updates), len(backend.appends)))
+                    self.assertFalse(backend.registers or backend.writes)
+
+    def test_fixed_asset_save_extends_columns_in_host_order_and_preserves_history(self):
+        backend = Tables(pd.DataFrame(), sample_results())
+        backend.tables["weights"] = pd.DataFrame({"BTC" + ASSET_SUFFIX: [7.0]},
+            index=pd.DatetimeIndex(["2017-12-29 08:00"], name="date"))
+        assets = ["BTC", "SOL", "ETH"]
+        saved = write_weight_data(backend, "result", "weights", **READ_RANGE, assets=assets)
+        self.assertEqual(list(saved.columns), [asset + ASSET_SUFFIX for asset in assets])
+        self.assertEqual(list(backend.tables["weights"].columns), list(saved.columns))
+        self.assertEqual(list(backend.tables["weights"].iloc[0]), [7.0, 0.0, 0.0])
+        before = (len(backend.updates), len(backend.appends))
+        write_weight_data(backend, "result", "weights", **READ_RANGE, assets=assets)
+        self.assertEqual(before, (len(backend.updates), len(backend.appends)))
+
     def test_repeat_with_copied_response_can_compute_without_source_in_read_range(self):
         source = result_frame([
             ("2017-12-31 01:00:00", "BTC", "repeat", "利好", "高"),
@@ -348,59 +477,6 @@ class WeightDataTests(unittest.TestCase):
                 write_weight_data(backend, "result", "weights", **READ_RANGE)
         self.assertFalse(backend.registers or backend.writes)
 
-    def test_readonly_audit_reports_css_c20_columns_absent_from_source(self):
-        source = sample_results()
-        backend = Tables(pd.DataFrame(), source)
-        stored = build_weight_data(build_basic_df(source), start_time="2017-12-31").rename(columns={
-            "OLD.USDT.UFUTURE.BINANCE": "CSS.USDT.UFUTURE.BINANCE"})
-        stored["C20.USDT.UFUTURE.BINANCE"] = 0.0
-        backend.tables["weights"] = stored
-        report = audit_weight_columns(backend, "result", "weights", **READ_RANGE)
-        self.assertEqual(report["source_assets"], ["BTC", "ETH", "OLD"])
-        self.assertEqual(report["unexpected_columns"], ["C20.USDT.UFUTURE.BINANCE", "CSS.USDT.UFUTURE.BINANCE"])
-        self.assertEqual(report["missing_columns"], ["OLD.USDT.UFUTURE.BINANCE"])
-        self.assertEqual(backend.column_reads, [("result", "2017-12-29", "2018-01-01", ["asset"])])
-        self.assertEqual(backend.reads, [("weights", "2017-12-30", "2017-12-31")])
-        self.assertFalse(backend.registers or backend.writes or backend.updates or backend.appends)
-
-    def test_readonly_audit_preserves_c20_if_it_is_an_actual_source_asset(self):
-        source = result_frame([("2017-12-31 00:00:00", "C20", "new", "利好", "高")])
-        backend = Tables(pd.DataFrame(), source)
-        backend.tables["weights"] = build_weight_data(build_basic_df(source), start_time="2017-12-31")
-        report = audit_weight_columns(backend, "result", "weights", **READ_RANGE)
-        self.assertEqual(report["source_assets"], ["C20"])
-        self.assertEqual(report["expected_columns"], ["C20.USDT.UFUTURE.BINANCE"])
-        self.assertEqual(report["unexpected_columns"], [])
-        self.assertEqual(report["missing_columns"], [])
-        self.assertFalse(backend.registers or backend.writes)
-
-    def test_audit_entrypoint_loads_event_config_without_writing(self):
-        module = importlib.import_module("entrypoints.audit_weight_columns")
-        backend = Tables(pd.DataFrame(), sample_results())
-        table_path = prepare_weight_grid("weights").variants[0].table_path
-        backend.tables[table_path] = build_weight_data(build_basic_df(sample_results()), start_time="2017-12-31")
-        settings = EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights", **READ_RANGE)
-        with patch.object(module, "load_event_config", return_value=settings), patch("builtins.print") as output:
-            report = module.main([], cli=backend)
-        self.assertEqual(json.loads(output.call_args.args[0]), report)
-        self.assertEqual(report["unexpected_columns"], [])
-        self.assertFalse(backend.registers or backend.writes)
-
-    def test_audit_entrypoint_selects_mode_for_shared_parameter_id(self):
-        module = importlib.import_module("entrypoints.audit_weight_columns")
-        grid = {"aggregation_methods": ["sum", "max_abs"]}
-        variant = prepare_weight_grid("weights", grid).variants[1]
-        backend = Tables(pd.DataFrame(), sample_results())
-        backend.tables[variant.table_path] = build_weight_data(build_basic_df(sample_results()), start_time="2017-12-31")
-        settings = EventConfig("first", "result", "round2.yaml", "round3.yaml",
-                               weight_path="weights", weight_grid=grid, **READ_RANGE)
-        with patch.object(module, "load_event_config", return_value=settings), patch("builtins.print"):
-            report = module.main(["--param-id", variant.parameters.param_id,
-                                  "--aggregation-method", "max_abs"], cli=backend)
-        self.assertEqual(report["weight_path"], variant.table_path)
-        self.assertEqual(report["unexpected_columns"], [])
-        self.assertFalse(backend.registers or backend.writes)
-
     def test_reads_only_required_columns_and_writes_new_table(self):
         backend = Tables(pd.DataFrame(), sample_results())
         weight = write_weight_data(backend, "result", "weights", **READ_RANGE)
@@ -632,8 +708,9 @@ class WeightDataTests(unittest.TestCase):
 
     def test_cli_uses_event_config_paths_and_dates(self):
         module = importlib.import_module("entrypoints.write_weight_data")
-        backend = Tables(pd.DataFrame(), sample_results())
-        settings = EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights", **READ_RANGE)
+        backend = AssetTables(pd.DataFrame(), sample_results(), assets=["OLD", "BTC", "ETH"])
+        settings = EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights",
+                               round2_asset_list_path="assets.json", **READ_RANGE)
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(module, "load_event_config", return_value=settings) as load:
                 summary = module.main(["--report-dir", str(Path(temporary) / "run")], cli=backend)
@@ -644,6 +721,9 @@ class WeightDataTests(unittest.TestCase):
         self.assertEqual(summary["tables"][0]["assets"], 3)
         self.assertEqual(summary["tables"][0]["table_path"], prepare_weight_grid("weights").variants[0].table_path)
         self.assertNotIn("weights", backend.tables)
+        self.assertEqual(backend.object_reads, ["assets.json"])
+        self.assertEqual(list(backend.tables[summary["tables"][0]["table_path"]].columns),
+                         [asset + ASSET_SUFFIX for asset in backend.assets])
 
     def test_cli_requires_dates_and_weight_path_before_accessing_database(self):
         module = importlib.import_module("entrypoints.write_weight_data")

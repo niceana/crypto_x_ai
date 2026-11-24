@@ -133,14 +133,33 @@ JSONL 作为已经筛选好的最终输入，全部记录参与对比，不再�
 
 相同 `(date, id)` 且内容一致的 JSON 记录合并；JSON 内部同索引内容冲突，或同一 ID 对应不同日期时，预览在完整备份后停止并报错。候选 df 与原表出现同 ID 不同日期时，会导出冲突清单并禁止 apply。原表已存在的索引直接跳过，不覆盖旧内容；补录后重新 preview 会把这些索引识别为重叠。
 
-原始表补录成功后，已有第一轮任务表需要另外追加任务。在 `configs/post_extraction_config.yaml` 中，`source_path` 指向补入成功的原始帖子表，`task_path` 沿用已有第一轮任务表；使用上次 `supplement_posts apply` 的同一个目录：
+爬虫已经将新帖写入结果表时，在 `configs/post_extraction_config.yaml` 中把 `source_path` 指向爬虫表，`task_path` 沿用已有第一轮任务表，`start_time/end_time` 填本次需要追加的 **UTC 发布时间** 范围（包含首尾日全天，两端同时为 `null` 时核对全部帖子）。直接运行，无需 JSONL 或补录目录：
+
+```bash
+python -X utf8 -m entrypoints.append_tasks preview
+python -X utf8 -m entrypoints.append_tasks apply
+```
+
+爬虫表使用单层 `date` 采集时间索引，允许同刻多行；普通列须含 `id`、`created_at`、`text`、`username`。入口完整读取这四列，将 `username` 映射为任务表的 `user_name`，再由 `created_at` 生成任务的 `(date,id)` 发布时间索引并筛选日期，不能用采集时间筛选，否则会漏掉迟到采集。带时区的 `created_at` 先转 UTC，再移除时区；无时区值按 UTC 理解，保留原时间精度，支持 X 原始时间文本。ID 接受非空字符串或整数，整数精确转字符串；浮点数、布尔值及空 ID 拒绝。重复采集且发布时间、正文和账号一致的同 ID 帖子合并，内容或发布时间冲突则停止。不会按任务表最大时间截断，范围内同刻新 ID 和较早漏帖也参与比较。
+
+直接读取爬虫表的模式先完整读取一次已有第一轮任务表，将全表 `user_name` 去重作为目标账号集合，不按任务状态或本次日期限制账号范围。集合匹配忽略账号大小写和首尾空格，空账号不进入集合；仅保留爬虫 `username` 命中该集合的记录。规范化只用于集合匹配，任务账号仍保存原始文本。目标集合为空时不会导入任何帖子。已读取的任务表复用于后续比较和写入前备份，不重复读表。
+
+目标账号筛选后，在内存排除 `username` 为 `WuBlockchain` 的记录，账号匹配忽略大小写和首尾空格；同时排除正文 `text` 以 `RT @` 或 `JUST IN ` 开头的记录（后者末尾有一个空格），正文前缀区分大小写、不去除前导空格。随后才校验字段、检查重复 ID 和追加或刷新任务。同 ID 的其他保留记录仍参与处理。日志及摘要 `target_account_count` 为目标账号数，`excluded_non_target_rows` 为非目标账号剔除采集行数，`excluded_rows` 为剩余记录中的 WuBlockchain 剔除数，`excluded_prefix_rows` 为其余记录中的前缀剔除数，按此顺序不重复计数。过滤日志的“剔除/保留记录”尚未按 ID 去重、尚未按发布时间筛选，不代表唯一帖子数；后续日志另报“过滤后唯一帖子”和“发布时间范围内帖子”。这些筛选属于直接读取爬虫表的追加模式，原始数据库记录和已有任务保留。
+
+`preview` 不写库，新增任务清单输出至 `reports/append_tasks/<时间戳>/round1_tasks_to_append.csv`；已有同 `(date,id)`、账号一致且仅正文不同的任务，`status="0"` 列入 `round1_text_updates.csv`，`status="1"` 保留旧正文和结果并跳过。`apply` 使用相同配置重新读取当前两张表、核对并写入，生成自己的清单与写入前完整任务表备份。正文更新通过 `cli.update_by_column` 只提交 `text` 列，已有状态、账号、摘要和 AI 回答保留；新任务通过 `cli.update_by_index` 追加，状态为 `"0"`、配置摘要和 AI 回答为空。两次写入依次执行，正文成功而追加失败时，重跑会跳过已刷新的正文并继续追加。源表在两次命令间新增的范围内帖子也会参与 apply。入口不会注册新表、不调用 AI，且与第一轮共用进程锁。此模式只适用于已有第一轮任务表；`initialize_tasks` 仍使用旧的发布时间 `date/id` 双层索引输入。
+
+爬虫表内部出现同 ID 冲突时，报错会给出前 10 个冲突 ID、各自不同的字段及完整明细路径。运行 `append_tasks preview` 即可生成 `reports/append_tasks/<时间戳>/crawler_conflicts.csv`，无需执行 apply。明细按 ID 分组，保留目标账号筛选及账号、正文前缀过滤后该 ID 的每次采集记录：`capture_date` 是源表采集时间，`source_row` 是本次原始读表结果中从 1 开始的行号，`created_at` 为原始发布时间，`published_at_utc` 为规范后的 UTC 发布时间，另有完整 `text/username` 和 `conflict_fields`。`text_repr/username_repr` 用 JSON 字符串显示换行及首尾空格，方便识别不可见差异。冲突按筛选后的整张源表检查，发生在配置日期筛选和任务表写入之前；账号集合已从任务表读取，但不会自动选择某个版本或写入任务。
+
+同一个 `(date,id)` 的账号不同，或正文不同且已有状态为 `9/-1` 或其他非 `0/1` 状态时，会在本次报告目录导出 `round1_task_conflicts.csv` 后停止。冲突表及待处理正文更新表 `round1_text_updates.csv` 均为每帖一行，包含 `date/id`、`conflict_fields`、双方完整的 `existing_text/incoming_text`、`existing_user_name/incoming_user_name`、对应的 `*_repr` 及 `existing_status`。`existing` 来自任务表，`incoming` 来自本批输入，其中爬虫 `username` 已映射为 `user_name`。报错列出前 10 个 ID、差异字段及完整 CSV 路径；两种追加模式的 preview/apply 都支持按状态处理。比较按字符串实际值进行，不把 Pandas 的 `object/string` 类型差异视为内容冲突。存在停止型冲突时，本批正文更新和任务追加均不执行。同 ID 不同 date 仍停止核对。
+
+如果原始表是通过 JSONL 补录成功的，继续使用原有补录目录模式。在 `configs/post_extraction_config.yaml` 中，`source_path` 指向补入成功的旧原始帖子表，`task_path` 沿用已有第一轮任务表；传入上次 `supplement_posts apply` 的同一个目录：
 
 ```bash
 python -X utf8 -m entrypoints.append_tasks preview "上次补录目录"
 python -X utf8 -m entrypoints.append_tasks apply "上次补录目录"
 ```
 
-第一个命令只预览，生成目录内的 `round1_tasks_to_append.csv`；查看后执行第二个命令。入口核对 `apply_result.json` 和 `new_posts.pkl`，从原表确认这批帖子的索引、正文、账号已经落库，再只向任务表追加缺失索引。新任务 `status="0"`，配置摘要及 AI 输出为空；已有状态、配置摘要和输出保留。存在同 ID 不同 date 或共同索引输入不一致时停止。实际追加前完整备份原任务表到该目录的 `round1_backups/<时间戳>/tasks.pkl`，读回核对成功后才调用 `cli.update_by_index`。重复运行跳过已存在任务，不注册新表、不调用 AI；入口与第一轮共用任务表的进程锁。
+第一个命令只预览，生成目录内的追加清单及待处理正文更新清单；查看后执行第二个命令。目录模式入口核对 `apply_result.json` 和 `new_posts.pkl`，从原表确认这批帖子的索引、正文、账号已经落库，再按上述状态规则刷新待处理正文及追加缺失任务，不使用配置日期筛选。两种模式均在写入前完整备份原任务表到本次目录的 `round1_backups/<时间戳>/tasks.pkl`，读回核对成功后才更新或追加。日志和摘要分别统计 `text_updates`（计划正文更新数）、`written_text_updates`（实际正文更新数）、`skipped_completed_texts`（已成功正文差异跳过数）及原有新增任务数量；重复运行按当前表状态跳过已完成的刷新和追加。
 
 追加日志会给出本批实际 `start_time/end_time`。把这段日期填写到帖子配置和事件配置中，事件配置的 `first_round_task_path` 与帖子配置的 `task_path` 一致，`result_path` 沿用已有事件表。这里的日期控制 AI 处理范围，范围内已有成功记录会跳过，其他未完成任务也会参与处理。按下方四个命令依次执行：第一轮提取及自动导入、向量准备、第二轮、第三轮；第一轮全部成功且导入完成后再准备向量。
 
@@ -165,15 +184,15 @@ python -X utf8 -m entrypoints.run_round3
 
 当前三轮 AI 接口 URL 和 Embedding 基础地址为空，第二、三轮模型为空。第一轮已配置事件 JSON 提取及账号背景规则，第二、三轮 system 均已配置正式提示词；提取及经济影响判断的质量仍需真实样本验证。账号背景已按用户提供的 TradeCoins 50 名单填入；正式运行还须准备认证信息、核对源帖用户名并确定日期范围。event_processing_config.yaml 的日期目前留空，第二、三轮启动前必须填写，未设置会停止；仅独立导入保留日期为空时的全范围处理。第三轮提示词始终分析当前完整 event，new_information 仅辅助理解事件进展和新旧变化。阻塞项与可后置项见 [接入待办](docs/IMPLEMENTATION_ISSUES.md#运行前必须补齐)。
 
-round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时round1事件提取结果保留，重新运行同范围可跳过成功帖 AI 并补导。没有成功帖时不创建事件去重分析表。
+round1事件提取普通单帖失败不阻止其他成功帖导入；round1事件提取整体异常或中断不进入自动导入。导入失败时第一轮结果保留，重新运行同范围会跳过成功帖 AI。自动导入与独立导入均只追加严格晚于事件表全表最大 `date` 的事件，不补较早或同刻缺失任务；截止时间保留完整时分秒及精度，所有资产共用，跳过数量记日志。空表首次导入不受限制；同一批符合条件的事件一起写入。没有成功帖时不创建事件去重分析表。
 
-历史数据独立导入使用：
+独立导入并核对第一轮结果使用：
 
 ```powershell
 python -X utf8 -m entrypoints.import_events
 ```
 
-独立导入使用 `configs/event_processing_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功。导入自动判断目标是否存在：仅明确缺表时注册并首次写入；已有目标严格校验后只追加缺失记录，保留已有分析结果。无需配置导入模式。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
+独立导入使用 `configs/event_processing_config.yaml` 的来源和范围，默认要求范围内round1事件提取全部成功。导入自动判断目标是否存在：仅明确缺表时注册并首次写入；已有目标严格校验后，只追加索引缺失且 `date` 严格晚于全表最大时间的记录，保留已有分析结果。无需配置导入模式。round2事件去重归组与round3事件影响分析按已有任务状态运行，不重新展开round1事件提取，不自动补跑范围外任务。
 
 已有第一轮回答的 event 正文包含未转义英文双引号时，导入会批量尝试在内存中补转义，再严格校验；第一轮原始回答和状态保留，不调用 AI，也无需新参数或依赖。日志逐条记录修复与失败的帖子 ID，并汇总数量。内容截断、字段缺失或边界不明确的记录集中报错，本批在建表或写入前停止。具体支持范围和例子见 [历史回答引号修复](docs/rules/EVENT_RULES.md#历史回答中未转义引号的批量处理)。
 
@@ -207,7 +226,7 @@ python -X utf8 -m entrypoints.audit_return_contribution
 
 用户确认模型已输出归一化向量；程序保留返回数值，直接用内积计算余弦相似度，不再归一化或转成 float32。仍校验格式、维度、有限数值、非零向量及单位范数，范数允许绝对误差 1e-5；新响应不满足约定时使用该批剩余请求预算重试，耗尽后停止。
 
-第二、三轮共用 `round2_asset_list_path` 配置，各自在入口中用 `json.loads(cli.read_object(path).decode('utf-8'))['InstrumentList']` 读取名单，取每项第一个 `.` 前的币名，去首尾空白、转大写并去重。当前路径为 `crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json`。两轮都只处理日期范围内 `asset` 命中名单的记录。第二轮在状态恢复、前史检查、向量准备和任务调度之前筛选；第三轮在检查第二轮状态、恢复第三轮状态、准备 AI 请求及 repeat 继承之前筛选，统计也只包含目标资产。每轮启动读取一次名单；配置留空字符串或未配置时处理全资产。本项不筛选权重入口。
+第二、三轮共用 `round2_asset_list_path` 配置，各自在入口中用 `json.loads(cli.read_object(path).decode('utf-8'))['InstrumentList']` 读取名单，取每项第一个 `.` 前的币名，去首尾空白、转大写并去重。当前路径为 `crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json`。两轮都只处理日期范围内 `asset` 命中名单的记录。第二轮在状态恢复、前史检查、向量准备和任务调度之前筛选；第三轮在检查第二轮状态、恢复第三轮状态、准备 AI 请求及 repeat 继承之前筛选，统计也只包含目标资产。每轮启动读取一次名单；配置留空字符串或未配置时两轮处理全资产。权重、标签实验及跳过事件查询也使用此配置，要求非空；权重按 InstrumentList 顺序构造固定资产列，同币名重复时报错，与实盘一致。
 
 第二轮按 event_processing_config.yaml 指定日期读取待处理任务，前史校验、候选检索及向量准备共用 history_lookback_months（默认 3 个日历月）。下面仅为范围填写示例，按实际要处理的日期修改：
 
@@ -247,7 +266,7 @@ update 的 new_information 须独立说明此前已知状态、本次变化及�
 
 ## 第三轮结果转为小时权重表
 
-第二、三轮完成后，使用 `configs/event_processing_config.yaml` 中的 `result_path`（共用结果表）、`weight_path`（参数表的基础路径）、`start_time`、`end_time` 和 `weight_grid`。`weight_path` 按要求留空，运行前自行填写；实际运行的日期必须同时设置为 `YYYY-MM-DD`，包含起止日全天。先预览参数、组合数量和表名，再在已安装 `xdata` 的环境运行：
+第二、三轮完成后，使用 `configs/event_processing_config.yaml` 中的 `result_path`（共用结果表）、`weight_path`（参数表的基础路径）、`round2_asset_list_path`（固定资产名单）、`start_time`、`end_time` 和 `weight_grid`。`weight_path` 按要求留空，运行前自行填写；实际运行的日期必须同时设置为 `YYYY-MM-DD`，包含起止日全天。先预览参数、组合数量和表名，再在已安装 `xdata` 的环境运行：
 
 ```powershell
 python -X utf8 -m entrypoints.write_weight_data --dry-run
@@ -262,15 +281,23 @@ python -X utf8 -m entrypoints.write_weight_data
 
 可用 `--config "另一个事件配置文件路径"` 指定同结构的事件配置。源表按日期范围只读取一次、回答只解析一次，供所有组合复用，不调用 AI。逐组合生成、保存并释放 DataFrame。目标不存在时注册并首次 write；已有表通过 `update_by_column` 替换重叠小时，通过 `update_by_index` 追加新小时。重复运行不累加，范围外数据保留。完整参数、目标表和状态保存到 `reports/weight_grid/<北京时间>/manifest.json`，可用 `--report-dir` 指定新目录。某表失败时停止，已成功表保留，重跑继续对齐更新。
 
-`weight_data` 的单层索引名为 `date`，类型为 `DatetimeIndex`（`datetime64[ns]`），每条时间均为整点。列为窗口范围内去重资产加 `.USDT.UFUTURE.BINANCE` 后缀。整点 T 聚合 `[T-75分钟, T-15分钟)` 内的事件，映射公式为 `(发布时间 + 15分钟).floor("h") + 1小时`；例如 `[16:45, 17:45)` 计入 `18:00`，`17:45` 计入 `19:00`。按目标小时和资产以 float64 使用所选算法聚合并补零，写库前索引整体加 8 小时，`18:00` 最终写入次日 `02:00`。实际写库范围从 `start_time 08:00:00` 到 end_time 次日 `09:00:00`。程序补读首日前一天和末日次日，再精确保留首尾完整窗口所需事件；索引仍为无时区 datetime。
+`weight_data` 的单层索引名为 `date`，类型为 `DatetimeIndex`（`datetime64[ns]`），每条时间均为整点。列按资产名单 InstrumentList 的原顺序构造；去首尾空白并转大写，币名补 `.USDT.UFUTURE.BINANCE` 后缀，完整交易资产名沿用其名称。同币名不可重复，名单外事件在解析回答前过滤；名单内无有效事件的资产仍保留列并填 `0.0`，整个范围没有有效事件时也输出完整零表。整点 T 聚合 `[T-75分钟, T-15分钟)` 内的事件，映射公式为 `(发布时间 + 15分钟).floor("h") + 1小时`；例如 `[16:45, 17:45)` 计入 `18:00`，`17:45` 计入 `19:00`。按目标小时和资产以 float64 使用所选算法聚合并补零，写库前索引整体加 8 小时，`18:00` 最终写入次日 `02:00`。实际写库范围从 `start_time 08:00:00` 到 end_time 次日 `09:00:00`。程序补读首日前一天和末日次日，再精确保留首尾完整窗口所需事件；索引仍为无时区 datetime。
 
 当前版本 `direction_product_v3` 的参数标识与旧版不同，避免将 45 分钟窗口的数据混入旧版整点分桶的参数表；旧表保留。`reports/weight_grid/` 只保存本地参数和状态清单，不存权重 DataFrame；重跑依赖数据库实际数据，不依赖旧清单。
 
-续写时保留已有资产列：本批未出现的旧资产在新小时填浮点数 `0.0`，新资产的已有历史行也补浮点零值。首尾完整窗口补读后，所有重叠小时（包括批次起点）均按本次重新计算值替换，跨日分批与一次性计算一致。重复运行不会再次平移已有表。返回的本批 df 包含重新计算的边界值及合并后的资产列。
+续写时按列名对齐，已有表的列顺序无需与名单一致；新资产的已有历史行补浮点零值，允许在名单任意位置新增资产。已有表含名单外列时，在写入前停止并提示使用新的 `weight_path`，不删除旧表历史列。首尾完整窗口补读后，所有重叠小时（包括批次起点）均按本次重新计算值替换，跨日分批与一次性计算一致。重复运行不会再次平移已有表。已有表保留原列顺序，返回的本批 df 包含重新计算的边界值及名单中的全部资产列，并按名单顺序排列。
 
 默认 B/C/D 为 1；方向为利好 `1`、利空 `-1`、其他 `0`；重要性为高 `3`、中 `2`、低 `1`、不确定 `0`；执行阶段为未开始 `1`、执行中 `2`、已完成 `3`、不确定 `0`；关系为 new `2`、update `1.5`、repeat `0.5`。利好、高、已完成、new 得分为 `18`，利空为 `-18`。任一乘数为零则得分为零；事件及小时聚合结果溢出时停止。
 
-第三轮回答先解析外层 `round3_ai_response`，再解析其 `ai_response_content`。repeat 与其他行一样只使用本条已保存的响应，关系使用本条 event_relation；响应填充已由第三轮处理，权重阶段不再查历史或继承其他行。任何行（包括 repeat）回答为空、状态未完成或 JSON 损坏时停止。
+第三轮回答先解析外层 `round3_ai_response`，再解析其 `ai_response_content`。repeat 与其他行一样只使用本条已保存的响应，关系使用本条 event_relation；响应填充已由第三轮处理，权重阶段不再查历史或继承其他行。仅处理名单内两轮均成功的记录；未成功的记录跳过，成功记录（包括 repeat）回答为空或 JSON 损坏时停止。
+
+日志中的“跳过未成功事件”是事件条数，不是资产数；同一资产的其他成功事件仍计入权重。出现跳过时，日志追加按 asset、round2_status、round3_status 分组的数量。要查看当前被跳过的具体事件，在相同环境和相同配置下执行只读命令：
+
+```powershell
+python -X utf8 -m entrypoints.audit_skipped_weight_events --config configs/event_processing_config.yaml
+```
+
+命令沿用权重的资产名单和完整首尾窗口，不解析 AI 回答、不写数据库。终端显示各受影响资产的总事件数、成功数、跳过数及两轮状态分布；`reports/skipped_weight_events/<北京时间>/skipped_events.csv` 保留发布时间、record_id、资产、两轮状态、事件正文及 error_message，另保存 assets.csv、status_counts.csv 和 summary.json。`0` 为待处理，`9` 为已认领，`-1` 为最终失败，只有两轮均为字符串 `1` 才参与权重。查询反映当前状态，后续补跑可能改变数量。
 
 在已有客户端的应用或 notebook 中可以执行整个网格，返回逐组合摘要和参数清单路径：
 
@@ -283,9 +310,7 @@ summary = run_weight_grid(cli, settings)
 print(summary["manifest_path"])
 ```
 
-单组合接口仍返回一个 DataFrame：`build_basic_df(results, parameters=WeightParameters(...))`、`build_weight_data(basic_df, start_time=..., end_time=...)` 在内存构建；`write_weight_data(..., parameters=...)` 续写指定目标。完整配置、口径和示例见 [小时权重表](docs/data/WEIGHT_DATA.md)。
-
-已有表出现无法对应源资产的列时，运行 `python -X utf8 -m entrypoints.audit_weight_columns --param-id <参数标识>`；只有一个组合时可省略参数标识。该入口只读对照配置范围内 asset 与所选参数表列名。续写表中本批未出现的列可能来自历史批次，需结合此前范围判断。保存入口也会核对本批生成列的来源。
+单组合接口仍返回一个 DataFrame：`build_basic_df(results, parameters=WeightParameters(...))`、`build_weight_data(basic_df, assets=assets, start_time=..., end_time=...)` 在内存构建；`write_weight_data(..., assets=assets, parameters=...)` 续写指定目标。`run_weight_grid(..., assets=assets)` 可直接接受宿主名单；省略时读取配置中的资产对象。低层单表接口不传 assets 时兼容原有按事件推导列的行为。完整配置、口径和示例见 [小时权重表](docs/data/WEIGHT_DATA.md)。
 
 ## 标签贡献实验仓位表
 

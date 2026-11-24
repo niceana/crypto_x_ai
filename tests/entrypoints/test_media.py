@@ -16,6 +16,7 @@ import pandas as pd
 import yaml
 
 from entrypoints import initialize_media_tasks, run_media_round1, run_media_round2, run_media_round3, import_media_events
+from common.validation import TASK_COLUMNS
 from tests.event_support import EventFixture, Tables, impact_result, new_result, source_posts
 from tests.support import success
 
@@ -186,6 +187,46 @@ class MediaEntryTests(EventFixture, unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "同一张"):
                 run_media_round2.main()
         factory.assert_not_called()
+
+    def test_json_initialization_registers_tasks_without_reading_database_source_or_ai(self):
+        post = {"id": "2023554387919122594", "created_at": "Tue Feb 17 00:25:36 +0000 2026",
+                "text": "Ethereum news", "user": {"screen_name": "WuBlockchain"},
+                "fetched_at": "2026-09-30T12:00:26.403852+00:00"}
+        (self.root / "media.jsonl").write_text(json.dumps(post), encoding="utf-8")
+        self.job.pop("ai_config_path")
+        self.job.update(source_path="", json_files=["../media.jsonl"])
+        self.write_media_configs()
+        backend = Mock(spec=["read", "register", "write"])
+        sdk, factory = self.sdk(backend)
+        with sdk:
+            result = initialize_media_tasks.main()
+        self.assertEqual((result.total, result.written), (1, 1))
+        factory.assert_called_once_with()
+        backend.read.assert_not_called()
+        backend.register.assert_called_once_with("first", "timeseries", "")
+        backend.write.assert_called_once()
+        self.assertEqual([call[0] for call in backend.mock_calls], ["register", "write"])
+        target, tasks = backend.write.call_args.args
+        self.assertEqual(target, "first")
+        self.assertEqual(list(tasks.columns), TASK_COLUMNS)
+        # 配置处理范围仍为 2021 年；初始化包含 JSON 中 2026 年的完整帖子。
+        self.assertEqual(tasks.index[0], (pd.Timestamp("2026-02-17 00:25:36"), post["id"]))
+        self.assertEqual(tasks.iloc[0]["text"], post["text"])
+        self.assertEqual(tasks.iloc[0]["user_name"], "WuBlockchain")
+        self.assertEqual(tasks.iloc[0]["status"], "0")
+        for column in set(TASK_COLUMNS) - {"text", "user_name", "status"}:
+            self.assertTrue(tasks[column].eq("").all(), column)
+
+    def test_invalid_json_initialization_fails_before_sdk_client_creation(self):
+        self.job.update(source_path="", json_files=["../media.jsonl"])
+        self.write_media_configs()
+        sdk, factory = self.sdk(Mock())
+        for content in ("{bad", "[]", '{"id":"missing"}'):
+            with self.subTest(content=content):
+                (self.root / "media.jsonl").write_text(content, encoding="utf-8")
+                with sdk, self.assertRaises(ValueError):
+                    initialize_media_tasks.main()
+                factory.assert_not_called()
 
     def test_first_round_rejects_inconsistent_paths_before_client_creation(self):
         sdk, factory = self.sdk(object())

@@ -774,9 +774,9 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(result.http_attempts_started, 1)
                 self.assertEqual(backend.tables["result"].iloc[0][stage + "_config_hash"], ai_config_hash(self.config()))
 
-    def test_backfill_is_identified_but_same_time_frontier_and_tail_append_continue(self):
-        for inserted_day, blocked in (("2021-01-15", True), ("2021-01-10", True),
-                                      ("2021-01-20", False), ("2021-01-21", False)):
+    def test_import_skips_history_and_same_time_tasks_and_allows_tail_append(self):
+        for inserted_day, written in (("2021-01-15", 0), ("2021-01-10", 0),
+                                      ("2021-01-20", 0), ("2021-01-21", 1)):
             with self.subTest(day=inserted_day):
                 backend = self.backend([("2021-01-10", "old", ["ETH"], "a"), ("2021-01-20", "later", ["ETH"], "a")])
                 self.relate(backend)
@@ -790,13 +790,14 @@ class RelationRunnerTests(EventFixture, unittest.TestCase):
                 self.assertEqual(summary.new_completed, 0)
                 self.assertEqual(len(backend.updates), previous_updates)
                 pd.testing.assert_frame_equal(backend.tables["result"], before_import)
-                import_event_records_from_table(backend, self.settings(start_time=inserted_day, end_time=inserted_day, ))
+                imported = import_event_records_from_table(
+                    backend, self.settings(start_time=inserted_day, end_time=inserted_day))
+                self.assertEqual(imported.written, written)
                 baseline = backend.tables["result"].copy(deep=True)
-                if blocked:
-                    with self.assertRaisesRegex(ValueError, "疑似历史补录") as caught:
-                        run_relation(backend, scope, ai_config=self.config(), retriever=choose)
-                    self.assertIn("102:0:ETH", str(caught.exception))
-                    self.assertIn("101:0:ETH", str(caught.exception))
+                if not written:
+                    pd.testing.assert_frame_equal(baseline, before_import)
+                    result = run_relation(backend, scope)
+                    self.assertEqual(result.new_completed, 0)
                     pd.testing.assert_frame_equal(backend.tables["result"], baseline)
                 else:
                     result = run_relation(backend, scope, ai_config=self.config(), retriever=choose,

@@ -6,7 +6,7 @@
 
 | 文件 | 需要填写的内容 |
 | --- | --- |
-| `configs/media_post_extraction_config.yaml` | 原始媒体帖子 `source_path`、新第一轮表 `round1_result_path`、本轮日期 |
+| `configs/media_post_extraction_config.yaml` | 原始媒体表 `source_path` 或本地 `json_files` 二选一、新第一轮表 `round1_result_path`、本轮日期 |
 | `configs/media_event_processing_config.yaml` | 同一 `round1_result_path`、相同物理路径的 `round2_result_path` 与 `round3_result_path`、第二三轮日期、可选资产名单和输入字符上限 |
 | `configs/media_round1_ai_config.yaml` | 第一轮接口 URL、模型、请求及运行参数 |
 | `configs/media_round2_ai_config.yaml` | 第二轮接口 URL、模型、请求及运行参数 |
@@ -22,7 +22,30 @@
 
 ## 原帖输入和初始化
 
-原始表需要 `(date, id)` 索引，date 为完整发布时间、id 唯一，普通列至少包含字符串 text、user_name。第一轮初始化完整读取来源，不调用 AI、不按处理日期截取；与现有初始化规则一致。
+初始化支持数据库源表和本地 JSON 文件，在 `configs/media_post_extraction_config.yaml` 中二选一填写来源。
+
+**本地 JSON 文件：** 无需先建立原始帖子表。示例配置如下，文件相对路径从本配置所在目录计算，也可使用绝对路径：
+
+```yaml
+source_path: ""
+json_files:
+  - "../media_posts.jsonl"
+round1_result_path: "填写尚未创建的媒体第一轮任务表路径"
+ai_config_path: "media_round1_ai_config.yaml"
+start_time: null
+end_time: null
+```
+
+支持每行一条帖子的 JSONL/NDJSON、JSON 数组和单条 JSON 对象，可同时填写多个文件；`.json` 文件也兼容每行一条帖子的格式。输入读取 `id`、`created_at`、`text`、`user.screen_name`：
+
+- `id` 接受非空字符串或整数，大整数精确转为字符串，不经过浮点数；拒绝浮点数、布尔值和空 ID。
+- `created_at` 是发布时间，不使用 `fetched_at`。带时区的时间转 UTC 后移除时区，无时区时间按 UTC 理解，保留时间精度。例如 `Tue Feb 17 00:25:36 +0000 2026` 对应任务索引 `2026-02-17 00:25:36`。
+- `text` 原样保留，`user.screen_name` 写入 `user_name`。点赞、转发、引用等其他字段不进入任务表。
+- JSON 导入时过滤正文以 `RT @` 或 `JUST IN` 开头的帖子（区分大小写，不去除前导空格），不按账号或配置日期过滤，包括示例中的 WuBlockchain。过滤后所有文件内相同 ID、发布时间、正文和账号的记录合并；同 ID 任一任务输入不同则在连接 SDK 和注册目标之前报错，并给出冲突字段及来源位置。所有文件均无可导入帖子时停止，不创建空任务表。此规则仅在初始化导入时生效，不会自动清理已导入的任务。
+
+**数据库源表：** `json_files: []`，`source_path` 填已筛选好的媒体原帖表。原始表需要 `(date, id)` 索引，date 为完整发布时间、id 唯一，普通列至少包含字符串 text、user_name。
+
+两种模式均完整读取来源，不调用 AI、不按处理日期截取；`start_time/end_time` 只控制之后第一轮 AI 的处理范围。初始化不读取 AI 配置，不需要提前填写接口、模型或密钥。使用相同入口运行：
 
 ```powershell
 python -X utf8 -m entrypoints.initialize_media_tasks
@@ -80,9 +103,9 @@ repeat 复制同对象、同组、严格此前最近的有效第三轮回答，�
 python -X utf8 -m entrypoints.import_media_events
 ```
 
-独立导入只对本次配置范围展开、核对固定输入。共同索引的 event/asset/source_post_id 冲突、目标在本范围多出源记录时停止；缺失记录用 update_by_index 追加，不覆盖已有分析。
+独立导入只对本次配置范围展开、核对固定输入。共同索引的 event/asset/source_post_id 冲突、目标在本范围多出源记录时停止；仅将索引缺失且 date 严格晚于目标表全表最大时间的记录用 update_by_index 追加，不覆盖已有分析。
 
-自动导入只按已有索引补缺，依赖第一轮成功内容固定，不额外比较已有事件正文。纯新成功批次不读取全部旧事件；包含历史成功帖时可能读取目标表索引补漏。两种路径均不重写已有成功业务结果。
+自动导入和独立导入均不补较早或同刻缺失任务，只追加严格晚于目标表全表最大 date 的事件，保留完整时间精度，所有对象共用截止时间；跳过数量记日志，空表首次导入不受限制。自动导入依赖第一轮成功内容固定，不额外比较已有事件正文。纯新成功批次按元数据只读表尾日的 asset 一列及索引，取得准确截止时刻；包含历史成功帖时仍读取目标表核对已有索引。两种路径均不重写已有成功业务结果。
 
 每阶段复用现有进程锁，同阶段同表不能并行跑不同日期。AI 配置摘要按本轮全表核对，提示词或模型参数冲突不会自动重算成功任务。历史窗口或候选规则不在 AI 摘要中；改处理口径时使用新结果表或明确重算范围，第一轮结果可复用。
 

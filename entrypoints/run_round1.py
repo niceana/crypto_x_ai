@@ -94,7 +94,8 @@ def _run_locked(settings, event_settings):
                 previous_posts=pd.concat(previous_successes).sort_index() if previous_successes else None,
             )
     except Exception:
-        logger.error("事件去重分析表自动导入未完成，round1帖子事件提取表已保存结果保留；重新运行同一范围的第一轮入口可继续补导")
+        logger.error("事件去重分析表自动导入未完成，第一轮已保存结果保留；重新运行同一范围可继续导入，"
+                     "仅追加目标表最大 date 之后的事件，不补历史")
         raise
     logger.info("事件去重分析表自动导入完成：新增=%d", imported)
     return summary

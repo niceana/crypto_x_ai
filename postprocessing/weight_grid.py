@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from postprocessing.weight_data import (
-    SOURCE_COLUMNS, _validate_weight_request, _write_weight_features, parse_weight_features, read_weight_events,
+    SOURCE_COLUMNS, _validate_weight_request, _write_weight_features, load_weight_assets, normalize_weight_assets,
+    parse_weight_features, read_weight_events,
 )
 from postprocessing.weight_parameters import WeightGridPlan, prepare_weight_grid
 
@@ -25,7 +26,7 @@ def _write_manifest(path, manifest):
     temporary.replace(path)
 
 
-def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
+def run_weight_grid(cli, settings, *, prepared=None, report_dir=None, assets=None):
     """返回各参数表摘要和 manifest_path；不在返回值中保留 DataFrame。"""
     _validate_weight_request(settings.result_path, settings.weight_path, settings.start_time, settings.end_time)
     plan = prepared if prepared is not None else prepare_weight_grid(
@@ -49,12 +50,16 @@ def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
     logger.info("权重参数网格开始：组合=%d，清单=%s", len(plan.variants), manifest_path)
     current = None
     try:
+        manifest["asset_list_path"] = settings.round2_asset_list_path if assets is None else None
+        columns = normalize_weight_assets(load_weight_assets(cli, settings.round2_asset_list_path)
+                                         if assets is None else assets)
+        assets = list(columns.values())
+        manifest["output_columns"] = assets
         results = read_weight_events(cli, settings.result_path, settings.start_time, settings.end_time,
                                     columns=SOURCE_COLUMNS, label="权重网格来源读取")
+        results = results.loc[results["asset"].isin(columns)]
         features = parse_weight_features(results)
         del results
-        if features.empty:
-            raise ValueError("结果表没有事件，无法确定权重表的资产列")
         manifest["source_rows"] = len(features)
         manifest["source_assets"] = sorted(features["asset"].unique())
         for variant, entry in zip(plan.variants, manifest["variants"]):
@@ -66,7 +71,7 @@ def run_weight_grid(cli, settings, *, prepared=None, report_dir=None):
                         variant.parameters.aggregation_method, variant.table_path)
             saved = _write_weight_features(cli, features, settings.result_path, variant.table_path,
                                             start_time=settings.start_time, end_time=settings.end_time,
-                                            parameters=variant.parameters)
+                                            parameters=variant.parameters, assets=assets)
             entry.update(status="completed", hours=len(saved), assets=len(saved.columns),
                          start_time=saved.index[0].strftime("%Y-%m-%d %H:%M:%S"),
                          end_time=saved.index[-1].strftime("%Y-%m-%d %H:%M:%S"))

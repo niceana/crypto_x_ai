@@ -178,6 +178,82 @@ class EventImportTests(EventFixture, unittest.TestCase):
             import_event_records_from_posts(backend, self.settings(), new_posts=source, previous_posts=source)
         self.assertFalse(backend.meta_reads or backend.reads or backend.registers or backend.writes or backend.appends)
 
+    def test_memory_import_skips_historical_gaps_in_both_success_sources(self):
+        source = source_posts([("2021-01-01", "missing history", ["ETH"], "a"),
+                               ("2021-01-02", "saved", ["ETH"], "a"),
+                               ("2021-01-03", "new tail", ["ETH"], "a")])
+        existing = expand_first_round(source.iloc[1:2])
+        existing.loc[:, ["round2_status", "round3_status"]] = "1"
+        for recovering in (False, True):
+            with self.subTest(recovering=recovering):
+                backend = Tables(source, existing)
+                before = source.copy(deep=True)
+                arguments = {"new_posts": source}
+                if recovering:
+                    arguments = {"new_posts": source.iloc[2:], "previous_posts": source.iloc[:2]}
+                with self.assertLogs("initialization.event_records", level="WARNING") as logged:
+                    written = import_event_records_from_posts(backend, self.settings(), **arguments)
+                self.assertEqual(written, 1)
+                self.assertIn("不补历史", "\n".join(logged.output))
+                self.assertEqual(list(backend.appends[0]["event"]), ["new tail"])
+                self.assertEqual(set(backend.tables["result"]["event"]), {"saved", "new tail"})
+                pd.testing.assert_frame_equal(backend.tables["result"].loc[existing.index], existing)
+                pd.testing.assert_frame_equal(source, before)
+                self.assertFalse(backend.updates or backend.writes or backend.registers)
+
+    def test_new_success_import_uses_actual_global_maximum_with_nanosecond_precision(self):
+        source = source_posts([
+            ("2021-01-02 12:00:00.123456789", "saved BTC", ["BTC"], "a"),
+            ("2021-01-02 12:00:00.123456788", "earlier ETH", ["ETH"], "a"),
+            ("2021-01-02 12:00:00.123456789", "same time ETH", ["ETH"], "a"),
+            ("2021-01-02 12:00:00.123456790", "later ETH", ["ETH"], "a"),
+        ])
+        existing = expand_first_round(source.iloc[:1])
+        backend = Tables(source, existing)
+        # 元数据可能只提供日期，不能把 00:00 当成实际表尾时间。
+        backend.metadata["result"] = {"meta": {"start_time": "2021-01-02", "end_time": "2021-01-02"}}
+        with self.assertLogs("initialization.event_records", level="WARNING") as logged:
+            written = import_event_records_from_posts(backend, self.settings(), new_posts=source.iloc[1:])
+        self.assertEqual(written, 1)
+        self.assertEqual(backend.column_reads, [("result", "2021-01-02", "2021-01-02", ["asset"])])
+        self.assertEqual(list(backend.appends[0]["event"]), ["later ETH"])
+        self.assertEqual(backend.appends[0].index[0][0], source.index[3][0])
+        self.assertIn("数量=2", "\n".join(logged.output))
+        pd.testing.assert_frame_equal(backend.tables["result"].loc[existing.index], existing)
+
+    def test_table_import_skips_older_and_same_time_gaps_and_remains_idempotent(self):
+        source = source_posts([("2021-01-01", "missing history", ["ETH"], "a"),
+                               ("2021-01-02", "saved", ["BTC"], "a"),
+                               ("2021-01-02", "same time", ["ETH"], "a"),
+                               ("2021-01-03", "new tail", ["ETH"], "a")])
+        existing = expand_first_round(source.iloc[1:2])
+        backend = Tables(source, existing)
+        with self.assertLogs("initialization.event_records", level="WARNING") as logged:
+            summary = import_event_records_from_table(backend, self.settings())
+        self.assertEqual((summary.total, summary.written), (2, 1))
+        self.assertIn("数量=2", "\n".join(logged.output))
+        self.assertEqual(list(backend.appends[0]["event"]), ["new tail"])
+        with self.assertLogs("initialization.event_records", level="WARNING"):
+            summary = import_event_records_from_table(backend, self.settings())
+        self.assertEqual((summary.total, summary.written), (2, 0))
+        self.assertEqual(len(backend.appends), 1)
+        pd.testing.assert_frame_equal(backend.tables["result"].loc[existing.index], existing)
+
+    def test_new_success_import_stops_if_metadata_tail_has_no_records(self):
+        source = source_posts([("2021-01-01", "saved", ["ETH"], "a"),
+                               ("2021-01-02", "new tail", ["ETH"], "a")])
+        existing = expand_first_round(source.iloc[:1])
+        backend = Tables(source, existing)
+        read = backend.read
+        def missing_tail(path, **options):
+            result = read(path, **options)
+            return result.iloc[:0] if options.get("columns") == ["asset"] else result
+        backend.read = missing_tail
+        with self.assertRaisesRegex(ValueError, "表尾读取为空"):
+            import_event_records_from_posts(backend, self.settings(), new_posts=source.iloc[1:])
+        self.assertFalse(backend.appends or backend.updates or backend.writes or backend.registers)
+        pd.testing.assert_frame_equal(backend.tables["result"], existing)
+
     def test_expansion_deduplicates_symbols_skips_empty_and_preserves_original_index(self):
         source = source_posts([("2018-01-01 12:12:12", "fact", [" eth ", "ETH", "LEND"], "a"),
                                ("2018-01-02 12:12:12", "mapped", [], "b"),
@@ -266,7 +342,7 @@ class EventImportTests(EventFixture, unittest.TestCase):
         self.assertFalse(backend.updates)
         pd.testing.assert_frame_equal(backend.tables["result"].loc[previous.index], previous)
 
-    def test_successful_only_import_skips_failed_posts_and_imports_them_after_retry(self):
+    def test_successful_only_import_does_not_backfill_same_time_after_retry(self):
         source = source_posts([("2021-01-01", "ready", ["ETH"], "a"),
                                ("2021-01-01", "retry", ["ETH"], "a")])
         backend = Tables(source)
@@ -277,12 +353,13 @@ class EventImportTests(EventFixture, unittest.TestCase):
         self.relate(backend)
         previous = backend.tables["result"].copy(deep=True)
         backend.tables["first"].iloc[1, source.columns.get_loc("status")] = "1"
-        summary = import_event_records_from_table(backend, self.settings(), successful_only=True)
-        self.assertEqual(summary.written, 1)
+        with self.assertLogs("initialization.event_records", level="WARNING"):
+            summary = import_event_records_from_table(backend, self.settings(), successful_only=True)
+        self.assertEqual(summary.written, 0)
         pd.testing.assert_frame_equal(backend.tables["result"].loc[previous.index], previous)
         self.assertEqual(import_event_records_from_table(backend, self.settings(),
                                                  successful_only=True).written, 0)
-        self.assertEqual(len(backend.appends), 1)
+        self.assertEqual(len(backend.appends), 0)
 
     def test_successful_only_import_uses_run_range_and_does_not_parse_failed_results(self):
         source = source_posts([("2021-01-01", "outside", [], "unmapped"),

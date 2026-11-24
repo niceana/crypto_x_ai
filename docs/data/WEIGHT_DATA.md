@@ -49,7 +49,17 @@ weight_path 是基础路径，默认实际目标为 `{weight_path}/{aggregation_
 
 ## 数据口径
 
-`build_basic_df(results, parameters=WeightParameters(...))` 仅为第二、三轮状态均为字符串 `"1"` 的源记录生成一行，恰好包含 `date`、`asset`、`data` 三列。省略参数时使用默认标量参数。源表的 `(date, record_id)` 索引须唯一。任一轮状态不为 `"1"` 的记录直接跳过，不解析回答，也不参与评分或本批资产列生成；日志记录参与和跳过的数量。读取数据库时只选择 asset、event_relation、round3_ai_response、round2_status、round3_status 五列，不再读取 event_id，不读取向量、原文或用量等其他列。整个网格只读取一次源数据、解析一次成功记录的回答，保留原始枚举特征供所有组合复用，逐组合生成、保存并释放 DataFrame。
+`build_basic_df(results, parameters=WeightParameters(...))` 仅为第二、三轮状态均为字符串 `"1"` 的源记录生成一行，恰好包含 `date`、`asset`、`data` 三列。省略参数时使用默认标量参数。源表的 `(date, record_id)` 索引须唯一。任一轮状态不为 `"1"` 的记录直接跳过，不解析回答，也不参与评分；日志记录参与和跳过的数量。网格入口先按外部资产名单筛选，再解析回答。读取数据库时只选择 asset、event_relation、round3_ai_response、round2_status、round3_status 五列，不再读取 event_id，不读取向量、原文或用量等其他列。整个网格只读取一次资产对象和源数据、解析一次名单内成功记录的回答，保留原始枚举特征供所有组合复用，逐组合生成、保存并释放 DataFrame。
+
+资产列与实盘的传入 assets 规则一致。命令行从 `round2_asset_list_path` 指向的 JSON 读取 `InstrumentList`，必须非空；Python 可显式传入 `assets` 覆盖配置。每项去首尾空白、转大写；币名补 `.USDT.UFUTURE.BINANCE` 后缀，完整交易资产名保留名称。以第一个点前的币名匹配源表 asset，拒绝同币名重复。输出列始终保持名单顺序；名单外事件不会参与评分或生成列。
+
+日志中的“跳过未成功事件=N”按事件记录计数：round2_status 或 round3_status 任一不等于字符串 `"1"` 即跳过，同一资产其余成功记录仍计入。跳过包括待处理 `"0"`、已认领 `"9"`、最终失败 `"-1"` 及其他非成功值；日志同时显示按资产和两轮状态分组的数量。只读查询明细命令如下，须使用生成权重时的同一份配置：
+
+```powershell
+python -X utf8 -m entrypoints.audit_skipped_weight_events --config configs/event_processing_config.yaml
+```
+
+查询复用权重的名单过滤及首尾完整窗口补读，只按列读取 asset、round2_status、round3_status、event_relation、event、error_message，不解析 AI 回答，不调用模型，不写库。默认新建 `reports/skipped_weight_events/<北京时间>/`，可用 `--output-dir` 指定尚不存在的目录。skipped_events.csv 包含完整原始发布时间（含小数秒）、record_id、资产、状态、事件和错误原因；assets.csv 对受影响资产列出 total_events、successful_events、skipped_events；status_counts.csv 按资产和两轮状态组合计数；summary.json 记录来源、名单路径、精确窗口、数量及文件路径。终端打印 summary.json 的内容。报告是当前状态快照，若之后补跑或继续写入，数量可能与此前日志不同。
 
 - `date`：保留源记录完整发布时间，例如 `2017-08-17 15:20:10`，不在 basic_df 中截断时间。若原索引带时区，仅去掉时区信息，不转换年月日时分秒。
 - `asset`：使用源表原值，不按事件组去重，不合并币种别名。
@@ -67,15 +77,15 @@ weight_path 是基础路径，默认实际目标为 `{weight_path}/{aggregation_
 
 repeat 的响应已由第三轮填充保存。权重阶段对 new/update/repeat 一视同仁，只解析本行已保存的响应，再使用本行 event_relation 的映射值。这里不建立历史、不查找同事件组、不复制或继承其他行的响应，basic_df 保留源表行顺序。
 
-两轮状态均成功的记录（包括 repeat）没有回答、必要分析字段缺失、评分字段没有配置映射或 JSON 解析失败时，计算直接失败，不静默排除或填零。可在相应评分字段下增加枚举映射。如果范围内没有两轮均成功的记录，停止计算，不创建权重表。
+名单内两轮状态均成功的记录（包括 repeat）没有回答、必要分析字段缺失、评分字段没有配置映射或 JSON 解析失败时，计算直接失败，不静默排除或填零。可在相应评分字段下增加枚举映射。外部名单和起止日期明确时，即使范围内没有有效事件，也生成全部名单列的零权重表；未传名单的低层调用仍保留空事件报错的旧行为。
 
-`build_weight_data(basic_df, start_time=..., end_time=..., aggregation_method="sum")` 将事件映射到 `(date + 15分钟).floor("h") + 1小时`，再按目标整点和 asset 使用所选算法聚合。整点 T 对应左闭右开窗口 `[T-75分钟, T-15分钟)`，例如 `[16:45:00, 17:45:00)` 统一计入 `18:00:00`；`17:45:00` 则计入 `19:00:00`，每条事件只落入一个窗口。切换为 `max_abs` 不改变时间归属和写库偏移。
+`build_weight_data(basic_df, assets=assets, start_time=..., end_time=..., aggregation_method="sum")` 将事件映射到 `(date + 15分钟).floor("h") + 1小时`，再按目标整点和 asset 使用所选算法聚合。整点 T 对应左闭右开窗口 `[T-75分钟, T-15分钟)`，例如 `[16:45:00, 17:45:00)` 统一计入 `18:00:00`；`17:45:00` 则计入 `19:00:00`，每条事件只落入一个窗口。切换为 `max_abs` 不改变时间归属和写库偏移。
 
 上述内存构建仍使用源时间轴。在评分、聚合和补零完成后，写库入口最后执行 `weight_data.index = weight_data.index + pd.Timedelta(hours=8)`，再按平移后的索引与数据库对齐。不进行时区本地化。例如 `2017-12-31 16:45 → 18:00 → 实际写入 2018-01-01 02:00`。`write_weight_data` 返回值及网格清单中的输出范围均使用平移后的索引。
 
 - 单层索引名为 `date`，类型为 `DatetimeIndex`，dtype 为 `datetime64[ns]`，每条时间均为整点，排序且唯一。时间本身为 datetime，不转换成日期字符串写库。
-- 内存时间轴从 `start_time 00:00:00` 连续到 end_time 次日 `01:00:00`，写库后对应从 `start_time 08:00:00` 到 end_time 次日 `09:00:00`。这样结束日 `23:45` 及之后的事件也有目标行。无事件小时补零。单独在内存调用时可省略 end_time，此时结束在最后事件所归属的目标整点。范围内没有事件时停止，不创建无资产列的表。
-- 列名为读取范围内去重资产加 `.USDT.UFUTURE.BINANCE`，按资产名称排序。入库续写时再与已有表资产列取并集，保留此前批次的列。
+- 内存时间轴从 `start_time 00:00:00` 连续到 end_time 次日 `01:00:00`，写库后对应从 `start_time 08:00:00` 到 end_time 次日 `09:00:00`。这样结束日 `23:45` 及之后的事件也有目标行。无事件小时补零。单独在内存调用时可省略 end_time，此时结束在最后事件所归属的目标整点；空事件调用必须明确 end_time。
+- 列名及顺序由外部资产名单确定，名单内无有效事件仍保留零列。低层单表接口省略 assets 时兼容原有从事件去重排序生成列、续写合并历史列的行为；命令行始终使用外部名单。
 - 分数、聚合、补零和写库全程使用 float64，保留 0.5、1.5 等小数。所有资产列 dtype 为 float64，单元格为浮点数，例如 `4.5`、`-2.5` 和 `0.0`；date 索引保留 datetime 类型。无事件的小时和资产组合补浮点零，不向前延续权重，不累计前面小时。
 
 例如默认参数下，BTC 在 `16:50` 有利好、高、已完成、new，贡献 18；`17:20` 有利空、中、执行中、update，贡献 -6；`17:40` 的 repeat 本行已保存利空、中、执行中，贡献 `-1 × 2 × 2 × 0.5 = -2`。三条事件在内存中聚合到 `18:00:00`，最终写入次日 `02:00:00` 行，`sum` 的 BTC 权重为浮点数 `10.0`，`max_abs` 则为 `18.0`。
@@ -94,11 +104,11 @@ python -X utf8 -m entrypoints.write_weight_data --dry-run
 python -X utf8 -m entrypoints.write_weight_data
 ```
 
-统一读取 `configs/event_processing_config.yaml` 中的 result_path、weight_path、start_time、end_time 和 weight_grid。weight_path 留空供运行前填写，作为参数表的基础路径。实际运行的 start_time/end_time 必须同时配置为 `YYYY-MM-DD`，包含起止日全天，不允许留空后读取全表。预览模式不要求填写日期。输出时间轴也使用本次读取范围，不再有固定历史起点。可用 `--config` 指定另一份同结构的事件配置。
+统一读取 `configs/event_processing_config.yaml` 中的 result_path、weight_path、round2_asset_list_path、start_time、end_time 和 weight_grid。weight_path 留空供运行前填写，作为参数表的基础路径；round2_asset_list_path 必须指向非空有效名单，读取失败或名单无效时停止，不回退到事件资产。实际运行的 start_time/end_time 必须同时配置为 `YYYY-MM-DD`，包含起止日全天，不允许留空后读取全表。预览模式不要求填写日期，不读取资产对象。输出时间轴也使用本次读取范围，不再有固定历史起点。可用 `--config` 指定另一份同结构的事件配置。
 
 实际运行在 `reports/weight_grid/<北京时间>/manifest.json` 保存清单，也可用 `--report-dir "一个尚不存在的新目录"` 指定位置。清单包含公式、评分版本、完整候选配置、每个组合的标量参数和完整哈希、目标路径、处理状态、完成数量及输出范围。状态为 pending、running、completed、failed 或 interrupted。某张表失败时停止后续组合，记录错误，已成功表保留。重跑会生成新清单，按相同参数定位原表并重新对齐更新；没有变化的已完成行不再提交。
 
-这个目录保存本地运行记录，不保存权重 DataFrame，权重数据仍在数据库中。它用于核对参数和表名、查看失败位置；重跑根据数据库实际索引和数据更新，不依赖旧清单。删除旧清单不影响数据库表。清单的 output_time_offset_hours 为 8，逐表输出范围记录平移后的时间。
+这个目录保存本地运行记录，不保存权重 DataFrame，权重数据仍在数据库中。它用于核对参数和表名、查看失败位置；重跑根据数据库实际索引和数据更新，不依赖旧清单。删除旧清单不影响数据库表。清单的 output_time_offset_hours 为 8，逐表输出范围记录平移后的时间；asset_list_path 记录实际使用的名单路径（显式传 assets 时为 null），output_columns 记录实际输出列及顺序。
 
 为算完整首尾窗口，源表一次读取 `start_time` 前一日至 `end_time` 次日，再精确筛选 `[start_time 前一日22:45, end_time 次日00:45)`。因此窗口边缘可能使用配置日期以外的事件；区间外事件不参与评分或资产列生成。客户端若返回请求日期以外的数据仍在注册前停止。补读只用于覆盖事件窗口，写库时间的 +8 小时不用于平移源读取日期。
 
@@ -107,23 +117,15 @@ python -X utf8 -m entrypoints.write_weight_data
 - 首次缺表时注册 timeseries，再用 cli.write 初始化；已注册但尚无行列的空目标只初始化，不重复注册。
 - 已有表以 date 整点 DatetimeIndex 对齐；重叠小时由 update_by_column 替换为本批重新计算值，缺少的小时通过 update_by_index 追加，追加批次只包含新索引。
 - 本批起点（平移后为起始日 08:00）也使用补读的完整窗口重新计算，不再保留旧的边界值；相邻批次的重叠窗口会得到相同结果，重跑可修正边界事件分数。
-- 资产列取本批与已有表的并集。本批没有事件的旧资产在新小时补浮点零；新资产先用 update_by_column 将已有历史行补为浮点零，再保存当前计算值。已有列在本批范围外的值保持原样。
+- 资产列固定为名单列，续写按列名对齐，不要求已有表的列顺序与名单一致。名单可在任意位置新增资产，先用 update_by_column 将其已有历史行补为浮点零，再保存当前计算值。已有表保留原列顺序，返回值按名单顺序排列；只有已有表出现名单外列时，才在本表任何写入前停止并提示使用新的 weight_path，不删除旧表历史列。已有列在本批范围外的值保持原样。
 - 旧版保存的字符串权重在本批覆盖范围内改写为浮点数，数值相同但类型不同的行也会提交；范围外的历史字符串不自动迁移，需按对应日期范围重跑。参数标识和目标表路径不因本次类型调整而改变。
 - 同范围重复运行以计算结果替换旧值，不相加；无变化行不提交。各阶段沿用存储重试，最多三次，同一阶段重试同一批，不重新计算或注册。
 
-例如先生成 12 月 31 日再生成 1 月 1 日，两批都补读 `[12-31 23:45, 01-01 00:45)`，该窗口最终写入 `01-01 09:00`；后一批对完整窗口重算替换，不漏掉前一天最后 15 分钟，也不重复累加。重复运行不会再次平移已有表索引。返回的本批 df 包含本次重新计算的边界值及合并后的资产列，不返回整张历史表。
+例如先生成 12 月 31 日再生成 1 月 1 日，两批都补读 `[12-31 23:45, 01-01 00:45)`，该窗口最终写入 `01-01 09:00`；后一批对完整窗口重算替换，不漏掉前一天最后 15 分钟，也不重复累加。重复运行不会再次平移已有表索引。返回的本批 df 包含本次重新计算的边界值及全部名单列，不返回整张历史表。
 
-保存前从源表两轮状态均成功记录的 asset 原值去重生成本批预期列集合，与本批生成 DataFrame 的列名比较。列名重复、多出或缺少时停止并列出差异；核对通过后日志打印本次实际使用的 result_path、weight_path 和去重 asset 原值。列重命名按资产标签映射，不使用 record_id、event_id 或配置中的账号币种名单。核对后才合并已有表的历史资产列。
+保存前从外部名单生成预期列及顺序，与本批生成 DataFrame 比较。列名重复、多出、缺少或顺序不符时停止并列出差异；核对通过后日志打印本次实际使用的 result_path、weight_path、事件中的去重 asset 和完整输出列。列重命名按名单中的币名映射，不使用 record_id、event_id 或配置中的账号币种名单。
 
 保存失败会立即停止后续阶段；此前已成功的更新保留。再次运行时重新读取目标实际索引和数据，重算并对齐后续写，支持注册后初始化失败、更新成功但追加失败等情况。各阶段不是共同事务。
-
-已有表的列名来源核对命令为：
-
-```powershell
-python -X utf8 -m entrypoints.audit_weight_columns --param-id <预览中的参数标识>
-```
-
-配置只有一个组合时可省略 --param-id。此命令使用同一个 event_processing_config.yaml，仅读取配置范围内源表的 asset 和所选参数权重表，不注册、不写入、不重新请求 AI。输出实际表路径、日期范围、source_assets（源表去重值）、expected_columns（本批应有列）、actual_columns（已有列）、unexpected_columns（本批来源中没有的列）和 missing_columns（缺少的列）。续写表保留历史批次资产，因此 unexpected_columns 也可能是其他批次的合法资产，需结合此前范围核对。
 
 执行整个网格，返回各组合摘要和参数清单路径，不返回所有 DataFrame：
 
@@ -139,17 +141,19 @@ print(summary["manifest_path"], summary["tables"])
 只计算一个组合的内存数据，继续返回单个 DataFrame；显式参数对象采用标量：
 
 ```python
-from postprocessing.weight_data import SOURCE_COLUMNS, build_basic_df, build_weight_data
+from postprocessing.weight_data import SOURCE_COLUMNS, build_basic_df, build_weight_data, load_weight_assets, normalize_weight_assets
 from common.config import load_event_config
 from postprocessing.weight_parameters import WeightParameters
 
 settings = load_event_config("configs/event_processing_config.yaml")
+assets = load_weight_assets(cli, settings.round2_asset_list_path)
 results = cli.read(settings.result_path, start_time=settings.start_time,
                    end_time=settings.end_time, columns=SOURCE_COLUMNS)
+results = results.loc[results["asset"].isin(normalize_weight_assets(assets))]
 parameters = WeightParameters(B=2, mappings={"materiality": {"高": 5}}, aggregation_method="max_abs")
 basic_df = build_basic_df(results, parameters=parameters)
 weight_data = build_weight_data(basic_df, start_time=settings.start_time, end_time=settings.end_time,
-                                aggregation_method=parameters.aggregation_method)
+                                aggregation_method=parameters.aggregation_method, assets=assets)
 ```
 
-若已用 `parse_weight_features(results)` 解析特征，可重复调用 `score_weight_features(features, parameters)` 生成不同组合的 basic_df。单组合写库接口为 `write_weight_data(..., parameters=parameters)`，返回本批实际保存的一个 DataFrame，目标路径由调用方明确提供；可用 `prepare_weight_grid(settings.weight_path, settings.weight_grid).variants` 中的 table_path 和 parameters 保持路径与参数一致。
+若已用 `parse_weight_features(results)` 解析特征，可重复调用 `score_weight_features(features, parameters)` 生成不同组合的 basic_df。单组合写库接口为 `write_weight_data(..., assets=assets, parameters=parameters)`，返回本批实际保存的一个 DataFrame，目标路径由调用方明确提供；可用 `prepare_weight_grid(settings.weight_path, settings.weight_grid).variants` 中的 table_path 和 parameters 保持路径与参数一致。网格接口 `run_weight_grid(cli, settings, assets=assets)` 可以直接接收宿主名单，省略 assets 时从配置路径读取。

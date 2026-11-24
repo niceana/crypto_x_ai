@@ -53,8 +53,9 @@ round3_ai_config_path: "round3_ai_config.yaml"
 # 连跑时第三轮先处理第二轮已成功的记录，跳过第二轮 0/9/-1，保留待后续补跑。
 # false 恢复严格检查：目标范围内第二轮存在任何未完成记录即停止第三轮。
 round3_skip_incomplete_round2: true
-# 第二、三轮每次启动时用 cli.read_object 读取此 JSON，UTF-8 解码，取 InstrumentList 每项第一个点之前的币名并去重。
-# 两轮共用此配置项，仅处理名单内的 asset；留空字符串时处理所有资产。本项不筛选权重入口。
+# 第二、三轮每次启动时读取此 JSON，取 InstrumentList 每项第一个点之前的币名并去重；留空时处理所有资产。
+# 权重、标签实验及跳过事件查询入口也读取此名单，必须非空；权重按原数组顺序固定输出列，无信号填零。
+# 权重名单支持币名或完整交易资产名，去空白并转大写；币名补默认后缀，同币名重复时报错，与实盘一致。
 round2_asset_list_path: "crypto_1m/research_prod/meta/alphas/Cpt380_BA_Daily_Update_All.json"
 # 第二、三轮和权重入口必须填写本次读取的起止日期（YYYY-MM-DD，含首尾日），未设置会停止。
 # 仅独立导入保留两端为空时的原有全范围规则。

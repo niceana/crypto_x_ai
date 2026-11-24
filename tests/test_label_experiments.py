@@ -18,8 +18,7 @@ from postprocessing.label_experiments import (
 )
 from postprocessing.weight_data import ASSET_SUFFIX, SOURCE_COLUMNS, parse_weight_features
 from postprocessing.weight_parameters import WeightParameters, prepare_weight_grid
-from tests.event_support import Tables
-from tests.test_weight_data import result_frame
+from tests.test_weight_data import AssetTables as Tables, result_frame
 
 
 RANGE = {"start_time": "2023-01-01", "end_time": "2023-01-01"}
@@ -45,7 +44,8 @@ def source_events():
 
 
 def settings():
-    return EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights", **RANGE)
+    return EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights",
+                       round2_asset_list_path="assets.json", **RANGE)
 
 
 class LabelExperimentTests(unittest.TestCase):
@@ -53,6 +53,21 @@ class LabelExperimentTests(unittest.TestCase):
         self.plan = prepare_label_experiments("weights")
         self.entries = {entry["name"]: entry for entry in self.plan["variants"]}
         self.features = parse_weight_features(source_events())
+
+    def test_runtime_uses_fixed_assets_for_all_label_groups_even_without_signals(self):
+        for assets, successful in ((["SOL", "BTC"], 2), (["SOL", "ADA"], 0)):
+            with self.subTest(assets=assets), tempfile.TemporaryDirectory() as temporary:
+                backend = Tables(pd.DataFrame(), source_events(), assets=assets)
+                summary = run_label_experiments(backend, settings(), report_dir=Path(temporary) / "run")
+                manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(backend.object_reads, ["assets.json"])
+            self.assertEqual(manifest["successful_events"], successful)
+            for entry in summary["tables"]:
+                weight = backend.tables[entry["table_path"]]
+                self.assertEqual(list(weight.columns), [asset + ASSET_SUFFIX for asset in assets])
+                self.assertTrue(weight["SOL" + ASSET_SUFFIX].eq(0).all())
+                if not successful:
+                    self.assertTrue(weight.eq(0).all().all())
 
     def positions(self, name):
         return build_label_positions(self.features, self.entries[name], **RANGE)
@@ -210,7 +225,7 @@ class LabelExperimentTests(unittest.TestCase):
             summary = run_label_experiments(backend, settings(), report_dir=output / "first")
             manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "completed")
-            self.assertEqual((manifest["source_rows"], manifest["successful_events"]), (6, 5))
+            self.assertEqual((manifest["source_rows"], manifest["successful_events"]), (5, 5))
             self.assertEqual(summary["completed"], 25)
             self.assertEqual(backend.column_reads, [("result", "2022-12-31", "2023-01-02", SOURCE_COLUMNS)])
             self.assertEqual(len(pd.read_csv(summary["tables_path"])), 25)
@@ -269,7 +284,7 @@ class LabelExperimentTests(unittest.TestCase):
         following.index = pd.MultiIndex.from_tuples([("2023-01-02 00:20:00", "following")], names=source.index.names)
         backend = Tables(pd.DataFrame(), pd.concat([source, late, following]))
         second = EventConfig("first", "result", "round2.yaml", "round3.yaml", weight_path="weights",
-                             start_time="2023-01-02", end_time="2023-01-02")
+                             start_time="2023-01-02", end_time="2023-01-02", round2_asset_list_path="assets.json")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             run_label_experiments(backend, settings(), report_dir=root / "first")

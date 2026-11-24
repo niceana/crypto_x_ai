@@ -5,6 +5,7 @@
 ## 配置与交接
 
 - 第一轮读取 `configs/post_extraction_config.yaml` 的任务表和日期；正常结束后，才将本次范围内成功帖自动导入事件表。
+- 自动导入和独立导入只追加严格晚于目标事件表全表最大 `date` 的事件，不补历史或同刻缺失任务。比较保留时分秒及精度，截止时间由所有资产共用，跳过数量记日志；空表首次导入全部本批合法事件。重跑仍可导入超过表尾的已成功帖子，但较早失败帖后来成功也不会补入旧位置。
 - 向量、第二轮、第三轮读取 `configs/event_processing_config.yaml` 的表路径和日期。`first_round_task_path` 须指向实际第一轮任务表，`result_path` 须与第一轮自动导入目标相同。日期不会自动沿用第一轮配置。
 - 向量和第二轮入口只读检查配置范围内的第一轮状态，存在未成功帖子时停止。第一轮全成功后仍须确认导入完成，再进入下游。
 - 第三轮保留 `round3_skip_incomplete_round2` 的原有行为：当前配置为 `true`，可以先处理第二轮成功部分，跳过未完成记录；关闭时要求整个目标范围第二轮完成。补跑第二轮后，再运行第三轮补齐。
@@ -65,7 +66,7 @@ tail -f round2.log
 
 | 入口 | 互斥依据 | 持锁范围 |
 | --- | --- | --- |
-| `append_tasks` | round1 + 实际 task_path，与 `run_round1` 共用锁 | 原表核对、任务预览或备份及追加 |
+| `append_tasks` | round1 + 实际 task_path，与 `run_round1` 共用锁 | 原表核对、任务预览、备份、待处理正文刷新及追加 |
 | `run_round1` | round1 + 实际 task_path | 创建客户端之前，直到提取及自动导入全部结束 |
 | `prepare_vectors` | vectors + result_path | 整次向量准备 |
 | `run_round2` | round2 + result_path | 包括上游检查、状态恢复、AI 和写入 |
@@ -96,14 +97,33 @@ export CRYPTO_X_AI_LOCK_DIR=/var/tmp/crypto_x_ai_locks
 
 从 2023 年扩展到 2025 年时，保留实际任务表、事件表及核心处理配置，分别调整帖子配置和事件配置的日期。先确认第一轮任务表已经包含新增年份帖子；仅原始帖子表有数据不够。处理入口不会自动补入源帖，首次初始化入口也不是增量追加命令，不要在已有任务表上重新初始化。
 
-对于通过 `supplement_posts apply` 补入的批次，使用同一个补录目录追加第一轮任务：
+新帖已经在爬虫结果表时，`post_extraction_config.yaml.source_path` 填爬虫表，`task_path` 指向已有任务表，日期填本次 UTC 发布时间范围（含首尾日全天，两端同时 `null` 为全部），直接运行：
+
+```bash
+python -X utf8 -m entrypoints.append_tasks preview
+python -X utf8 -m entrypoints.append_tasks apply
+```
+
+爬虫表是单层采集时间 `date` 索引，`id/created_at/text/username` 为普通列。入口完整读取所需四列，将 `username` 映射为任务表 `user_name`，用 `created_at` 规范为无时区 UTC 的发布时间，再筛选配置日期并与完整任务表按 `(date,id)` 求差集。采集时间不作为任务时间，也不用于数据库读取的日期筛选。重复采集且输入一致的同 ID 帖子合并；同 ID 不同发布时间或输入冲突会停止。不会以任务表最大时间为起点，避免遗漏同刻新 ID 或较早漏帖。
+
+新增任务清单输出在 `reports/append_tasks/<时间戳>/round1_tasks_to_append.csv`。同一 `(date,id)` 的账号一致且仅正文不同时，`status=0` 列入 `round1_text_updates.csv`，`status=1` 保留原正文和结果。`apply` 使用相同配置重新读表检查，范围内新到的帖子也参与处理；写入前完整备份任务表，随后先按列只刷新待处理任务的 `text`，再追加状态为 `0` 的新任务。所有已有状态、账号、摘要和 AI 结果保留。不注册新表、不调用 AI。新爬虫表结构只用于此追加模式，首次初始化仍使用旧发布时间 `date/id` 双层索引源表。正文刷新成功但追加失败时，重跑按当前表状态继续，不会重复刷新已一致的正文。
+
+直接读取爬虫表时，先完整读取一次已有任务表，将全表各状态、各日期的 `user_name` 去重作为目标账号集合，忽略大小写、首尾空格和空账号，仅保留爬虫 `username` 命中的帖子；账号规范化仅用于集合匹配，仍保存原始账号文本。目标集合为空则不导入。任务表快照复用于后续比较及备份，不重复读取。
+
+随后在内存排除 `username` 为 `WuBlockchain` 的记录（账号忽略大小写和首尾空格），以及 `text` 以 `RT @` 或 `JUST IN ` 开头的记录（后者末尾有空格，正文前缀区分大小写且不去除前导空格），再校验数据及检查冲突。同 ID 的其他保留记录仍参与处理。日志和摘要 `target_account_count` 显示目标账号数，`excluded_non_target_rows` 显示非目标账号剔除采集行数；之后 `excluded_rows` 为 WuBlockchain 剔除数，`excluded_prefix_rows` 为剩余记录中的前缀剔除数，按此顺序不重复计数。过滤的“剔除/保留”统计尚未按 ID 去重或筛选发布时间；后续日志另报过滤后唯一帖子数和发布时间范围内帖子数。原始数据库记录和已有任务保留。
+
+若报“爬虫表同一 ID 的发布时间、正文或账号不一致”，重新执行 `append_tasks preview`，查看报错中的冲突 ID、差异字段和 `crawler_conflicts.csv` 完整路径。CSV 保留目标账号筛选以及账号、正文前缀过滤后的全部冲突采集版本、采集时间、原始和 UTC 发布时间、完整正文与账号；`source_row` 为本次原始读表结果的 1 起始行号，`conflict_fields` 标记差异，`text_repr/username_repr` 显示换行与首尾空格。筛选后的整表冲突检查先于日期筛选，因此也可能包含范围外记录；账号范围已由任务表读取，但报错时尚未更新或追加任务。
+
+账号不同，或正文不同且已有状态不是 `0/1` 时，仍报“第一轮已有任务的正文或账号与本批不一致”，查看报错指向的 `round1_task_conflicts.csv`。双方值保存在 `existing_text/incoming_text` 和 `existing_user_name/incoming_user_name`，`existing_status` 为已有任务状态；`conflict_fields` 标记不同字段，`*_repr` 显示换行及空格。两种追加模式的 preview/apply 均导出此表后停止，本批正文更新和任务追加均不执行。同 ID 不同 date 仍停止核对。
+
+对于通过 `supplement_posts apply` 补入的批次，继续使用同一个补录目录追加第一轮任务：
 
 ```bash
 python -X utf8 -m entrypoints.append_tasks preview "上次补录目录"
 python -X utf8 -m entrypoints.append_tasks apply "上次补录目录"
 ```
 
-`post_extraction_config.yaml` 的 `source_path` 须与补录计划原表一致，`task_path` 使用已有第一轮任务表。先查看 `round1_tasks_to_append.csv`，再 apply；追加前会完整备份任务表，只提交缺失索引，旧任务及 AI 输出保留。日志给出本批日期范围，分别填写到帖子和事件配置后按前述顺序运行。若补入日期早于同币种已成功的第二轮记录，第二轮会按既有规则报“疑似历史补录或历史状态缺口”，须核查受影响历史，不能仅靠缩小日期或跳过检查继续处理。
+`post_extraction_config.yaml` 的 `source_path` 须与补录计划原表一致，`task_path` 使用已有第一轮任务表。先查看 `round1_tasks_to_append.csv` 和 `round1_text_updates.csv`，再 apply；写入前完整备份任务表，按上述状态规则刷新待处理正文、追加缺失索引，旧状态及 AI 输出保留。日志分别显示待更新正文、实际更新、已成功正文差异跳过及新增任务数量，并给出本批日期范围，分别填写到帖子和事件配置后按前述顺序运行。若补入日期早于同币种已成功的第二轮记录，第二轮会按既有规则报“疑似历史补录或历史状态缺口”，须核查受影响历史，不能仅靠缩小日期或跳过检查继续处理。
 
 第一轮完成并导入新增范围后，准备向量，再运行第二、三轮。可保留含 2023 年的范围以复用已成功结果；只跑新增范围时，仍保留第二轮所需前史及向量。调整密钥、并发、重试不改变 AI 配置摘要；修改提示词或模型参数、向量版本仍按原规则检查，不会自动重算成功结果。
 

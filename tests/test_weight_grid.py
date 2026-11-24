@@ -17,12 +17,12 @@ from postprocessing import weight_data
 from postprocessing.weight_data import ASSET_SUFFIX, SOURCE_COLUMNS, build_basic_df, build_weight_data
 from postprocessing.weight_grid import run_weight_grid
 from postprocessing.weight_parameters import DEFAULT_MAPPINGS, WeightParameters, prepare_weight_grid, select_weight_variant
-from tests.event_support import Tables
-from tests.test_weight_data import result_frame
+from tests.test_weight_data import AssetTables as Tables, result_frame
 
 
 def settings(grid=None, **overrides):
-    values = dict(weight_path="weights", start_time="2017-12-31", end_time="2017-12-31", weight_grid=grid)
+    values = dict(weight_path="weights", start_time="2017-12-31", end_time="2017-12-31", weight_grid=grid,
+                  round2_asset_list_path="assets.json")
     values.update(overrides)
     return EventConfig("first", "result", "round2.yaml", "round3.yaml", **values)
 
@@ -262,6 +262,60 @@ class WeightScoringTests(unittest.TestCase):
 
 
 class WeightGridExecutionTests(unittest.TestCase):
+    def test_grid_loads_assets_once_filters_before_parse_and_preserves_host_columns(self):
+        outside = completed_events().iloc[:1].copy()
+        outside.index = pd.MultiIndex.from_tuples([("2017-12-31 15:30:00", "outside")], names=outside.index.names)
+        outside["asset"] = "OUTSIDE"
+        outside["round3_ai_response"] = "broken"
+        backend = Tables(pd.DataFrame(), pd.concat([completed_events(), outside]),
+                         assets=["ETH.USDT.CUSTOM", "SOL", "BTC"])
+        config = settings({"coefficients": {"B": [1, 2]}, "aggregation_methods": ["sum", "max_abs"]})
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(weight_data, "_parse_impact", wraps=weight_data._parse_impact) as parse:
+                summary = run_weight_grid(backend, config, report_dir=Path(temporary) / "run")
+            manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(parse.call_count, 2)
+        self.assertEqual(backend.object_reads, ["assets.json"])
+        self.assertEqual(manifest["output_columns"], ["ETH.USDT.CUSTOM", "SOL" + ASSET_SUFFIX, "BTC" + ASSET_SUFFIX])
+        for table in summary["tables"]:
+            weight = backend.tables[table["table_path"]]
+            self.assertEqual(list(weight.columns), manifest["output_columns"])
+            self.assertTrue(weight["SOL" + ASSET_SUFFIX].eq(0).all())
+            self.assertLess(weight.loc["2018-01-01 00:00", "ETH.USDT.CUSTOM"], 0)
+
+    def test_empty_asset_window_produces_zero_grid_without_falling_back_to_events(self):
+        backend = Tables(pd.DataFrame(), completed_events(), assets=["SOL", "ADA"])
+        with tempfile.TemporaryDirectory() as temporary:
+            summary = run_weight_grid(backend, settings({"aggregation_methods": ["sum", "max_abs"]}),
+                                      report_dir=Path(temporary) / "run")
+        for entry in summary["tables"]:
+            weight = backend.tables[entry["table_path"]]
+            self.assertEqual(weight.shape, (26, 2))
+            self.assertEqual(list(weight.columns), ["SOL" + ASSET_SUFFIX, "ADA" + ASSET_SUFFIX])
+            self.assertTrue(weight.eq(0).all().all())
+
+    def test_explicit_assets_override_config_without_reading_asset_object(self):
+        backend = Tables(pd.DataFrame(), completed_events())
+        with tempfile.TemporaryDirectory() as temporary:
+            summary = run_weight_grid(backend, settings(round2_asset_list_path=""), assets=["ETH", "BTC"],
+                                      report_dir=Path(temporary) / "run")
+            manifest = json.loads(Path(summary["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(backend.object_reads, [])
+        self.assertIsNone(manifest["asset_list_path"])
+        self.assertEqual(list(backend.tables[summary["tables"][0]["table_path"]].columns),
+                         ["ETH" + ASSET_SUFFIX, "BTC" + ASSET_SUFFIX])
+
+    def test_missing_or_invalid_asset_list_stops_before_source_and_target_access(self):
+        for path, assets, error in (("", ["BTC"], ValueError), ("missing.json", ["BTC"], FileNotFoundError),
+                                     ("assets.json", [], ValueError),
+                                     ("assets.json", ["BTC", "btc.usdt.custom"], ValueError)):
+            with self.subTest(path=path, assets=assets), tempfile.TemporaryDirectory() as temporary:
+                backend = Tables(pd.DataFrame(), completed_events(), assets=assets)
+                with self.assertRaises(error):
+                    run_weight_grid(backend, settings(round2_asset_list_path=path),
+                                    report_dir=Path(temporary) / "run")
+                self.assertFalse(backend.column_reads or backend.reads or backend.registers or backend.writes)
+
     def test_both_aggregations_write_separate_tables_and_rerun_without_accumulating(self):
         source = result_frame([
             ("2017-12-31 15:10:00", "BTC", "new", "利好", "中"),

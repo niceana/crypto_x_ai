@@ -48,6 +48,28 @@ class MediaConfigTests(unittest.TestCase):
         self.assertEqual(settings.round2_ai_config_path, str(self.root / "r2.yaml"))
         self.assertIsNone(settings.round2_max_input_characters)
 
+    def test_json_source_resolves_paths_from_config_directory_and_needs_no_ai_for_init(self):
+        document = dict(json_files=["posts.jsonl", str(self.root / "other.json")], round1_result_path="media-first")
+        self.write(document)
+        settings = load_media_job_config(self.path, require_ai=False)
+        self.assertEqual(settings["source_path"], "")
+        self.assertEqual(settings["task_path"], "media-first")
+        self.assertEqual(settings["json_files"], [str(self.root / "posts.jsonl"), str(self.root / "other.json")])
+        self.write(dict(document, source_path="", ai_config_path="r1.yaml"))
+        self.assertEqual(load_media_job_config(self.path)["json_files"], settings["json_files"])
+
+    def test_job_requires_exactly_one_source_and_rejects_invalid_file_lists(self):
+        for change in ({}, {"source_path": ""}, {"json_files": []},
+                       {"source_path": "raw", "json_files": ["posts.jsonl"]},
+                       {"source_path": None}, {"json_files": "posts.jsonl"},
+                       {"json_files": [""]}, {"json_files": [None]}, {"json_files": None}):
+            with self.subTest(change=change):
+                self.write(dict(round1_result_path="first", **change))
+                with self.assertRaises(ConfigError):
+                    load_media_job_config(self.path, require_ai=False)
+        self.write(dict(source_path="raw", json_files=[], round1_result_path="first"))
+        self.assertEqual(load_media_job_config(self.path, require_ai=False)["source_path"], "raw")
+
     def test_invalid_paths_options_dates_and_limits_are_rejected(self):
         cases = [({"round3_result_path": "different"}, "同一张"),
                  ({"round1_result_path": "media-events"}, "路径必须不同"),
