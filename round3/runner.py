@@ -15,7 +15,7 @@ from common.store import (
     EventRecordStore, StageSummary,
     read_event_history, validate_stage_config_hash, summarize,
 )
-from common.time_rules import published_time, table_date_bounds
+from common.time_rules import history_window_start, published_time, table_date_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +43,16 @@ def _remember_impact_response(latest, groups, key, row):
     except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
         logger.warning("repeat 继承跳过无效第三轮响应：record_id=%s，原因=%s", key[1], exc)
         return
-    latest[group] = published_time(key[0]), raw, digest
+    latest[group] = published_time(key[0]), raw, digest, key[1]
 
 
-def _load_repeat_sources(cli, settings, groups):
+def _load_repeat_sources(cli, settings, groups, lookback_months=None):
     """从近到远按月查找范围前的有效来源，每组只保留最近一条响应。"""
     latest = {}
     begin, _ = table_date_bounds(cli.read_meta(settings.result_path))
     end = date.fromisoformat(settings.start_time) - timedelta(days=1)
+    if begin is not None and lookback_months is not None:
+        begin = max(begin, history_window_start(settings.start_time + " 00:00:00", lookback_months).date())
     if begin is not None and begin <= end:
         # 继承没有三个月期限；所有目标组找到有效来源后即停止读取。
         for start, finish in reversed(tuple(month_ranges(begin, end))):
@@ -65,7 +67,7 @@ def _load_repeat_sources(cli, settings, groups):
     return latest
 
 
-def _complete_repeat_impacts(store, groups, latest):
+def _complete_repeat_impacts(store, groups, latest, lookback_months=None):
     """本月 AI 结果全部保存后，按完整披露时间复制 repeat，再推进组历史。"""
     for stamp, keys in groupby(_ordered_impact_keys(store.df), key=lambda key: published_time(key[0])):
         keys = list(keys)
@@ -75,8 +77,11 @@ def _complete_repeat_impacts(store, groups, latest):
             if row["event_relation"] != "repeat" or row["round3_status"] != "0":
                 continue
             source = latest.get((row["asset"], row["event_id"]))
-            response, digest = (source[1], source[2]) if source is not None and source[0] < stamp else (None, "")
-            items.append((key, response, digest))
+            usable = source is not None and source[0] < stamp
+            if usable and lookback_months is not None:
+                usable = source[0] >= history_window_start(stamp, lookback_months)
+            response, digest = (source[1], source[2]) if usable else (None, "")
+            items.append((key, response, digest, source[3] if usable else None))
             if len(items) >= store.config.run.batch_size:
                 store.save_repeat_impact_batch(items)
                 items.clear()
@@ -162,10 +167,14 @@ def _impact_result(message):
 
 
 def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, validator=validate_impact_output, *,
-               target_assets=None):
+               target_assets=None, repeat_lookback_months=None, control=None):
     """检查本范围第二轮结果后，分月分析 new/update，并为 repeat 复制此前响应。"""
+    if control is not None:
+        control.check()
     if not settings.start_time or not settings.end_time:
         raise ValueError("第三轮必须配置 start_time/end_time，明确本次处理的事件日期范围")
+    if repeat_lookback_months is not None and (type(repeat_lookback_months) is not int or repeat_lookback_months <= 0):
+        raise ValueError("repeat_lookback_months 必须为正整数或 None")
     start, end = date.fromisoformat(settings.start_time), date.fromisoformat(settings.end_time)
     if start > end:
         raise ValueError("start_time 不能晚于 end_time")
@@ -177,6 +186,8 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
                 settings.start_time, settings.end_time, len(ranges), settings.round3_skip_incomplete_round2)
     summary, needs_ai, repeat_groups = _prepare_impact(
         cli, settings, ai_config.run if ai_config else None, ranges, target_assets)
+    if control is not None:
+        control.check()
     logger.info("round3事件影响分析启动准备完成：任务数=%d，已有完成=%d，待处理数=%d，失败数=%d，处理中数=%d，跳过第二轮未完成=%d",
                 summary.total, summary.already_completed, summary.pending, summary.failed, summary.processing,
                 summary.skipped_round2)
@@ -188,7 +199,7 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
         config = ai_config or load_ai_config(settings.round3_ai_config_path)
         require_prompts(config)
         digest = validate_stage_config_hash(config, cli, settings.result_path, "round3_config_hash", "round3")
-    repeat_sources = _load_repeat_sources(cli, settings, repeat_groups) if repeat_groups else {}
+    repeat_sources = _load_repeat_sources(cli, settings, repeat_groups, repeat_lookback_months) if repeat_groups else {}
     run = config.run if config is not None else (ai_config.run if ai_config else None)
 
     def load_segment(start, end):
@@ -209,7 +220,7 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
 
         def finish_month():
             if repeat_groups:
-                _complete_repeat_impacts(store, repeat_groups, repeat_sources)
+                _complete_repeat_impacts(store, repeat_groups, repeat_sources, repeat_lookback_months)
             month = summarize(store, keys, "round3", already)
             month.skipped_round2 = store.skipped_round2
             return summary.add_month(month)
@@ -219,6 +230,7 @@ def run_impact(cli, settings, ai_config=None, network_factory=NetworkWorker, val
 
     summary = StageSummary("round3")
     run_segments(ranges, load_segment, summary,
-                 lambda: network_factory(config), _impact_result, logger, "round3事件影响分析")
+                 lambda: network_factory(config), _impact_result, logger, "round3事件影响分析",
+                 **({"control": control} if control is not None else {}))
     logger.info("round3事件影响分析处理结束：%s", summary)
     return summary

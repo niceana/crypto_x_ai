@@ -1,5 +1,6 @@
 """验证目标币种的事件筛选与续跑；不访问真实服务。"""
 
+import asyncio
 import json
 import queue
 import unittest
@@ -112,12 +113,12 @@ class AssetScopeTests(EventFixture, unittest.TestCase):
             return httpx.Response(200, json={"data": [
                 {"index": index, "embedding": [1.0, 0.0]} for index in range(len(texts))]})
 
-        embedding_client = httpx.Client(transport=httpx.MockTransport(embedding_handler), trust_env=False)
-        self.addCleanup(embedding_client.close)
+        embedding_client = httpx.AsyncClient(transport=httpx.MockTransport(embedding_handler), trust_env=False)
+        self.addCleanup(lambda: asyncio.run(embedding_client.aclose()))
         with self.asset_list(backend, {"InstrumentList": ["ETH.exchange"]}):
             with patch("round2.runner.load_embedding_config", return_value=EmbeddingConfig("https://mock.invalid/v1", "test-key")):
                 with patch("vectorization.encoder._create_client", return_value=embedding_client):
-                    prepare_vectors(backend, settings, embedding_config=EmbeddingConfig("https://mock.invalid/v1", "test-key"))
+                    asyncio.run(prepare_vectors(backend, settings, embedding_config=EmbeddingConfig("https://mock.invalid/v1", "test-key")))
                     summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.memory_network(requests))
         self.assertEqual((summary.total, summary.new_completed), (1, 1))
         self.assertEqual(embedding_texts, ["target-history", "target-current"])

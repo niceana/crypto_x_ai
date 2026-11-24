@@ -1,5 +1,6 @@
-"""离线验证原重试循环的十次预算；直接驱动协程，不创建事件循环或套接字。"""
+"""离线验证原重试循环的十次预算；HTTP 使用 MockTransport，不连接真实服务。"""
 
+import asyncio
 import json
 import unittest
 from dataclasses import replace
@@ -110,9 +111,9 @@ class RetryLimitTests(Fixture, unittest.TestCase):
             return httpx.Response(200, json={"data": [{"index": 0, "embedding":
                                                        [1.0, 0.0] if len(calls) == 10 else [0.0, 0.0]}]})
         encoder = EmbeddingEncoder(EmbeddingConfig("https://mock.invalid/v1", "secret"),
-                                  client_factory=lambda config: httpx.Client(transport=httpx.MockTransport(handler)))
-        with patch("vectorization.encoder.time.sleep") as sleep:
-            encoder.prepare([("key", "text", "")], saved.update)
+                                  client_factory=lambda config: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        with patch("vectorization.encoder.sleep") as sleep:
+            asyncio.run(encoder.prepare([("key", "text", "")], saved.update))
         self.assertEqual((len(calls), sleep.call_count), (10, 9))
         self.assertIn("key", saved)
 

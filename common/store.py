@@ -14,6 +14,7 @@ from common.config import AIConfig, RunConfig, ai_config_hash
 from common.execution import check_month_complete
 from common.persistence import BatchPersistenceError, TaskValidationError, write_columns
 from common.ai_protocol import ParsedResponse
+from common.call_meta import merge_call_meta, no_call
 from common.validation import (
     POST_RESULT_COLUMNS,
     RELATION_COLUMNS,
@@ -164,6 +165,23 @@ class TableStore:
     def count_completed(self, stage, keys=None):
         return int(self._statuses(stage, keys).eq("1").sum())
 
+    def add_call_meta(self, key, row, stage, current):
+        column = stage + "_call_meta"
+        if column in self.df.columns and current is not None:
+            row[column] = merge_call_meta(self.df.at[key, column], current)
+
+    def save_interrupted_call_meta(self, messages, stage=None):
+        """取消或异常也保留已起发次数及原因，状态仍交给原来的恢复流程。"""
+        stage = stage or self.call_meta_stage
+        keys, rows = [], []
+        for message in messages:
+            row = {}
+            self.add_call_meta(message.key, row, stage, getattr(message, "call_meta", None))
+            if row:
+                keys.append(message.key)
+                rows.append(row)
+        self.update_stage_columns(keys, rows, stage)
+
     def pending_keys(self, stage, keys=None):
         statuses = self._statuses(stage, keys)
         return list(statuses.index[statuses.isin(["0"])])
@@ -181,10 +199,14 @@ class TableStore:
 class PostTaskStore(TableStore):
     """只持有当前分段数据；状态与结果均在保存确认后更新内存。"""
 
+    call_meta_stage = "round1"
+
     def __init__(self, config: AIConfig, cli, task_path, start_time=None, end_time=None):
         stages = {"round1": ("status", "config_hash", set(POST_RESULT_COLUMNS + ["config_hash"]))}
         super().__init__(config, cli, task_path, stages, _validate_tasks,
                          start_time, end_time, TaskValidationError, logger)
+        if "round1_call_meta" in self.df:
+            self.stages["round1"][2].add("round1_call_meta")
         _validate_range(self.df, start_time, end_time)
         self.digest = None
         self.already_completed = self.count_completed("round1")
@@ -223,7 +245,9 @@ class PostTaskStore(TableStore):
             # 生成时间已由响应解析转为北京时间文本，缺失或转换失败时为空。
             row = ["1" if result.success else "-1", result.ai_response_content,
                    result.reasoning_content, usage, result.response_created, "" if result.success else result.error_message]
-            rows.append(dict(zip(POST_RESULT_COLUMNS, row)))
+            values = dict(zip(POST_RESULT_COLUMNS, row))
+            self.add_call_meta(key, values, "round1", result.call_meta)
+            rows.append(values)
         self.update_stage_columns([key for key, _ in results], rows, "round1", "final")
 
 
@@ -283,6 +307,8 @@ def _stamp_event_responses(batch):
 class EventRecordStore(TableStore):
     """事件业务封装；数据库普通列原样使用，阶段写入和恢复由核心负责。"""
 
+    call_meta_stage = "round3"
+
     def __init__(self, cli, settings, run=None, start_time=None, end_time=None):
         self.settings = settings
         stages = {
@@ -293,6 +319,9 @@ class EventRecordStore(TableStore):
         }
         super().__init__(SimpleNamespace(run=run or RunConfig()), cli, settings.result_path,
                          stages, validate_event_table_structure, start_time, end_time, log=logger)
+        for stage in ("round2", "round3"):
+            if stage + "_call_meta" in self.df:
+                self.stages[stage][2].add(stage + "_call_meta")
         if start_time is not None:
             start, end = date.fromisoformat(start_time), date.fromisoformat(end_time)
             if any(not start <= published_time(key[0]).date() <= end for key in self.df.index):
@@ -361,6 +390,7 @@ class EventRecordStore(TableStore):
                           "round2_status": "1", "error_message": ""}
                 if relation != "repeat":
                     values["round3_status"] = "0"
+            self.add_call_meta(key, values, "round2", no_call() if response is None else response.call_meta)
             rows.append(values)
         self.update_stage_columns([key for key, _, _, _ in items], rows, "round2",
                                   prepare_write=_stamp_event_responses)
@@ -372,16 +402,20 @@ class EventRecordStore(TableStore):
             row = {"round3_ai_response": _event_response_json(response, attempts),
                    "round3_status": "1" if response.success else "-1",
                    "error_message": "" if response.success else response.error_message}
+            self.add_call_meta(key, row, "round3", response.call_meta)
             rows.append(row)
         self.update_stage_columns([key for key, _, _ in items], rows, "round3", prepare_write=_stamp_event_responses)
 
     def save_repeat_impact_batch(self, items):
         """原样复制有效历史响应及其摘要；不刷新源响应元数据，不伪造 AI 请求。"""
         rows = []
-        for key, response, digest in items:
-            rows.append({"round3_ai_response": response or "",
+        for item in items:
+            key, response, digest = item[:3]
+            row = {"round3_ai_response": response or "",
                          "round3_config_hash": digest,
                          "round3_status": "1" if response is not None else "-1",
                          "error_message": "" if response is not None else
-                         "repeat 找不到同币种、同事件组中严格早于当前披露的有效第三轮响应"})
-        self.update_stage_columns([key for key, _, _ in items], rows, "round3")
+                         "repeat 找不到同币种、同事件组中严格早于当前披露的有效第三轮响应"}
+            self.add_call_meta(key, row, "round3", no_call(item[3] if len(item) > 3 else None))
+            rows.append(row)
+        self.update_stage_columns([item[0] for item in items], rows, "round3")

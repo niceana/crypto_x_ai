@@ -1,5 +1,6 @@
 """验证表内向量保存与复用、阈值及历史边界；不访问真实服务。"""
 
+import asyncio
 import json
 import os
 import queue
@@ -44,7 +45,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
     def retriever(self, handler, config=None):
         self.clients = []
         def create(settings):
-            client = httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
             self.clients.append(client)
             return client
         return EmbeddingEncoder(config or self.embedding_config(), create)
@@ -74,7 +75,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
 
     def prepare(self, retriever, texts, saved=None):
         saved = {} if saved is None else saved
-        retriever.prepare(((text, text, saved.get(text, "")) for text in dict.fromkeys(texts)), saved.update)
+        asyncio.run(retriever.prepare(((text, text, saved.get(text, "")) for text in dict.fromkeys(texts)), saved.update))
         return saved
 
     def vector_handler(self, vectors, calls):
@@ -133,12 +134,12 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         saved = self.prepare(initial, ["same"])
         updated = {}
         second = self.retriever(lambda req: self.fail("相同文本应复用已有向量"))
-        second.prepare([("new-asset", "same", ""), ("old-asset", "same", saved["same"])], updated.update)
+        asyncio.run(second.prepare([("new-asset", "same", ""), ("old-asset", "same", saved["same"])], updated.update))
         self.assertEqual(updated, {"new-asset": saved["same"]})
         self.assertFalse(self.clients)
         calls, updated = [], {}
         third = self.retriever(self.vector_handler({"fresh": [0, 1]}, calls))
-        third.prepare([("ETH", "fresh", ""), ("BTC", "fresh", "")], updated.update)
+        asyncio.run(third.prepare([("ETH", "fresh", ""), ("BTC", "fresh", "")], updated.update))
         self.assertEqual(calls, [["fresh"]])
         self.assertEqual(updated["ETH"], updated["BTC"])
 
@@ -209,7 +210,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                 raise httpx.ReadTimeout("timeout", request=request)
             return httpx.Response(503)
         retriever = self.retriever(handle)
-        with patch("vectorization.encoder.time.sleep") as sleep, patch("common.network.random.uniform", side_effect=lambda low, high: high):
+        with patch("vectorization.encoder.sleep") as sleep, patch("common.network.random.uniform", side_effect=lambda low, high: high):
             with self.assertRaisesRegex(EmbeddingError, "503"):
                 self.prepare(retriever, ["one"])
         self.assertEqual(len(calls), 3)
@@ -235,7 +236,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                         return httpx.Response(429, headers=headers)
                     return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.6, 0.8]}]})
 
-                with patch("vectorization.encoder.time.sleep") as sleep, \
+                with patch("vectorization.encoder.sleep") as sleep, \
                         patch("common.network.random.uniform", side_effect=lambda low, high: high):
                     self.prepare(self.retriever(handler), ["one"], saved)
                 self.assertEqual(calls, [calls[0], calls[0]])
@@ -255,7 +256,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                         raise httpx.ReadTimeout("timeout", request=request)
                     return httpx.Response(429, headers={"Retry-After": "5"})
 
-                with patch("vectorization.encoder.time.sleep") as sleep:
+                with patch("vectorization.encoder.sleep") as sleep:
                     with self.assertRaisesRegex(EmbeddingError, "429"):
                         self.prepare(self.retriever(handler, self.embedding_config(max_attempts=max_attempts)),
                                      ["one"], saved)
@@ -274,7 +275,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             if len(calls) == 2:
                 raise httpx.ReadTimeout("timeout", request=request)
             return httpx.Response(503)
-        with patch("vectorization.encoder.time.sleep") as sleep:
+        with patch("vectorization.encoder.sleep") as sleep:
             with self.assertRaisesRegex(EmbeddingError, "503"):
                 self.prepare(self.retriever(handle), ["one"], saved)
         self.assertEqual((len(calls), sleep.call_count), (3, 2))
@@ -289,7 +290,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             if len(calls) == 2:
                 return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0, 0]}]})
             return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.6, 0.8]}]})
-        with patch("vectorization.encoder.time.sleep") as sleep:
+        with patch("vectorization.encoder.sleep") as sleep:
             self.prepare(self.retriever(handle), ["one"], saved)
         self.assertEqual((len(calls), sleep.call_count), (3, 2))
         self.assertEqual(sleep.call_args_list[0].args[0], 5)
@@ -381,7 +382,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             with self.subTest(value=value):
                 retriever = self.retriever(lambda req: self.fail("损坏向量须停止"))
                 with self.assertRaises(EmbeddingError):
-                    retriever.prepare([("a", "a", value)], lambda values: self.fail("不得自动修复损坏内容"))
+                    asyncio.run(retriever.prepare([("a", "a", value)], lambda values: self.fail("不得自动修复损坏内容")))
 
     def test_configuration_env_priority_threshold_and_removed_cache_parameter(self):
         document = {"base_url": "https://embedding.invalid/v1/", "api_key": "$" + "{TEST_EMBEDDING_KEY}"}
@@ -419,7 +420,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             self.assertFalse(backend.updates)
             return self.vector_handler({"plan": [1, 0], "peer": [0, 1], "execute": [1, 0]}, calls)(request)
         def create(config):
-            client = httpx.Client(transport=httpx.MockTransport(handle))
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
             clients.append(client)
             return client
         def relation(request):
@@ -431,7 +432,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                                        "new_information": "开始执行"}))
         settings = self.relation_settings(backend, embedding_config_path="unused.yaml")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), patch("vectorization.encoder._create_client", create):
-            prepare_vectors(backend, settings, embedding_config=self.embedding_config())
+            asyncio.run(prepare_vectors(backend, settings, embedding_config=self.embedding_config()))
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["plan", "peer", "execute"]])
         self.assertEqual((summary.http_attempts_started, summary.new_completed), (1, 4))
@@ -449,7 +450,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         engine = self.retriever(lambda request: httpx.Response(401))
         with self.assertRaisesRegex(EmbeddingError, "401"):
-            prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"), encoder=engine)
+            asyncio.run(prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"), encoder=engine))
         self.assertFalse(backend.updates)
         self.assertTrue(backend.tables["result"]["round2_status"].eq("0").all())
         self.assertTrue(all(client.is_closed for client in self.clients))
@@ -470,8 +471,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
             seen.append(json.loads(request_text(request)))
             return success(json.dumps({"event_relation": "repeat", "matched_candidate_id": "E1", "new_information": None}))
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
-                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
-            prepare_vectors(backend, settings, embedding_config=self.embedding_config())
+                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            asyncio.run(prepare_vectors(backend, settings, embedding_config=self.embedding_config()))
             summary = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(relation))
         self.assertEqual(calls, [["progress", "current"]])
         candidate = seen[0]["candidates"][0]
@@ -494,8 +495,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         handler = self.vector_handler({"boundary": [1, 0], "current": [1, 0]}, calls)
         settings = self.settings(start_time="2024-05-31", end_time="2024-05-31", embedding_config_path="unused")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
-                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
-            prepare_vectors(backend, settings, embedding_config=self.embedding_config())
+                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            asyncio.run(prepare_vectors(backend, settings, embedding_config=self.embedding_config()))
             result = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(
                 lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
         self.assertEqual(calls, [["boundary", "current"]])
@@ -515,8 +516,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         handler = self.vector_handler({"history": [1, 0], "first": [0, 1], "second": [1, 0]}, calls)
         settings = self.settings(start_time="2024-05-29", end_time="2024-05-30", embedding_config_path="unused")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
-                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
-            prepare_vectors(backend, settings, embedding_config=self.embedding_config())
+                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            asyncio.run(prepare_vectors(backend, settings, embedding_config=self.embedding_config()))
             result = run_relation(backend, settings, ai_config=self.config(), network_factory=self.factory(
                 lambda request: seen.append(json.loads(request_text(request))) or success(json.dumps(new_result()))))
         self.assertEqual(calls, [["history", "first", "second"]])
@@ -537,8 +538,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
                     backend.apply(path, frame)
                 backend.update_hook = update
                 engine = self.retriever(self.vector_handler({"one": [1, 0]}, calls))
-                operation = lambda: prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"),
-                                                     encoder=engine, run_config=self.config().run)
+                operation = lambda: asyncio.run(prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"),
+                                                     encoder=engine, run_config=self.config().run))
                 if fail_all:
                     with self.assertRaises(BatchPersistenceError):
                         operation()
@@ -553,7 +554,7 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         backend = self.backend([("2021-01-01", "one", ["ETH"], "a")])
         before = backend.tables["result"].copy(deep=True)
         engine = self.retriever(self.vector_handler({"one": [1, 0]}, []))
-        prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"), encoder=engine)
+        asyncio.run(prepare_vectors(backend, self.relation_settings(backend, embedding_config_path="unused"), encoder=engine))
         self.assertEqual(list(backend.updates[-1].columns), ["embedding"])
         pd.testing.assert_frame_equal(backend.tables["result"].drop(columns="embedding"), before.drop(columns="embedding"))
         store = EventRecordStore(backend, self.settings())
@@ -568,8 +569,8 @@ class EmbeddingTests(EventFixture, unittest.TestCase):
         handler = self.vector_handler({"first": [1, 0], "second": [0, 1]}, calls)
         settings = self.relation_settings(backend, embedding_config_path="unused")
         with patch("round2.runner.load_embedding_config", return_value=self.embedding_config()), \
-                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.Client(transport=httpx.MockTransport(handler))):
-            prepare_vectors(backend, settings, embedding_config=self.embedding_config())
+                patch("vectorization.encoder._create_client", side_effect=lambda config: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
+            asyncio.run(prepare_vectors(backend, settings, embedding_config=self.embedding_config()))
             summary = run_relation(backend, settings, ai_config=self.config(),
                                    network_factory=self.factory(lambda req: self.fail("低分应跳过第二轮")))
         self.assertEqual(summary.http_attempts_started, 0)

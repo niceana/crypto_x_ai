@@ -1,7 +1,9 @@
 """三轮共用进度统计，第一轮与第三轮共用自然月推进和独立任务执行。"""
 
+import asyncio
 import logging
 import queue
+import threading
 import time
 from calendar import monthrange
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ from datetime import date, timedelta
 from common.network import BatchRunError
 from common.persistence import BatchPersistenceError
 from common.preparation import RequestPreparer
+from common.control import ExecutionStopped
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +100,8 @@ class SegmentCoordinator:
     """
 
     def __init__(self, run, network, candidates, claim_jobs, save_results,
-                 confirmed_before=0, result_item=None, log=None, progress=None, preparer=None):
+                 confirmed_before=0, result_item=None, log=None, progress=None, preparer=None,
+                 on_interrupted=None, control=None):
         self.run_config = run
         self.network = network
         self.candidates = candidates
@@ -107,6 +111,8 @@ class SegmentCoordinator:
         self.logger = log or logger
         self.progress = progress or ProgressStats(run, self.logger, "任务")
         self.preparer = preparer
+        self.on_interrupted = on_interrupted
+        self.control = control
         self.total = len(candidates)
         self.succeeded = self.failed = 0
         # 只跟踪已认领未收取的任务，不用它限制 HTTP 或备用请求补货。
@@ -177,6 +183,8 @@ class SegmentCoordinator:
         if message.key not in self.submitted:
             raise BatchRunError("收到未提交或重复的作业完成消息")
         self.submitted.remove(message.key)
+        if message.response is None and self.on_interrupted is not None:
+            self.on_interrupted([message])
         if message.response is not None:
             if len(self.buffer) >= self.run_config.result_buffer_size:
                 raise BatchRunError("结果缓冲容量不变量被破坏")
@@ -188,6 +196,8 @@ class SegmentCoordinator:
             self.flush()
 
     def check(self):
+        if self.control is not None:
+            self.control.check()
         self.preparer.check()
         try:
             self.network.check()
@@ -264,7 +274,7 @@ def _retain_unsaved(error, coordinator, network):
 
 
 def run_segments(ranges, load_segment, summary, network_factory,
-                 result_item=None, log=None, label="任务"):
+                 result_item=None, log=None, label="任务", control=None):
     """逐段加载和执行，复用一个网络线程，只跨段保留标量汇总。
 
     load_segment(start, end) 返回 store、候选队列、claim_jobs、save_results、
@@ -276,9 +286,12 @@ def run_segments(ranges, load_segment, summary, network_factory,
     active_logger = log or logger
     network = store = coordinator = progress = preparer = None
     confirmed = 0
+    remove_callbacks = []
     try:
         try:
             for segment_start, segment_end in ranges:
+                if control is not None:
+                    control.check()
                 if network is not None:
                     network.check()
                 active_logger.info("开始处理当前分段：起点=%s，终点=%s", segment_start, segment_end)
@@ -286,14 +299,20 @@ def run_segments(ranges, load_segment, summary, network_factory,
                 if candidates:
                     if network is None:
                         network = network_factory()
-                        preparer = RequestPreparer(store.config, network, log=active_logger, label=label)
+                        preparer = RequestPreparer(store.config, network, log=active_logger, label=label,
+                                                   control=control)
                         network.bind_ready_queue(preparer.ready_requests, preparer.wake)
+                        if control is not None:
+                            remove_callbacks.extend((control.register(network.request_stop),
+                                                     control.register(preparer.request_stop)))
+                            control.check()
                         network.start()
                         preparer.start()
                         progress = ProgressStats(store.config.run, active_logger, label)
                     coordinator = SegmentCoordinator(store.config.run, network, candidates,
                                                      claim_jobs, save_results, confirmed, result_item,
-                                                     active_logger, progress, preparer)
+                                                     active_logger, progress, preparer,
+                                                     getattr(store, "save_interrupted_call_meta", None), control)
                     coordinator.run()
                 else:
                     active_logger.info("当前分段无待处理任务：%s → %s", segment_start, segment_end)
@@ -313,6 +332,8 @@ def run_segments(ranges, load_segment, summary, network_factory,
             finally:
                 if preparer is not None:
                     preparer.shutdown()
+                for remove in remove_callbacks:
+                    remove()
         if preparer is not None:
             preparer.check()
         if network is not None:
@@ -320,6 +341,9 @@ def run_segments(ranges, load_segment, summary, network_factory,
                 raise BatchRunError("网络资源关闭失败") from network.failure
             summary.http_attempts_started = network.http_attempts_started
     except BaseException as error:
+        if control is not None:
+            # 实盘失败整批丢弃；线程已在 finally 回收，不做中间结果收尾或快照。
+            raise
         if isinstance(error, KeyboardInterrupt):
             active_logger.warning("收到用户中断，开始停止请求并保存已完成结果")
         else:
@@ -339,3 +363,65 @@ def run_segments(ranges, load_segment, summary, network_factory,
         active_logger.info("worker 收尾结束")
         raise
     return summary
+
+
+async def _finish_async(coroutine, control):
+    """重复取消也先等线程清理结束，避免留下后台计算进入下一轮。"""
+    task = asyncio.create_task(coroutine)
+    interrupted = False
+    while True:
+        try:
+            value = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            control.request_stop()
+            interrupted = True
+            if task.done():
+                value = task.result()
+                break
+    if interrupted:
+        raise asyncio.CancelledError()
+    return value
+
+
+async def run_controlled(function, control):
+    """原同步协调器在专用线程运行；异步宿主等待完成并负责整批取消。"""
+    control.check()
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def publish(outcome):
+        if not done.done():
+            done.set_result(outcome)
+
+    def execute():
+        try:
+            outcome = (True, function())
+        except BaseException as exc:
+            outcome = (False, exc)
+        loop.call_soon_threadsafe(publish, outcome)
+
+    thread = threading.Thread(target=execute, name="ai-batch-coordinator")
+    thread.start()
+
+    async def finish():
+        await asyncio.shield(done)
+        # 完成通知可能比线程函数真正返回略早；不在宿主循环里同步 join。
+        while thread.is_alive():
+            await asyncio.sleep(0.001)
+        thread.join(0)
+
+    try:
+        outcome = await asyncio.wait_for(asyncio.shield(done), timeout=control.remaining)
+    except asyncio.TimeoutError:
+        control.request_stop(timed_out=True)
+        raise ExecutionStopped("整批计算预算已耗尽")
+    except BaseException:
+        control.request_stop()
+        raise
+    finally:
+        await _finish_async(finish(), control)
+    control.check()
+    if not outcome[0]:
+        raise outcome[1]
+    return outcome[1]

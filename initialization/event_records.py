@@ -11,7 +11,7 @@ from common.validation import (
     validate_index,
     validate_event_source_index,
 )
-from common.time_rules import in_scope, select_scope
+from common.time_rules import in_scope, published_time, select_scope, table_date_bounds
 from initialization.first_round_answers import parse_first_round_answer
 
 
@@ -85,12 +85,42 @@ def _save_record_batch(cli, result_path, batch, initial_write):
                      "initialize", failure_message="初始化写入预算耗尽")
 
 
+def _read_import_tail(cli, result_path, metadata):
+    """元数据只定位表尾日期；从实际索引取得完整时间，不把日期当作截止时刻。"""
+    from common.store import read_event_history
+
+    _, end = table_date_bounds(metadata)
+    if end is None:
+        return None
+    day = end.isoformat()
+    tail = read_event_history(cli, result_path, day, day, columns=["asset"],
+                              label="事件导入表尾读取")
+    if tail.empty:
+        raise ValueError("事件导入表尾读取为空，与目标表元数据不一致；本批尚未写入")
+    return tail
+
+
+def _only_events_after_latest(batch, existing):
+    """所有资产共用目标表最大完整 date；相同时间和较早事件均不追加。"""
+    if existing is None or existing.empty:
+        return batch
+    latest = max(published_time(value) for value in existing.index.get_level_values("date"))
+    selected = batch.loc[[published_time(key[0]) > latest for key in batch.index]]
+    skipped = len(batch) - len(selected)
+    logger.info("事件导入时间限制：目标表最大 date=%s，待导候选=%d，时间限制跳过=%d，待追加=%d",
+                latest, len(batch), skipped, len(selected))
+    if skipped:
+        logger.warning("事件导入跳过较早或同刻任务：数量=%d，目标表最大 date=%s；"
+                       "只追加严格晚于该时刻的事件，不补历史", skipped, latest)
+    return selected
+
+
 def import_event_records_from_posts(cli, settings, new_posts=None, previous_posts=None):
     """导入round1事件提取交出的成功帖，返回本次新写入的事件行数。
 
-    新批次只查元数据后直接追加，依赖原帖 ID 稳定唯一、成功状态不人为回退。
-    有历史成功帖时才读旧表，仅核对索引去重；不重读源表或比较旧业务字段。
-    不为统计全表总数而读取旧表。所有调用均在主入口线程，失败保留round1事件提取结果。
+    已有目标只追加严格晚于全表最大 date 的事件，不补较早或同刻缺失任务。
+    新批次按元数据读取表尾日的一列以取得准确截止时刻；有历史成功帖时
+    沿用旧表索引去重，不重读源表或比较旧业务字段。失败保留第一轮结果。
     """
     from common.validation import validate_event_table_structure
 
@@ -104,17 +134,20 @@ def import_event_records_from_posts(cli, settings, new_posts=None, previous_post
     validate_event_table_structure(expected)
     recovering = previous_posts is not None and not previous_posts.empty
     initial_write = False
+    existing = None
     try:
         if recovering:
             existing = cli.read(settings.result_path)
         else:
-            # 正常新批次只确认目标存在，不读取旧记录；元数据内容不参与业务判断。
-            cli.read_meta(settings.result_path)
+            metadata = cli.read_meta(settings.result_path)
     except Exception as exc:
         if not _is_data_not_found(exc):
             raise
         cli.register(settings.result_path, "timeseries", "")
         initial_write = True
+
+    if not recovering and not initial_write and not expected.empty:
+        existing = _read_import_tail(cli, settings.result_path, metadata)
 
     batch = expected
     if recovering and not initial_write:
@@ -130,6 +163,8 @@ def import_event_records_from_posts(cli, settings, new_posts=None, previous_post
                     raise ValueError("已有结果与新增记录的日期索引类型、时区或精度不一致")
                 if batch.index.get_level_values("record_id").isin(existing.index.get_level_values("record_id")).any():
                     raise ValueError("新增记录的 record_id 已存在于其他日期")
+    if not initial_write:
+        batch = _only_events_after_latest(batch, existing)
     if batch.empty and not initial_write:
         return 0
     _save_record_batch(cli, settings.result_path, batch, initial_write)
@@ -139,7 +174,8 @@ def import_event_records_from_posts(cli, settings, new_posts=None, previous_post
 def import_event_records_from_table(cli, settings, *, successful_only=False):
     """自动判断首次建表或续建；已有表严格校验后只追加不存在的新索引。
 
-    缺表只注册一次，write 失败整批重试；已有表不补列或单元格，不写旧行。
+    缺表只注册一次，write 失败整批重试；已有表只追加严格晚于全表最大
+    date 的任务，较早或同刻缺失任务跳过，不补列或单元格，不写旧行。
     已注册且尚无行列的空目标可继续追加。CLI 抛异常即本次未写入，不读回。
     先读目标，仅明确 DataNotFound 时建表；其他读取错误直接传播。
     successful_only 可只展开当前范围内成功帖子；
@@ -229,19 +265,19 @@ def import_event_records_from_table(cli, settings, *, successful_only=False):
             if any(existing.loc[key, name] != expected.loc[key, name] for name in INPUT_COLUMNS):
                 raise ValueError("已有记录与固定输入不一致：{}".format(key[1]))
         batch = expected.loc[~expected.index.isin(existing.index)]
-        total = len(existing) + len(batch)
-        if batch.empty:
-            if uninitialized:
-                # 注册已成功、首次空表 write 未成功时，也要补齐索引和完整列结构。
-                # 目标已经注册，此处只选择 write，不会再次进入上面的注册步骤。
-                initial_write = True
-            else:
-                return InitializationSummary(total, 0)
-        if len(existing):
+        if len(existing) and not batch.empty:
             if existing.index.levels[0].dtype != batch.index.levels[0].dtype:
                 raise ValueError("已有结果与新增记录的日期索引类型、时区或精度不一致")
             # 复合键不同也不能让同一 record_id 出现在两个日期，范围外旧行同样检查。
             if batch.index.get_level_values("record_id").isin(existing.index.get_level_values("record_id")).any():
                 raise ValueError("新增记录的 record_id 已存在于其他日期")
+        batch = _only_events_after_latest(batch, existing)
+        total = len(existing) + len(batch)
+        if batch.empty:
+            if uninitialized:
+                # 注册已成功、首次空表 write 未成功时，也要补齐索引和完整列结构。
+                initial_write = True
+            else:
+                return InitializationSummary(total, 0)
     _save_record_batch(cli, settings.result_path, batch, initial_write)
     return InitializationSummary(total, len(batch))

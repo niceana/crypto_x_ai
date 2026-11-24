@@ -1,11 +1,13 @@
 """独立向量计算：沿用已有 HTTP 重试和批量生成规则。"""
 
+import asyncio
 import json
 import logging
-import time
+from asyncio import sleep
 from collections import defaultdict
 import httpx
 from common.network import RETRYABLE_NETWORK_ERRORS, parse_retry_after, retry_backoff
+from common.control import ExecutionStopped
 from common.validation import parse_strict_json
 from vectorization.storage import EmbeddingError, StoredVectors, _validate_unit_vector
 
@@ -13,21 +15,21 @@ logger = logging.getLogger(__name__)
 
 def _create_client(config):
     """批量准备期间复用一个客户端，重试次数只由本模块计算。"""
-    return httpx.Client(timeout=config.timeout_seconds, trust_env=config.trust_env,
-                        follow_redirects=False)
+    return httpx.AsyncClient(timeout=config.timeout_seconds, trust_env=config.trust_env,
+                             follow_redirects=False)
 
 
 class EmbeddingEncoder(StoredVectors):
     """只计算、复用及保存向量，不做候选检索或事件归组。"""
 
-    def __init__(self, config, client_factory=None, stop_event=None):
+    def __init__(self, config, client_factory=None, control=None):
         super().__init__(config)
         self.client_factory = client_factory or _create_client
-        self.stop_event = stop_event
+        self.control = control
 
     def _check_running(self):
-        if self.stop_event is not None and self.stop_event.is_set():
-            raise EmbeddingError("月流水线已停止，取消向量准备")
+        if self.control is not None:
+            self.control.check()
 
     def _parse_response(self, response, size):
         """先校验完整批次再允许保存；index 必须与本批输入一一对应。"""
@@ -50,13 +52,13 @@ class EmbeddingEncoder(StoredVectors):
             raise EmbeddingError("Embedding 同一批向量维度不一致")
         return result
 
-    def _request(self, client, texts):
+    async def _request(self, client, texts):
         """传输、429、5xx 和无效输出共用本批预算，复用 AI 网络的退避规则。"""
         for attempt in range(1, self.config.max_attempts + 1):
             self._check_running()
             retry_after = 0
             try:
-                response = client.post(
+                response = await client.post(
                     self.config.base_url + "/embeddings",
                     headers={"Authorization": "Bearer " + self.config.api_key},
                     json={"model": self.config.model, "input": texts, "encoding_format": "float"},
@@ -85,12 +87,9 @@ class EmbeddingEncoder(StoredVectors):
             delay = max(retry_backoff(self.config, attempt), retry_after)
             logger.warning("独立向量计算 批次准备重试：尝试=%d/%d，等待=%.3f秒",
                            attempt, self.config.max_attempts, delay)
-            if self.stop_event is None:
-                time.sleep(delay)
-            elif self.stop_event.wait(delay):
-                self._check_running()
+            await sleep(delay)
 
-    def prepare(self, records, save_embeddings):
+    async def prepare(self, records, save_embeddings):
         """records 为 (原键, event, embedding)；成功批次先按列保存再用于评分。
 
         相同 event 在本轮只生成一次，向量仍写入每条对应披露。保存回调负责
@@ -98,7 +97,9 @@ class EmbeddingEncoder(StoredVectors):
         """
         self._check_running()
         pending = defaultdict(list)
-        for key, text, value in records:
+        for position, (key, text, value) in enumerate(records):
+            if position % 64 == 0:
+                self._check_running()
             if not isinstance(text, str) or not text.strip():
                 raise EmbeddingError("Embedding 输入必须为非空 event 字符串")
             if not self._load_saved_vector(text, value):
@@ -111,11 +112,26 @@ class EmbeddingEncoder(StoredVectors):
         logger.info("独立向量计算 准备：已复用文本=%d，需请求文本=%d", len(self.vectors), len(missing))
         if not missing:
             return
-        with self.client_factory(self.config) as client:
+        # 原生异步请求运行在调用线程的循环中；保存回调仍由该线程执行。
+        loop, task = asyncio.get_running_loop(), asyncio.current_task()
+        active = True
+
+        def cancel_request():
+            if active:
+                task.cancel()
+
+        remove = (self.control.register(lambda: loop.call_soon_threadsafe(cancel_request))
+                  if self.control is not None else None)
+        client = None
+        try:
+            self._check_running()
+            client = self.client_factory(self.config)
+            await client.__aenter__()
             for offset in range(0, len(missing), self.config.batch_size):
                 self._check_running()
                 batch = missing[offset:offset + self.config.batch_size]
-                vectors = self._request(client, batch)
+                vectors = await self._request(client, batch)
+                self._check_running()
                 serialized = {
                     text: json.dumps({"model": self.config.model, "model_version": self.config.model_version,
                                       "config_hash": self.config_hash, "vector": vector.tolist()},
@@ -128,4 +144,15 @@ class EmbeddingEncoder(StoredVectors):
                 self.vectors.update(zip(batch, vectors))
                 self.serialized.update(serialized)
                 logger.info("独立向量计算 新文本保存进度：%d/%d", offset + len(batch), len(missing))
+        except asyncio.CancelledError as exc:
+            if self.control is not None and self.control.stopped.is_set():
+                raise ExecutionStopped("向量请求已取消") from exc
+            raise
+        finally:
+            # 停止回调只取消请求/退避，不再次打断连接关闭。
+            active = False
+            if remove is not None:
+                remove()
+            if client is not None:
+                await client.aclose()
 

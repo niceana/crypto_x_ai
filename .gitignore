@@ -4,6 +4,10 @@ __pycache__/
 .python38/
 .env
 reports/
+build/
+dist/
+*.egg-info/
+.build-tools/
 /.test-*/
 /return_contribution_positions.png
 /return_contribution_assets.png

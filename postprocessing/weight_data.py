@@ -107,6 +107,67 @@ def build_basic_df(results, parameters=None):
     return score_weight_features(parse_weight_features(results), parameters)
 
 
+def normalize_live_assets(assets):
+    """接受币名或完整交易资产名，返回保持宿主顺序的币名到输出列映射。"""
+    if isinstance(assets, (str, bytes, dict, set)):
+        raise ValueError("assets 必须为有序的资产数组")
+    try:
+        values = list(assets)
+    except TypeError as exc:
+        raise ValueError("assets 必须为有序的资产数组") from exc
+    result = {}
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("assets 的每项必须为非空字符串")
+        column = value.strip().upper()
+        asset = column.split(".", 1)[0]
+        if not asset or asset in result:
+            raise ValueError("assets 的币名不能为空或重复：{}".format(asset))
+        result[asset] = column if "." in column else column + ASSET_SUFFIX
+    if not result:
+        raise ValueError("assets 不能为空")
+    return result
+
+
+def live_weight_window(as_of):
+    """返回筛选基准时刻、上一小时 45 分下界、最近 15 分钟刻度上界。"""
+    if as_of is None:
+        raise ValueError("内部权重计算缺少当前时刻")
+    stamp = pd.Timestamp(as_of)
+    if pd.isna(stamp):
+        raise ValueError("as_of 不能缺失")
+    cutoff = stamp.floor("15min")
+    return stamp, cutoff.floor("h") - pd.Timedelta(minutes=15), cutoff
+
+
+def build_live_weight(results, *, as_of, assets, aggregation_method="max_abs", parameters=None):
+    """按 as_of 筛选并生成一行权重；实盘入口在输出前另设最终 date。"""
+    validate_aggregation_method(aggregation_method)
+    columns = normalize_live_assets(assets)
+    stamp, begin, cutoff = live_weight_window(as_of)
+    validate_index(results, "record_id")
+    dates = pd.DatetimeIndex(pd.to_datetime(results.index.get_level_values("date"), utc=True))
+    dates = dates.tz_localize(None) + pd.Timedelta(hours=8)
+    if stamp.tzinfo is not None:
+        raise ValueError("内部权重时刻必须为无时区的 UTC+8 钟面时间")
+    window = results.loc[(dates >= begin) & (dates < cutoff)] if len(dates) else results
+    window = window.loc[window["asset"].isin(columns)]
+    basic = build_basic_df(window, parameters=parameters)
+    output = pd.DataFrame(0.0, index=pd.DatetimeIndex([stamp], name="date"), columns=list(columns.values()))
+    if not basic.empty:
+        if aggregation_method == "sum":
+            selected = basic.groupby("asset", sort=False)["data"].sum()
+        else:
+            basic = basic.sort_values("date", kind="stable").reset_index(drop=True)
+            positions = basic["data"].abs().groupby(basic["asset"], sort=False).idxmax()
+            selected = basic.loc[positions].set_index("asset")["data"]
+        for asset, score in selected.items():
+            output.at[stamp, columns[asset]] = score
+    if not np.isfinite(output.to_numpy()).all():
+        raise ValueError("实时权重包含非有限值或聚合溢出")
+    return output.astype("float64")
+
+
 def build_weight_data(basic_df, *, start_time, end_time=None, aggregation_method="sum"):
     """按 [T-75分钟, T-15分钟) 聚合到整点 T，补零；并列取最早发布、同刻取首条。"""
     validate_aggregation_method(aggregation_method)

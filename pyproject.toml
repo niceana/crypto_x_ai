@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61,<76", "wheel>=0.37,<0.46"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypto-x-ai-live"
+version = "0.4.3"
+description = "In-memory three-round crypto post processing for live trading hosts"
+readme = "docs/LIVE_INTEGRATION.md"
+requires-python = ">=3.8"
+dependencies = [
+    "httpx==0.28.1",
+    "pandas==2.0.3",
+    "numpy==1.24.4",
+    "PyYAML==6.0.2",
+    "python-dotenv==1.0.1",
+]
+
+[tool.setuptools]
+packages = ["crypto_x_ai_live"]
+include-package-data = false
+
+[tool.setuptools.cmdclass]
+build_py = "_build.LiveBuild"

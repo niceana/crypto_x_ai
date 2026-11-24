@@ -28,8 +28,8 @@ class RelationPreparer(RequestPreparer):
     """
 
     def __init__(self, history, retrieve, config, network, *, max_candidate_groups=10,
-                 max_input_characters=None):
-        super().__init__(config, network, log=logger, label="第二轮")
+                 max_input_characters=None, control=None):
+        super().__init__(config, network, log=logger, label="第二轮", control=control)
         self.max_candidate_groups = max_candidate_groups
         self.max_input_characters = max_input_characters
         self.history = history
@@ -68,6 +68,8 @@ class RelationPreparer(RequestPreparer):
             return "prepare", record
 
     def _process_work(self, kind, value):
+        if self.control is not None:
+            self.control.check()
         if kind == "history":
             self.history.add_records(value)
         else:
@@ -79,6 +81,8 @@ class RelationPreparer(RequestPreparer):
         selection = validate_retrieval_selection(
             self.retrieve(current, searchable), {record["event_id"] for record in searchable},
             max_groups=self.max_candidate_groups)
+        if self.control is not None:
+            self.control.check()
         if selection.auto_new:
             if not self.stopped.is_set():
                 self.network.completions.put_nowait(AutoNewResult(key, selection.reason))

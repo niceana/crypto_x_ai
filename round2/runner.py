@@ -46,12 +46,14 @@ def _load_relation_history(store, pending_keys):
 
 def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=NetworkWorker, *,
                  embedding_config=None, target_assets=None, max_candidate_groups=10,
-                 max_input_characters=None):
+                 max_input_characters=None, control=None):
     """读取已有任务，恢复状态，按币协调检索、请求与即时保存。
 
     调用线程独占 cli；同币下一时点必须等当前时间全部结果保存确认。相同
     时间共享此前历史，普通失败只暂停该币，输入和候选不会额外落库。
     """
+    if control is not None:
+        control.check()
     for name, value in (("max_candidate_groups", max_candidate_groups),
                         ("max_input_characters", max_input_characters)):
         if value is not None and (type(value) is not int or value <= 0):
@@ -82,6 +84,8 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         return summarize(store, keys, "round2", store.count_completed("round2", keys))
     logger.info("round2事件去重归组开始读取和校验历史：待处理记录=%d", len(pending_keys))
     later_records = _load_relation_history(store, pending_keys)
+    if control is not None:
+        control.check()
     validate_relation_history(store, keys, settings.history_lookback_months, later_records)
     del later_records
     logger.info("round2事件去重归组历史校验完成，开始准备检索与 AI 配置")
@@ -100,6 +104,8 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     already = store.count_completed("round2", keys)
     grouped = defaultdict(lambda: defaultdict(list))
     for key in pending_keys:
+        if control is not None:
+            control.check()
         grouped[store.df.loc[key, "asset"]][published_time(key[0])].append(key)
     history = EventHistory(store.df.loc[store.df["asset"].isin(grouped)],
                            settings.history_lookback_months, truncate_group_history=True)
@@ -107,6 +113,8 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
         embedding_keys = set(pending_keys)
         times = {asset: sorted(batches) for asset, batches in grouped.items()}
         for key, row in store.df.iterrows():
+            if control is not None:
+                control.check()
             if row["round2_status"] != "1" or row["asset"] not in times:
                 continue
             if is_history_needed(key[0], times[row["asset"]], settings.history_lookback_months):
@@ -128,9 +136,13 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
     network = network_factory(config)
     preparer = RelationPreparer(history, retrieve, config, network,
                                max_candidate_groups=max_candidate_groups,
-                               max_input_characters=max_input_characters)
+                               max_input_characters=max_input_characters, control=control)
     network.bind_ready_queue(preparer.ready_requests, preparer.wake)
+    remove_callbacks = []
+    if control is not None:
+        remove_callbacks.extend((control.register(network.request_stop), control.register(preparer.request_stop)))
     current_results = []
+    interrupted_meta_saved = set()
     succeeded = failed = auto_new = 0
     progress = ProgressStats(config.run, logger, "round2事件去重归组")
 
@@ -183,6 +195,12 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
 
     def consume():
         nonlocal succeeded, failed, auto_new
+        interrupted = [message for message in current_results
+                       if not isinstance(message, AutoNewResult) and message.response is None
+                       and message.key not in interrupted_meta_saved]
+        if interrupted:
+            store.save_interrupted_call_meta(interrupted, "round2")
+            interrupted_meta_saved.update(message.key for message in interrupted)
         items, stopped, seen = [], [], set()
         for message in current_results:
             if message.key not in active or message.key in seen:
@@ -280,10 +298,14 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
 
     try:
         try:
+            if control is not None:
+                control.check()
             network.start()
             preparer.start()
             report_progress(force=True)
             while True:
+                if control is not None:
+                    control.check()
                 preparer.check()
                 try:
                     network.check()
@@ -315,10 +337,14 @@ def run_relation(cli, settings, ai_config=None, retriever=None, network_factory=
                 network.shutdown()
             finally:
                 preparer.shutdown()
+                for remove in remove_callbacks:
+                    remove()
         preparer.check()
         if network.failure is not None:
             raise BatchRunError("第二轮网络运行或关闭失败") from network.failure
     except BaseException as error:
+        if control is not None:
+            raise
         try:
             # 保存预算耗尽即停止，不能在收尾时继续保存其他答复或重开预算。
             if not isinstance(error, BatchPersistenceError):

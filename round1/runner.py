@@ -40,7 +40,7 @@ class ExtractionSummary:
 
 def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, *,
                on_successful_posts=None, user_name_to_tickers=None,
-               ai_config=None, network_factory=None) -> ExtractionSummary:
+               ai_config=None, network_factory=None, control=None) -> ExtractionSummary:
     """同步处理指定日期范围；当前月结果全部确认后才读取下一月。
 
     cli 直接读取 task_path 并按原索引更新指定列，始终在调用入口线程执行。
@@ -52,6 +52,8 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
     user_name_to_tickers 仅作为 AI 判断事件归属的账号背景，不在导入时兜底。
     """
     started = time.monotonic()
+    if control is not None:
+        control.check()
     logger.info("round1事件提取开始启动")
     try:
         if start_time is None and end_time is None:
@@ -110,7 +112,7 @@ def run_extraction(cli, task_path, config_path, start_time=None, end_time=None, 
                               retry_after=_retry_after, log=logger)
 
     run_segments(_month_ranges(start, end), load_segment, summary, create_network,
-                 log=logger, label="round1事件提取")
+                 log=logger, label="round1事件提取", **({"control": control} if control is not None else {}))
     summary.elapsed_seconds = time.monotonic() - started
     scope = "本次读取范围" if start is None else "本次日期范围"
     logger.info("round1事件提取：%s内的任务全部处理完了：成功 %d，失败 %d；HTTP起发=%d，耗时=%.3f秒",

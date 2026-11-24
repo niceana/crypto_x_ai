@@ -18,11 +18,12 @@ class RequestPreparer:
     共用唤醒、请求编码、构造失败交付和停止收尾。
     """
 
-    def __init__(self, config, network, *, log=None, label="AI"):
+    def __init__(self, config, network, *, log=None, label="AI", control=None):
         self.config = config
         self.network = network
         self.logger = log or logging.getLogger(__name__)
         self.label = label
+        self.control = control
         self.ready_requests = queue.Queue(maxsize=config.run.ready_request_buffer_size)
         self.condition = threading.Condition()
         self.candidates = deque()
@@ -36,6 +37,8 @@ class RequestPreparer:
         self.thread.start()
 
     def check(self):
+        if self.control is not None:
+            self.control.check()
         if self.failure is not None:
             raise self.failure
 
@@ -76,6 +79,8 @@ class RequestPreparer:
                 self.condition.wait()
 
     def _process_work(self, kind, value):
+        if self.control is not None:
+            self.control.check()
         self._prepare_request(value)
 
     def _run(self):
@@ -95,6 +100,8 @@ class RequestPreparer:
             self.network.request_stop(self.label + "数据准备异常，停止请求")
 
     def _prepare_request(self, job):
+        if self.control is not None:
+            self.control.check()
         try:
             if job.body is None:
                 payload = render_payload(self.config, job.text)
@@ -108,6 +115,8 @@ class RequestPreparer:
                 self.network.completions.put_nowait(CompletionMessage(job.key, request_failure(str(error))))
             return
         if not self.stopped.is_set() and not self.network.stopped.is_set():
+            if self.control is not None:
+                self.control.check()
             # 单一生产者只在未满时开始准备，消费者只取走，因此此处不等待容量。
             self.ready_requests.put_nowait(job)
             self.network.notify_ready()

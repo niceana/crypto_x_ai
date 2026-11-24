@@ -1,0 +1,17 @@
+include _build.py
+include docs/LIVE_INTEGRATION.md
+recursive-include common *.py
+recursive-include initialization *.py
+recursive-include round1 *.py
+recursive-include round2 *.py
+recursive-include round3 *.py
+recursive-include vectorization *.py
+include postprocessing/__init__.py
+include postprocessing/weight_data.py
+include postprocessing/weight_parameters.py
+include postprocessing/weight_time.py
+include configs/event_processing_config.yaml
+include configs/round1_ai_config.yaml
+include configs/round2_ai_config.yaml
+include configs/round3_ai_config.yaml
+include configs/embedding_config.yaml

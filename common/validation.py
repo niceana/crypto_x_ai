@@ -8,6 +8,7 @@ import pandas as pd
 
 from common.persistence import TaskValidationError
 from common.time_rules import published_time
+from common.call_meta import POST_META_COLUMNS, EVENT_META_COLUMNS
 
 
 POST_RESULT_COLUMNS = ["status", "ai_response_content", "reasoning_content", "usage_json",
@@ -96,8 +97,8 @@ def validate_task_range(df, start_time, end_time):
 def validate_post_task_structure(df):
     """运行端只检查表结构；数据库普通列原值保留。"""
     validate_post_index(df)
-    if set(df.columns) != set(TASK_COLUMNS):
-        raise TaskValidationError("任务表必须恰好包含约定的九个普通列")
+    if not set(TASK_COLUMNS).issubset(df.columns) or set(df.columns) - set(TASK_COLUMNS + POST_META_COLUMNS):
+        raise TaskValidationError("任务表必须恰好包含约定的九个普通列，可额外附加 round1_call_meta 列")
 
 
 def validate_event_source_index(source):
@@ -119,7 +120,7 @@ def validate_event_source_index(source):
 def validate_event_table_structure(frame):
     """仅检查事件去重分析表结构和原索引；不检查数据库普通列内容。"""
     validate_index(frame, "record_id")
-    if set(frame.columns) != set(RESULT_COLUMNS):
+    if not set(RESULT_COLUMNS).issubset(frame.columns) or set(frame.columns) - set(RESULT_COLUMNS + EVENT_META_COLUMNS):
         raise ValueError("结果表须恰好包含约定的 {} 个普通列；缺少={}，多出={}".format(
             len(RESULT_COLUMNS), sorted(set(RESULT_COLUMNS) - set(frame.columns)), sorted(set(frame.columns) - set(RESULT_COLUMNS))))
     ids = frame.index.get_level_values("record_id")

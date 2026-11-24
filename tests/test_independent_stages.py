@@ -1,5 +1,6 @@
 """验证独立阶段交接、向量复用与矩阵缓存，不连接真实服务。"""
 
+import asyncio
 import json
 import queue
 import threading
@@ -92,7 +93,7 @@ class IndependentStageTests(EventFixture, unittest.TestCase):
             return httpx.Response(200, json={"data": [
                 {"index": index, "embedding": [1.0, 0.0]} for index, _ in enumerate(texts)]})
         return EmbeddingEncoder(self.embedding_config(), client_factory=lambda config:
-                                httpx.Client(transport=httpx.MockTransport(handle)))
+                                httpx.AsyncClient(transport=httpx.MockTransport(handle)))
 
     def test_standalone_vector_and_relation_entrypoints_require_complete_first_round(self):
         from entrypoints import prepare_vectors as vector_entry
@@ -121,12 +122,12 @@ class IndependentStageTests(EventFixture, unittest.TestCase):
         calls = []
         settings = self.settings(start_time="2021-02-01", end_time="2021-02-28",
                                  embedding_config_path=str(self.path))
-        summary = prepare_vectors(backend, settings, encoder=self.vector_engine(calls), target_assets={"ETH"})
+        summary = asyncio.run(prepare_vectors(backend, settings, encoder=self.vector_engine(calls), target_assets={"ETH"}))
         self.assertEqual((summary.current_records, summary.prepared_records, summary.saved_records), (1, 2, 2))
         self.assertEqual(calls, ["previous-pending", "current"])
         pd.testing.assert_frame_equal(backend.tables["result"].drop(columns="embedding"), before)
         self.assertTrue(all(list(batch.columns) == ["embedding"] for batch in backend.updates))
-        prepare_vectors(backend, settings, encoder=self.vector_engine(calls), target_assets={"ETH"})
+        asyncio.run(prepare_vectors(backend, settings, encoder=self.vector_engine(calls), target_assets={"ETH"}))
         self.assertEqual(calls, ["previous-pending", "current"])
 
 
@@ -143,7 +144,7 @@ class IndependentStageTests(EventFixture, unittest.TestCase):
     def test_prepared_vectors_reject_version_mismatch_without_http(self):
         saved = {}
         engine = self.vector_engine([])
-        engine.prepare([("key", "event", "")], saved.update)
+        asyncio.run(engine.prepare([("key", "event", "")], saved.update))
         engine.config_hash = "different-version"
         engine.client_factory = lambda config: self.fail("不能重新请求向量")
         with self.assertRaisesRegex(EmbeddingError, "先运行向量准备"):
@@ -207,7 +208,7 @@ class IndependentStageTests(EventFixture, unittest.TestCase):
         calls = []
         for start, end in months:
             current = replace(settings, start_time=start, end_time=end)
-            prepare_vectors(backend, current, encoder=self.vector_engine(calls))
+            asyncio.run(prepare_vectors(backend, current, encoder=self.vector_engine(calls)))
         serial.tables["result"] = backend.tables["result"].copy(deep=True)
         for start, end in months:
             current = replace(settings, start_time=start, end_time=end)

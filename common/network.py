@@ -7,7 +7,7 @@ import queue
 import random
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional, Tuple
@@ -20,6 +20,7 @@ from common.ai_protocol import (
     request_failure,
 )
 from common.validation import OutputValidationError
+from common.call_meta import CallRecorder
 
 logger = logging.getLogger(__name__)
 TaskKey = Tuple[Any, str]
@@ -49,6 +50,7 @@ class CompletionMessage:
     stopped: bool = False
     error: Optional[BaseException] = None
     value: Any = None
+    call_meta: Optional[dict] = None
 
 
 @dataclass
@@ -57,6 +59,7 @@ class _JobState:
 
     attempts_started: int = 0
     slot_held: bool = True
+    recorder: CallRecorder = field(default_factory=CallRecorder)
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,8 @@ class NetworkWorker:
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._thread_main, name="ai-batch-network")
         self.loop = None
+        self.service_task = None
+        self.entering_client = False
         self.shutdown_event = None
         self.client = None
         self.gate = None
@@ -234,11 +239,18 @@ class NetworkWorker:
                 return
             self.stop_reason = reason
             self.stopped.set()
-            if self.loop is not None and self.loop.is_running() and self.shutdown_event is not None:
+            if self.loop is not None and self.loop.is_running():
                 try:
-                    self.loop.call_soon_threadsafe(self.shutdown_event.set)
+                    self.loop.call_soon_threadsafe(self._signal_stop)
                 except RuntimeError:
                     pass  # 网络线程可能已在异常收尾中关闭事件循环。
+
+    def _signal_stop(self):
+        if self.shutdown_event is not None:
+            self.shutdown_event.set()
+        # 客户端进入尚未完成时，也必须能中断启动，不能无限等待 ready。
+        if self.entering_client and self.service_task is not None:
+            self.service_task.cancel()
 
     def start(self):
         """等待客户端就绪，同时检查线程是否提前退出。"""
@@ -336,6 +348,7 @@ class NetworkWorker:
             if self.stopped.is_set():
                 raise asyncio.CancelledError()
             state.attempts_started += 1
+            state.recorder.start_attempt()
             self.http_attempts_started += 1
             self.logger.debug("开始 HTTP 请求：任务=%r，尝试=%d/%d",
                               job.key, state.attempts_started, self.config.run.max_attempts)
@@ -426,11 +439,21 @@ class NetworkWorker:
     async def _execute(self, job):
         """管理一个作业的尝试预算和退避；仅返回一次最终完成消息。"""
         state = _JobState()
+
+        def completed(response=None, **kwargs):
+            meta = state.recorder.finish()
+            if response is not None:
+                response = replace(response, call_meta=meta)
+            return CompletionMessage(job.key, response, state.attempts_started, call_meta=meta, **kwargs)
+
         self._reserved_slots.discard(asyncio.current_task())
         try:
             while True:
                 result = await self._attempt(job, state)
                 parsed, count = result.response, state.attempts_started
+                if not parsed.success:
+                    state.recorder.failure(parsed.error_message, parsed.http_status,
+                                           result.retry and not self.stopped.is_set())
                 if parsed.success or not result.retry:
                     if parsed.success:
                         self.logger.debug("单任务请求成功：任务=%r，实际尝试=%d", job.key, count)
@@ -439,7 +462,7 @@ class NetworkWorker:
                                   if parsed.http_status is not None and 200 <= parsed.http_status < 300 else "")
                         self.logger.warning("单任务请求最终失败：任务=%r，HTTP状态=%s，实际尝试=%d%s",
                                             job.key, parsed.http_status, count, detail)
-                    return CompletionMessage(job.key, parsed, count, value=result.value)
+                    return completed(parsed, value=result.value)
                 if self.stopped.is_set():
                     raise asyncio.CancelledError()
                 delay = result.delay if result.delay is not None else retry_backoff(self.config.run, count)
@@ -449,12 +472,14 @@ class NetworkWorker:
         except asyncio.CancelledError:
             self.logger.debug("作业因整个 worker 停止而结束：任务=%r，已起发=%d；无最终响应时保留状态 9",
                               job.key, state.attempts_started)
-            return CompletionMessage(job.key, http_attempts_started=state.attempts_started, stopped=True)
+            state.recorder.failure("作业因 worker 停止或取消而中断")
+            return completed(stopped=True)
         except Exception as exc:
             self.failure = exc
             self.request_stop()
             self.logger.error("网络作业发生批次异常：任务=%r，异常类型=%s", job.key, type(exc).__name__)
-            return CompletionMessage(job.key, http_attempts_started=state.attempts_started, error=exc)
+            state.recorder.failure("{}: {}".format(type(exc).__name__, str(exc)))
+            return completed(error=exc)
         finally:
             # 首次起发前取消或异常时，归还已接管的预留名额。
             if state.slot_held:
@@ -464,33 +489,46 @@ class NetworkWorker:
         """创建共享客户端，收到停止通知后自行取消任务并关闭资源。"""
         self.shutdown_event = asyncio.Event()
         self._ready_available = asyncio.Event()
-        async with self._client_factory(self.config) as client:
+        client = self._client_factory(self.config)
+        if self.stopped.is_set():
             self.client = client
-            self.gate = _RequestGate(self.config.run.requests_per_second, self.stopped, self.logger)
-            self.http_slots = asyncio.Semaphore(self.config.run.concurrency)
-            pump = None
-            self.ready.set()
-            try:
-                # 初始化前收到停止时，通知可能还无法投递，直接进入收尾。
-                if not self.stopped.is_set():
-                    pump = self.loop.create_task(self._pump_ready())
-                    await self.shutdown_event.wait()
-            finally:
-                if pump is not None:
-                    pump.cancel()
-                    await asyncio.gather(pump, return_exceptions=True)
-                # 本地取消只用于资源清理，不能保证服务端撤销已收到的请求。
-                tasks = list(self.tasks)
-                for task in tasks:
-                    task.cancel()
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+            await client.aclose()
+            return
+        entered = False
+        try:
+            self.entering_client = True
+            async with client:
+                entered = True
+                self.entering_client = False
+                self.client = client
+                self.gate = _RequestGate(self.config.run.requests_per_second, self.stopped, self.logger)
+                self.http_slots = asyncio.Semaphore(self.config.run.concurrency)
+                pump = None
+                self.ready.set()
+                try:
+                    if not self.stopped.is_set():
+                        pump = self.loop.create_task(self._pump_ready())
+                        await self.shutdown_event.wait()
+                finally:
+                    if pump is not None:
+                        pump.cancel()
+                        await asyncio.gather(pump, return_exceptions=True)
+                    tasks = list(self.tasks)
+                    for task in tasks:
+                        task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self.entering_client = False
+            if not entered:
+                await client.aclose()
 
     def _thread_main(self):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(self._serve())
+            self.service_task = self.loop.create_task(self._serve())
+            self.loop.run_until_complete(self.service_task)
         except BaseException as exc:
             self.logger.error("网络线程运行或关闭失败：异常类型=%s", type(exc).__name__)
             self.failure = exc

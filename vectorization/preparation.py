@@ -28,7 +28,7 @@ def read_target_assets(cli, settings):
     return frozenset(instrument.split(".", 1)[0].strip().upper() for instrument in universe)
 
 
-def prepare_vectors(cli, settings, *, embedding_config=None, encoder=None, target_assets=None, run_config=None):
+async def prepare_vectors(cli, settings, *, embedding_config=None, encoder=None, target_assets=None, run_config=None):
     """准备当前记录及必要前史，包括尚未归组的前月记录，允许领先第二轮运行。
 
     时间范围仍由第二轮逐条查询时裁剪。这里只提前编码事实，不能将尚未归组
@@ -77,6 +77,6 @@ def prepare_vectors(cli, settings, *, embedding_config=None, encoder=None, targe
         summary.saved_records += len(patch)
 
     keys = sorted(frame.index, key=lambda key: (published_time(key[0]), key[1]))
-    engine.prepare(((key, frame.at[key, "event"], frame.at[key, "embedding"]) for key in keys), save)
+    await engine.prepare(((key, frame.at[key, "event"], frame.at[key, "embedding"]) for key in keys), save)
     summary.prepared_records = len(keys)
     return summary

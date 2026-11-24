@@ -61,6 +61,7 @@ class ParsedResponse:
     usage: Any = None
     response_created: str = ""
     error_message: str = ""
+    call_meta: Optional[dict] = None
 
 
 def _reason(value):
